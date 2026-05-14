@@ -71,7 +71,7 @@ const EDB=[
   {id:"e20",name:"Leg Curl",             cat:"Beine",     eq:"Maschine",      muscle:"hamstrings"},
   {id:"e21",name:"Ausfallschritte",       cat:"Beine",     eq:"Körpergewicht", muscle:"quads"},
   {id:"e22",name:"Hip Thrust",            cat:"Beine",     eq:"Langhantel",    muscle:"glutes"},
-  {id:"e23",name:"Plank",                cat:"Core",      eq:"Körpergewicht", muscle:"core"},
+  {id:"e23",name:"Plank",                cat:"Core",      eq:"Körpergewicht", muscle:"core",       unitType:"secs"},
   {id:"e24",name:"Crunches",             cat:"Core",      eq:"Körpergewicht", muscle:"core"},
   {id:"e25",name:"Russian Twists",       cat:"Core",      eq:"Körpergewicht", muscle:"core"},
   {id:"e26",name:"Facepulls",            cat:"Schultern", eq:"Kabel",         muscle:"shoulders"},
@@ -106,6 +106,9 @@ const CARDIO_MET={Joggen:9.8,Spazieren:3.5,Radfahren:7.5,Schwimmen:8.0,HIIT:12.0
 // HELPERS
 // ═══════════════════════════════════════════════════════
 const uid     = () => `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+// Unique key per plan-exercise instance (fixes duplicate-exercise bug)
+// Format: "eid__planIndex" e.g. "e36__0" and "e36__4" for warmup vs. worksets
+const instKey = (eid, idx) => `${eid}__${idx}`;
 const fmt     = s  => `${Math.floor(s/60).toString().padStart(2,"0")}:${(s%60).toString().padStart(2,"0")}`;
 const fmtD    = d  => new Date(d).toLocaleDateString("de-DE",{day:"numeric",month:"short",year:"numeric"});
 const fmtDShort=d  => new Date(d).toLocaleDateString("de-DE",{weekday:"short",day:"numeric",month:"short"});
@@ -164,60 +167,6 @@ function getPRs(sessions) {
     if (isDone(x) && x.weight > 0 && (!p[x.eid] || x.weight > p[x.eid])) p[x.eid] = x.weight;
   }));
   return p;
-}
-
-
-// Stabilitaet & UX: zentrale Sortierung, Zeit-/Wdh.-Labels und Bildkompression
-const sortByDateDesc = arr => [...(arr||[])].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
-const TIME_EXERCISE_IDS = new Set(["e23","w3","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12"]);
-const isTimeExercise = (eid, ex) => TIME_EXERCISE_IDS.has(eid) || ["Aufwaermen","Aufwärmen","Dehnung"].includes(ex?.cat);
-const setTargetLabel = (eid, reps, ex) => {
-  const n = Number(reps)||0;
-  if (isTimeExercise(eid, ex)) return n >= 120 ? `${Math.round(n/60)} Min` : `${n} Sek`;
-  return `${n} Wdh`;
-};
-const planTargetLabel = (planEx, ex) => `${planEx.sets}×${setTargetLabel(planEx.eid, planEx.reps, ex)}${planEx.weight>0?` @ ${planEx.weight}kg`:""}`;
-
-function safeLocalSet(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)); return {ok:true}; }
-  catch (err) { return {ok:false, error: err?.message || "Speicherlimit erreicht"}; }
-}
-
-function compressImageFile(file, maxSize=900, quality=0.78) {
-  return new Promise((resolve, reject) => {
-    if (!file || !file.type?.startsWith("image/")) return reject(new Error("Bitte eine Bilddatei auswaehlen."));
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Bild konnte nicht gelesen werden."));
-    reader.onload = ev => {
-      const img = new Image();
-      img.onerror = () => reject(new Error("Bild konnte nicht verarbeitet werden."));
-      img.onload = () => {
-        const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(img.width * scale));
-        canvas.height = Math.max(1, Math.round(img.height * scale));
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      };
-      img.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-function validateImportData(data) {
-  if (!data || typeof data !== "object") throw new Error("Die Datei enthaelt kein gueltiges FitTrack-Backup.");
-  const arr = k => Array.isArray(data[k]) ? data[k] : [];
-  return {
-    settings: {...DEFAULT_SETTINGS, ...(data.settings||{}), onboarded:true},
-    sessions: arr("sessions"),
-    metrics: arr("metrics"),
-    plans: arr("plans").length ? arr("plans") : MY_PLANS,
-    cardio: arr("cardio"),
-    customExercises: arr("customExercises"),
-    exerciseOverrides: data.exerciseOverrides && typeof data.exerciseOverrides === "object" ? data.exerciseOverrides : {},
-  };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -319,8 +268,32 @@ function calcAchievements(sessions, metrics, streak, cardio) {
 }
 
 // ═══════════════════════════════════════════════════════
-// SEED / PLAN DATA
+// UNIT TYPE HELPERS  (Fix 6 – Zeit vs. Wdh)
 // ═══════════════════════════════════════════════════════
+// Each exercise can declare unitType: "reps" | "secs" | "mins"
+// Default = "reps".  Warm-up/Dehnung use "secs" or special.
+const UNIT_LABELS = { reps:"Wdh", secs:"Sek", mins:"Min" };
+
+function getUnitType(eid, allExercises) {
+  const ex = allExercises?.find(e=>e.id===eid);
+  if (!ex) return "reps";
+  return ex.unitType || "reps";
+}
+
+// Format a reps/time value for display
+function fmtRepsVal(val, unitType) {
+  if (!val && val !== 0) return "—";
+  switch(unitType) {
+    case "secs": return `${val} Sek`;
+    case "mins": return `${val} Min`;
+    default:     return `${val} Wdh`;
+  }
+}
+
+// Label for the field in WorkoutScreen
+function repsFieldLabel(unitType) {
+  return UNIT_LABELS[unitType] || "Wdh";
+}
 const DEFAULT_SETTINGS = {
   weeklyGoal:4, weightGoal:null, unit:"kg",
   fitnessGoal:"Muskelaufbau", name:"", onboarded:false, bodyWeight:null,
@@ -329,37 +302,35 @@ const DEFAULT_SETTINGS = {
 // ── Zusätzliche Übungen: Warm-up, Mobilisierung, Dehnung ──────────────
 // Diese werden zu EDB gemergt (custom exercises folgen später im State)
 const EXTRA_EDB = [
-  // Mobilisierung / Aufwärmen (aus Gainsfire-Protokoll)
-  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders",
+  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"reps",
    desc:"15× vorwärts, 15× rückwärts. Arme hängen locker, große Kreisbewegung."},
-  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",
+  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",      unitType:"reps",
    desc:"15× rechts, 15× links. Hände zu Fäusten, langsam im vollen Radius kreisen."},
-  {id:"w3", name:"Crosstrainer",        cat:"Aufwärmen", eq:"Maschine",      muscle:"core",
+  {id:"w3", name:"Crosstrainer",        cat:"Aufwärmen", eq:"Maschine",      muscle:"core",      unitType:"secs",
    desc:"Lockeres Aufwärmen, mittleres Tempo."},
-  // Dehnübungen Cool-down
-  {id:"s1", name:"Brustdehnung (Türrahmen)",  cat:"Dehnung", eq:"Körpergewicht", muscle:"chest",
+  {id:"s1", name:"Brustdehnung (Türrahmen)",  cat:"Dehnung", eq:"Körpergewicht", muscle:"chest",      unitType:"secs",
    desc:"Unterarm an Türrahmen, Körper vordrehen. 30 Sek. je Seite."},
-  {id:"s2", name:"Schulter Querdehnung",      cat:"Dehnung", eq:"Körpergewicht", muscle:"shoulders",
+  {id:"s2", name:"Schulter Querdehnung",      cat:"Dehnung", eq:"Körpergewicht", muscle:"shoulders",  unitType:"secs",
    desc:"Arm gerade vor den Körper, mit anderem Arm heranziehen. 30 Sek. je Seite."},
-  {id:"s3", name:"Trizeps Dehnung",            cat:"Dehnung", eq:"Körpergewicht", muscle:"triceps",
+  {id:"s3", name:"Trizeps Dehnung",            cat:"Dehnung", eq:"Körpergewicht", muscle:"triceps",    unitType:"secs",
    desc:"Arm über Kopf beugen, Ellbogen zeigt nach oben. 30 Sek. je Seite."},
-  {id:"s4", name:"Hüftbeuger Dehnung",         cat:"Dehnung", eq:"Körpergewicht", muscle:"glutes",
+  {id:"s4", name:"Hüftbeuger Dehnung",         cat:"Dehnung", eq:"Körpergewicht", muscle:"glutes",     unitType:"secs",
    desc:"Ausfallschritt, vorderes Knie 90°, hinteres Knie auf Boden. 30 Sek. je Seite."},
-  {id:"s5", name:"Oberschenkel Vorderseite",   cat:"Dehnung", eq:"Körpergewicht", muscle:"quads",
+  {id:"s5", name:"Oberschenkel Vorderseite",   cat:"Dehnung", eq:"Körpergewicht", muscle:"quads",      unitType:"secs",
    desc:"Im Stehen Ferse zum Po ziehen. 30 Sek. je Seite."},
-  {id:"s6", name:"Oberschenkel Rückseite",     cat:"Dehnung", eq:"Körpergewicht", muscle:"hamstrings",
+  {id:"s6", name:"Oberschenkel Rückseite",     cat:"Dehnung", eq:"Körpergewicht", muscle:"hamstrings", unitType:"secs",
    desc:"Bein gestreckt auf Erhöhung, Oberkörper nach vorne. 30 Sek. je Seite."},
-  {id:"s7", name:"Wadenstretch",               cat:"Dehnung", eq:"Körpergewicht", muscle:"calves",
+  {id:"s7", name:"Wadenstretch",               cat:"Dehnung", eq:"Körpergewicht", muscle:"calves",     unitType:"secs",
    desc:"An Wand lehnen, Ferse bleibt am Boden. 30 Sek. je Seite."},
-  {id:"s8", name:"Rücken – Knieziehen",        cat:"Dehnung", eq:"Körpergewicht", muscle:"back",
+  {id:"s8", name:"Rücken – Knieziehen",        cat:"Dehnung", eq:"Körpergewicht", muscle:"back",       unitType:"secs",
    desc:"Auf Rücken liegend, Knie zur Brust ziehen. 30 Sek."},
-  {id:"s9", name:"Piriformis / Gesäß",         cat:"Dehnung", eq:"Körpergewicht", muscle:"glutes",
+  {id:"s9", name:"Piriformis / Gesäß",         cat:"Dehnung", eq:"Körpergewicht", muscle:"glutes",     unitType:"secs",
    desc:"Auf Rücken, Knöchel auf Oberschenkel legen, Bein heranziehen. 30 Sek. je Seite."},
-  {id:"s10",name:"Seitlicher Rumpf",           cat:"Dehnung", eq:"Körpergewicht", muscle:"core",
+  {id:"s10",name:"Seitlicher Rumpf",           cat:"Dehnung", eq:"Körpergewicht", muscle:"core",       unitType:"secs",
    desc:"Im Stehen Arm über Kopf, Oberkörper seitlich kippen. 30 Sek. je Seite."},
-  {id:"s11",name:"Nacken Seitneigung",         cat:"Dehnung", eq:"Körpergewicht", muscle:"traps",
+  {id:"s11",name:"Nacken Seitneigung",         cat:"Dehnung", eq:"Körpergewicht", muscle:"traps",      unitType:"secs",
    desc:"Kopf zur Seite neigen, leicht mit Hand nachhelfen. 20 Sek. je Seite."},
-  {id:"s12",name:"Kindshaltung (Yoga)",        cat:"Dehnung", eq:"Körpergewicht", muscle:"back",
+  {id:"s12",name:"Kindshaltung (Yoga)",        cat:"Dehnung", eq:"Körpergewicht", muscle:"back",       unitType:"secs",
    desc:"Knie breit, Arme nach vorne strecken, Stirn zum Boden. 45 Sek."},
 ];
 
@@ -428,11 +399,12 @@ const MY_PLANS = [
         {eid:"e23", sets:3, reps:45, weight:0,  rest:60,
          note:"Plank · 45 Sek. halten"},
         // ── Cool-down Dehnung ──────────────────────────────────
-        {eid:"s2",  sets:1, reps:1,  weight:0, rest:0,
+        // Fix 2: reps = Sekunden (unitType "secs"), nicht 1
+        {eid:"s2",  sets:1, reps:30, weight:0, rest:0,
          note:"30 Sek. je Seite"},
-        {eid:"s1",  sets:1, reps:1,  weight:0, rest:0,
+        {eid:"s1",  sets:1, reps:30, weight:0, rest:0,
          note:"30 Sek. je Seite"},
-        {eid:"s6",  sets:1, reps:1,  weight:0, rest:0,
+        {eid:"s6",  sets:1, reps:30, weight:0, rest:0,
          note:"30 Sek. je Seite"},
       ],
     }],
@@ -444,20 +416,60 @@ const SEED_SESSIONS = [];
 const SEED_CARDIO   = [];
 
 // ═══════════════════════════════════════════════════════
-// PERSISTENCE
+// IMAGE COMPRESSION (Fix 5)
+// Canvas-based resize to max 400px, JPEG quality 0.72
 // ═══════════════════════════════════════════════════════
-function usePersistedState(key, seed) {
-  const [s, setS] = useState(() => {
+function compressImage(dataUrl, maxPx=400, quality=0.72) {
+  return new Promise((resolve) => {
     try {
-      const v = localStorage.getItem("ft5_"+key);
-      return v ? JSON.parse(v) : seed;
-    } catch { return seed; }
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const ratio  = Math.min(maxPx/img.width, maxPx/img.height, 1);
+        canvas.width  = Math.round(img.width  * ratio);
+        canvas.height = Math.round(img.height * ratio);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => resolve(dataUrl); // fallback: original
+      img.src = dataUrl;
+    } catch {
+      resolve(dataUrl);
+    }
   });
+}
+
+// ═══════════════════════════════════════════════════════
+// PERSISTENCE (Fix 4+8)
+// ═══════════════════════════════════════════════════════
+const LS_PREFIX = "ft5_";
+
+function lsGet(key, fallback) {
+  try {
+    const v = localStorage.getItem(LS_PREFIX + key);
+    return v ? JSON.parse(v) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function lsSet(key, value) {
+  try {
+    localStorage.setItem(LS_PREFIX + key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    // QuotaExceededError or similar – show a brief console warning
+    console.warn("FitTrack: localStorage write failed for key:", key, e?.name);
+    return false;
+  }
+}
+
+function usePersistedState(key, seed) {
+  const [s, setS] = useState(() => lsGet(key, seed));
   const set = useCallback(u => {
     setS(prev => {
       const next = typeof u === "function" ? u(prev) : u;
-      const saved = safeLocalSet("ft5_"+key, next);
-      if (!saved.ok) console.warn("FitTrack Speicherfehler", key, saved.error);
+      lsSet(key, next);
       return next;
     });
   }, [key]);
@@ -534,6 +546,33 @@ const PBar = ({value, max, color=T.accent, h=6}) => (
     }}/>
   </div>
 );
+
+// Fix 3: Auto-resize textarea – grows with content, no internal scroll
+const AutoTextarea = ({value, onChange, placeholder, style={}}) => {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      placeholder={placeholder}
+      rows={3}
+      style={{
+        background:T.bgInput, border:`1px solid ${T.border}`, borderRadius:10,
+        padding:"10px 14px", color:T.text, fontSize:14, width:"100%",
+        minHeight:80, outline:"none", resize:"none", overflow:"hidden",
+        boxSizing:"border-box", fontFamily:"inherit", lineHeight:1.6,
+        ...style,
+      }}
+    />
+  );
+};
 
 // ═══════════════════════════════════════════════════════
 // CHARTS
@@ -729,7 +768,12 @@ const CardioScreen = ({cardio, onSave, settings}) => {
   const [dist,setDist]  = useState("");
   const [note,setNote]  = useState("");
   const [date,setDate]  = useState(new Date().toISOString().slice(0,16));
-  const sortedCardio = useMemo(() => sortByDateDesc(cardio), [cardio]);
+
+  // Fix 7: always sort newest first
+  const sortedCardio = useMemo(()=>
+    [...cardio].sort((a,b)=>new Date(b.date)-new Date(a.date)),
+    [cardio]
+  );
 
   const save = () => {
     const d = parseInt(dur);
@@ -801,8 +845,8 @@ const CardioScreen = ({cardio, onSave, settings}) => {
       </>}
 
       {view==="history" && <>
-        <Lbl>{cardio.length} AKTIVITÄTEN</Lbl>
-        {cardio.length===0 && (
+        <Lbl>{sortedCardio.length} AKTIVITÄTEN</Lbl>
+        {sortedCardio.length===0 && (
           <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16}}>Noch keine Aktivitäten. Los geht's!</div>
         )}
         {sortedCardio.map(c=>(
@@ -831,7 +875,7 @@ const CardioScreen = ({cardio, onSave, settings}) => {
 
       {view==="stats" && <>
         {CARDIO_TYPES.filter(t=>cardio.some(c=>c.type===t)).map(t=>{
-          const entries=sortByDateDesc(cardio.filter(c=>c.type===t));
+          const entries=cardio.filter(c=>c.type===t);
           const km=entries.reduce((s,c)=>s+(c.distance||0),0);
           const min=entries.reduce((s,c)=>s+(c.duration||0),0);
           const kcal=entries.reduce((s,c)=>s+(c.kcal||0),0);
@@ -872,50 +916,63 @@ const ExerciseDBScreen = ({
   allExercises,
   customExercises, setCustomExercises,
   exerciseOverrides, setExerciseOverrides,
-  onSelect, selectable, selected=[], initialExerciseId=null, initialMode="detail", onBack,
+  onSelect, selectable, selected=[],
+  initialDetailId,   // Fix 1: open directly on this exercise id
 }) => {
-  const [cat,setCat]       = useState("Alle");
+  const [cat,setCat]   = useState("Alle");
   const [search,setSearch] = useState("");
-  const [mode,setMode]     = useState(() => initialExerciseId ? initialMode : "list"); // list | detail | edit | create
-  const [activeId,setActiveId] = useState(() => initialExerciseId);
+  // Fix 1: honour initialDetailId on mount
+  const [mode,setMode] = useState(() => initialDetailId ? "detail" : "list");
+  const [activeId,setActiveId] = useState(initialDetailId || null);
 
-  useEffect(() => {
-    if (initialExerciseId) {
-      setActiveId(initialExerciseId);
-      setMode(initialMode || "detail");
-    }
-  }, [initialExerciseId, initialMode]);
-
-  // Form fields
   const [fName,setFName] = useState("");
   const [fCat,setFCat]   = useState("Brust");
   const [fEq,setFEq]     = useState("Maschine");
   const [fDesc,setFDesc] = useState("");
   const [fLink,setFLink] = useState("");
   const [fImg,setFImg]   = useState(null);
+  const [fNote,setFNote] = useState(""); // Fix 5: Trainingsnotiz (Kurznotiz)
+  const [imgLoading,setImgLoading] = useState(false);
   const fileRef = useRef(null);
 
   // Resolve an exercise with any overrides applied
-  const resolve = ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})});
+  const resolve = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
 
+  // Fix 1: openEdit properly pre-fills form and sets activeId so back→detail works
   const openCreate = () => {
     setFName(""); setFCat("Brust"); setFEq("Maschine");
-    setFDesc(""); setFLink(""); setFImg(null);
+    setFDesc(""); setFLink(""); setFImg(null); setFNote("");
     setActiveId(null); setMode("create");
   };
 
-  const openEdit = ex => {
+  const openEdit = useCallback(ex => {
     const resolved = resolve(ex);
-    setFName(resolved.name); setFCat(resolved.cat); setFEq(resolved.eq);
-    setFDesc(resolved.desc||""); setFLink(resolved.link||""); setFImg(resolved.img||null);
-    setActiveId(ex.id); setMode("edit");
-  };
+    setFName(resolved.name || "");
+    setFCat(resolved.cat  || "Brust");
+    setFEq(resolved.eq    || "Maschine");
+    setFDesc(resolved.desc || "");
+    setFLink(resolved.link || "");
+    setFImg(resolved.img   || null);
+    setFNote(resolved.trainingsnotiz || ""); // Fix 5
+    setActiveId(ex.id);
+    setMode("edit");
+  }, [resolve]);
 
-  const handleImg = async e => {
-    const f = e.target.files?.[0]; if (!f) return;
-    try { setFImg(await compressImageFile(f)); }
-    catch (err) { alert(err?.message || "Bild konnte nicht verarbeitet werden."); }
-    finally { if (e.target) e.target.value = ""; }
+  const handleImg = e => {
+    const f = e.target.files[0]; if (!f) return;
+    setImgLoading(true);
+    const r = new FileReader();
+    r.onload = async ev => {
+      try {
+        const compressed = await compressImage(ev.target.result, 400, 0.72);
+        setFImg(compressed);
+      } catch {
+        setFImg(ev.target.result); // fallback
+      }
+      setImgLoading(false);
+    };
+    r.onerror = () => setImgLoading(false);
+    r.readAsDataURL(f);
   };
 
   const saveCreate = () => {
@@ -924,6 +981,7 @@ const ExerciseDBScreen = ({
       id:`cx${uid()}`, name:fName.trim(), cat:fCat, eq:fEq,
       muscle:fCat.toLowerCase(),
       desc:fDesc.trim()||null, link:fLink.trim()||null, img:fImg||null,
+      trainingsnotiz: fNote.trim()||null, // Fix 5
       custom:true,
     };
     setCustomExercises(p=>[...p, entry]);
@@ -931,27 +989,35 @@ const ExerciseDBScreen = ({
   };
 
   const saveEdit = () => {
-    if (!fName.trim()) return;
     const ex = allExercises.find(e=>e.id===activeId);
     if (!ex) return;
 
     if (ex.custom) {
-      // Custom exercise: update the entry itself (name/cat/eq can change)
+      // Custom exercise: all fields editable
+      if (!fName.trim()) return;
       const updated = {
         ...ex, name:fName.trim(), cat:fCat, eq:fEq,
         muscle:fCat.toLowerCase(),
         desc:fDesc.trim()||null, link:fLink.trim()||null, img:fImg||null,
+        trainingsnotiz: fNote.trim()||null, // Fix 5
       };
       setCustomExercises(p=>p.map(e=>e.id===activeId ? updated : e));
     } else {
-      // Built-in exercise: only store the enrichment fields in overrides
-      // (name/cat/eq of built-ins stays fixed to avoid breaking existing sessions)
+      // Built-in exercise: store enrichment in overrides incl. trainingsnotiz
       const override = {
         desc: fDesc.trim()||null,
         link: fLink.trim()||null,
         img:  fImg||null,
+        trainingsnotiz: fNote.trim()||null, // Fix 5
       };
-      setExerciseOverrides(prev=>({...prev, [activeId]: override}));
+      // Remove override entirely if all fields are empty (cleanup)
+      // Fix 1: keep override if ANY field is set, including trainingsnotiz
+      const hasAny = override.desc || override.link || override.img || override.trainingsnotiz;
+      if (hasAny) {
+        setExerciseOverrides(prev=>({...prev, [activeId]: override}));
+      } else {
+        setExerciseOverrides(prev=>{ const n={...prev}; delete n[activeId]; return n; });
+      }
     }
     setMode("detail");
   };
@@ -979,7 +1045,7 @@ const ExerciseDBScreen = ({
     return (
       <div style={{padding:"0 16px 24px"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,padding:"20px 0 12px"}}>
-          <Btn v="ghost" onClick={()=>onBack ? onBack() : setMode("list")} style={{padding:"8px 14px"}}>←</Btn>
+          <Btn v="ghost" onClick={()=>setMode("list")} style={{padding:"8px 14px"}}>←</Btn>
           <div style={{flex:1,fontSize:18,fontWeight:900,color:T.text}}>{ex.name}</div>
           <Btn v="ghost" onClick={()=>openEdit(base)} style={{padding:"8px 14px"}}>✎ Bearbeiten</Btn>
         </div>
@@ -996,6 +1062,12 @@ const ExerciseDBScreen = ({
             {ex.custom&&<Badge color={T.purple}>Eigene Übung</Badge>}
             {hasOverride&&<Badge color={T.teal}>Ergänzt</Badge>}
           </div>
+          {ex.trainingsnotiz&&(
+            <div style={{fontSize:12,color:T.teal,marginBottom:8,padding:"6px 10px",
+              background:T.teal+"15",borderRadius:8,border:`1px solid ${T.teal}33`}}>
+              📌 Trainingsnotiz: {ex.trainingsnotiz}
+            </div>
+          )}
           {ex.desc&&(
             <div style={{fontSize:14,color:T.sub,lineHeight:1.7,marginBottom:ex.link?12:0}}>
               {ex.desc}
@@ -1044,7 +1116,7 @@ const ExerciseDBScreen = ({
     return (
       <div style={{padding:"0 16px 24px"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,padding:"20px 0 14px"}}>
-          <Btn v="ghost" onClick={()=>isCreate ? setMode("list") : (onBack ? onBack() : setMode("detail"))} style={{padding:"8px 14px"}}>←</Btn>
+          <Btn v="ghost" onClick={()=>setMode(isCreate?"list":"detail")} style={{padding:"8px 14px"}}>←</Btn>
           <div style={{flex:1,fontSize:18,fontWeight:900,color:T.text}}>
             {isCreate?"Neue Übung":"Übung bearbeiten"}
           </div>
@@ -1096,12 +1168,18 @@ const ExerciseDBScreen = ({
           {/* Media fields – available for ALL exercises */}
           <div style={{marginBottom:10}}>
             <Lbl>BESCHREIBUNG</Lbl>
-            <textarea value={fDesc} onChange={e=>setFDesc(e.target.value)}
-              placeholder="Ausführung, Hinweise, Muskelgruppen..."
-              style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:10,
-                padding:"10px 14px",color:T.text,fontSize:14,width:"100%",
-                minHeight:88,outline:"none",resize:"vertical",
-                boxSizing:"border-box",fontFamily:"inherit",lineHeight:1.6}}/>
+            {/* Fix 3: auto-resize */}
+            <AutoTextarea value={fDesc} onChange={setFDesc}
+              placeholder="Ausführung, Hinweise, Muskelgruppen..."/>
+          </div>
+          {/* Fix 5: Trainingsnotiz – kurze Notiz die beim Training immer sichtbar ist */}
+          <div style={{marginBottom:10}}>
+            <Lbl>TRAININGSNOTIZ (immer sichtbar)</Lbl>
+            <Inp value={fNote} onChange={setFNote}
+              placeholder="z.B. Sitzhöhe 4 · Griff eng · Lehne Stufe 3"/>
+            <div style={{fontSize:10,color:T.muted,marginTop:4,lineHeight:1.5}}>
+              Wird während jedes Trainings unter der Übung angezeigt.
+            </div>
           </div>
           <div style={{marginBottom:12}}>
             <Lbl>VIDEO-LINK (YouTube, etc.)</Lbl>
@@ -1117,17 +1195,17 @@ const ExerciseDBScreen = ({
                       borderRadius:"50%",width:28,height:28,cursor:"pointer",color:"#fff",
                       fontWeight:900,fontSize:15}}>×</button>
                 </div>
-              : <div onClick={()=>fileRef.current?.click()}
+              : <div onClick={()=>!imgLoading&&fileRef.current?.click()}
                   style={{border:`1px dashed ${T.border}`,borderRadius:10,padding:"22px",
-                    textAlign:"center",cursor:"pointer",color:T.muted,fontSize:13}}>
-                  📷 Bild auswählen
+                    textAlign:"center",cursor:imgLoading?"default":"pointer",color:T.muted,fontSize:13}}>
+                  {imgLoading ? "⏳ Komprimiere…" : "📷 Bild auswählen"}
                 </div>
             }
             <input ref={fileRef} type="file" accept="image/*" onChange={handleImg} style={{display:"none"}}/>
           </div>
 
           <Btn onClick={isCreate?saveCreate:saveEdit}
-            disabled={!isBuiltIn&&!fName.trim()} full>
+            disabled={(!isBuiltIn&&!fName.trim())||imgLoading} full>
             {isCreate?"Übung erstellen":"Änderungen speichern"}
           </Btn>
         </Card>
@@ -1265,21 +1343,18 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
     return {...day,exercises:exs};
   }));
 
-  // Info/Edit overlay from within PlanEditor
+  // Fix 1: Info/Edit overlay – passes initialDetailId so ExerciseDBScreen opens directly on this exercise
   if (infoExId) return (
     <div>
       <div style={{padding:"16px 16px 0",display:"flex",alignItems:"center",gap:10}}>
-        <Btn v="ghost" onClick={()=>setInfoExId(null)} style={{padding:"8px 14px"}}>← Zurück</Btn>
-        <div style={{fontSize:15,fontWeight:700,color:T.text}}>Übungsinfo bearbeiten</div>
+        <Btn v="ghost" onClick={()=>setInfoExId(null)} style={{padding:"8px 14px"}}>← Zurück zum Plan</Btn>
       </div>
       <ExerciseDBScreen
         allExercises={allExercises}
         customExercises={customExercises} setCustomExercises={setCustomExercises}
         exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}
         selectable={false}
-        initialExerciseId={infoExId}
-        initialMode="edit"
-        onBack={()=>setInfoExId(null)}
+        initialDetailId={infoExId}
       />
     </div>
   );
@@ -1457,6 +1532,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
             <div style={{fontSize:15,fontWeight:700,color:T.accent,marginBottom:10}}>{day.name}</div>
             {day.exercises.map((ex,i)=>{
               const e=allExercises.find(x=>x.id===ex.eid);
+              const unitType = e?.unitType || "reps";
               return (
                 <div key={`${ex.eid}-${i}`} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",padding:"8px 0",borderBottom:i<day.exercises.length-1?`1px solid ${T.border}`:"none"}}>
                   <div style={{flex:1}}>
@@ -1464,7 +1540,9 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
                     <div style={{fontSize:11,color:T.sub}}>{e?.eq}{ex.note&&<span style={{color:T.muted}}> · {ex.note}</span>}</div>
                   </div>
                   <div style={{textAlign:"right",marginLeft:8}}>
-                    <div style={{fontSize:13,fontWeight:700,color:T.text}}>{planTargetLabel(ex,e)}</div>
+                    <div style={{fontSize:13,fontWeight:700,color:T.text}}>
+                      {ex.sets}×{fmtRepsVal(ex.reps, unitType)}{ex.weight>0&&unitType==="reps"?` @ ${ex.weight}kg`:""}
+                    </div>
                     {ex.rest>0&&<div style={{fontSize:10,color:T.muted}}>{ex.rest}s Pause</div>}
                   </div>
                 </div>
@@ -1532,6 +1610,142 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
   );
 };
 
+// ─────────────────────────────────────────────────────────────────────
+// WorkoutExerciseCard – extracted so hooks (useState) are valid
+// Fix: React.useState must not be called inside .map()
+// ─────────────────────────────────────────────────────────────────────
+const WorkoutExerciseCard = ({
+  planEx, planExIdx, allExercises, exerciseOverrides,
+  sets, toggle, upd, addSet,
+}) => {
+  const ikey     = instKey(planEx.eid, planExIdx);
+  const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
+  const override = exerciseOverrides?.[planEx.eid] || {};
+  const resolved = {...(exercise||{}), ...override};
+  const exSets   = sets[ikey]||[];
+  const allDone  = exSets.length>0 && exSets.every(s=>s.done);
+  const unitType = resolved.unitType || "reps";
+  const repLabel = repsFieldLabel(unitType);
+  // Fix 2: only desc/link/img trigger the expandable panel and its toggle button
+  const hasExpandableInfo = !!(resolved.desc || resolved.link || resolved.img);
+  // Fix 3: visible indicator icons (same condition, explicit name)
+  const hasExtraInfo = hasExpandableInfo;
+  const [showInfo, setShowInfo] = useState(false); // safe: called in component, not .map()
+
+  return (
+    <Card key={ikey} style={{marginTop:12}} accent={allDone?T.accentDim:T.border}>
+      {/* Header */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text}}>
+            {resolved.name||"?"}{allDone&&" ✓"}
+          </div>
+          <div style={{fontSize:11,color:T.sub}}>
+            {resolved.cat}{resolved.eq?` · ${resolved.eq}`:""}
+            {planEx.rest>0&&` · ${planEx.rest}s Pause`}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          {/* Fix 2: toggle button only when expandable content exists */}
+          {hasExpandableInfo&&(
+            <button onClick={()=>setShowInfo(v=>!v)} style={{
+              background:showInfo?T.blue+"33":T.bgAlt,
+              border:`1px solid ${showInfo?T.blue+"88":T.border}`,
+              borderRadius:7,padding:"3px 8px",cursor:"pointer",
+              color:showInfo?T.blue:T.muted,fontSize:11,fontWeight:700,lineHeight:"18px",
+            }}>ℹ</button>
+          )}
+          <Badge color={CAT_COLOR_EXT[resolved.cat]||T.accent}>{resolved.cat||"?"}</Badge>
+        </div>
+      </div>
+      {/* Fix 3+4: always-visible micro-indicators for extra content types */}
+      {hasExtraInfo&&(
+        <div style={{display:"flex",gap:5,marginBottom:6,marginTop:-2,flexWrap:"wrap"}}>
+          {resolved.img&&(
+            <span style={{fontSize:10,color:T.purple,background:T.purple+"18",
+              border:`1px solid ${T.purple}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
+              🖼 Bild
+            </span>
+          )}
+          {resolved.desc&&(
+            <span style={{fontSize:10,color:T.blue,background:T.blue+"18",
+              border:`1px solid ${T.blue}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
+              📝 Info
+            </span>
+          )}
+          {resolved.link&&(
+            <span style={{fontSize:10,color:T.teal,background:T.teal+"18",
+              border:`1px solid ${T.teal}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
+              🎥 Video
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Trainingsnotiz – immer sichtbar */}
+      {resolved.trainingsnotiz&&(
+        <div style={{fontSize:11,color:T.teal,marginBottom:6,padding:"4px 8px",
+          background:T.teal+"15",borderRadius:6,border:`1px solid ${T.teal}33`}}>
+          📌 {resolved.trainingsnotiz}
+        </div>
+      )}
+      {planEx.note&&(
+        <div style={{fontSize:10,color:T.muted,marginBottom:6}}>💡 {planEx.note}</div>
+      )}
+
+      {/* Aufklappbarer Info-Bereich */}
+      {showInfo&&(
+        <div style={{marginBottom:10,padding:"10px 12px",background:T.bgAlt,
+          borderRadius:10,border:`1px solid ${T.border}`}}>
+          {resolved.img&&(
+            <img src={resolved.img} alt={resolved.name}
+              style={{width:"100%",borderRadius:8,maxHeight:160,objectFit:"cover",marginBottom:8}}/>
+          )}
+          {resolved.desc&&(
+            <div style={{fontSize:12,color:T.sub,lineHeight:1.6,marginBottom:resolved.link?8:0}}>
+              {resolved.desc}
+            </div>
+          )}
+          {resolved.link&&(
+            <a href={resolved.link} target="_blank" rel="noreferrer"
+              style={{display:"flex",alignItems:"center",gap:6,padding:"7px 10px",
+                background:T.bgCard,borderRadius:8,color:T.blue,fontSize:12,
+                fontWeight:700,textDecoration:"none",marginTop:resolved.desc?6:0}}>
+              🎥 Anleitungsvideo
+            </a>
+          )}
+        </div>
+      )}
+
+      {/* Satz-Zeilen */}
+      {exSets.map((s,i)=>(
+        <div key={i} style={{display:"grid",gridTemplateColumns:"28px 1fr 12px 1fr 1fr 32px",alignItems:"center",gap:4,marginBottom:6,opacity:s.done?0.5:1}}>
+          <div style={{width:26,height:26,borderRadius:7,background:s.done?T.accent:T.bgInput,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:s.done?"#07070F":T.muted,cursor:"pointer"}}
+            onClick={()=>toggle(ikey,i,planEx.rest)}>{s.done?"✓":i+1}</div>
+          {unitType==="reps" ? (
+            <input type="number" value={s.weight} onChange={e=>upd(ikey,i,"weight",e.target.value)}
+              style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+          ) : (
+            <div style={{background:T.bgInput,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:T.muted,minHeight:34}}>—</div>
+          )}
+          <span style={{textAlign:"center",color:T.muted,fontSize:12}}>×</span>
+          <input type="number" value={s.reps} onChange={e=>upd(ikey,i,"reps",e.target.value)}
+            style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+          <div style={{textAlign:"center",fontSize:11,fontWeight:700,color:unitType==="reps"?T.muted:T.teal}}>
+            {unitType==="reps" && s.weight>0 ? `${(s.weight*s.reps).toFixed(0)}` : repLabel}
+          </div>
+          <button onClick={()=>toggle(ikey,i,planEx.rest)} style={{width:30,height:30,borderRadius:8,border:"none",cursor:"pointer",background:s.done?T.accent+"33":T.bgAlt,color:s.done?T.accent:T.muted,fontSize:14}}>
+            {s.done?"✓":"○"}
+          </button>
+        </div>
+      ))}
+      <button onClick={()=>addSet(ikey,planEx)} style={{background:"none",border:`1px dashed ${T.border}`,borderRadius:8,width:"100%",padding:6,color:T.muted,fontSize:11,cursor:"pointer",marginTop:2}}>
+        + Satz
+      </button>
+    </Card>
+  );
+};
+
 // ═══════════════════════════════════════════════════════
 // WORKOUT SCREEN  – mit localStorage Session-Recovery
 // ═══════════════════════════════════════════════════════
@@ -1541,116 +1755,116 @@ function saveWorkoutDraft(draft) {
   try { localStorage.setItem(WS_KEY, JSON.stringify(draft)); } catch {}
 }
 function loadWorkoutDraft() {
-  try { const v = localStorage.getItem(WS_KEY); return v ? JSON.parse(v) : null; }
-  catch { return null; }
+  try {
+    const v = localStorage.getItem(WS_KEY);
+    if (!v) return null;
+    const d = JSON.parse(v);
+    // Fix 6 migration: old drafts used eid as key (no "__"), discard them
+    if (d?.sets && Object.keys(d.sets).some(k => !k.includes("__"))) {
+      localStorage.removeItem(WS_KEY);
+      return null;
+    }
+    return d;
+  } catch { return null; }
 }
 function clearWorkoutDraft() {
   try { localStorage.removeItem(WS_KEY); } catch {}
 }
 
-const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
-  const activePlans = useMemo(() => (plans||[]).filter(p=>!p.archived), [plans]);
-  // ── Beim ersten Render: prüfen ob eine unterbrochene Session vorliegt ──
-  const draft = useMemo(() => loadWorkoutDraft(), []);
-  const hasDraft = draft && draft.phase === "active" && activePlans.some(p=>p.id===draft.planId);
+const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselectedPlanId}) => {
+  // Fix 3: only non-archived plans
+  const activePlans = useMemo(() => (plans||[]).filter(p => !p.archived), [plans]);
 
-  const [phase,setPhase]     = useState(() => {
-    if (hasDraft) return "active";
-    return preselectedPlanId ? "preselect" : "select";
-  });
-  const [planId,setPlanId]   = useState(() => hasDraft ? draft.planId : (preselectedPlanId||null));
-  const [dayId,setDayId]     = useState(() => hasDraft ? draft.dayId  : null);
-  const [sets,setSets]       = useState(() => hasDraft ? draft.sets   : {});
-  const [note,setNote]       = useState(() => hasDraft ? draft.note   : "");
-  const [rest,setRest]       = useState(null);
+  const draft = useMemo(() => loadWorkoutDraft(), []);
+  const hasDraft = draft && draft.phase === "active";
+
+  const [phase,setPhase]   = useState(() => hasDraft ? "active" : preselectedPlanId ? "preselect" : "select");
+  const [planId,setPlanId] = useState(() => hasDraft ? draft.planId : (preselectedPlanId||null));
+  const [dayId,setDayId]   = useState(() => hasDraft ? draft.dayId  : null);
+  const [sets,setSets]     = useState(() => hasDraft ? (draft.sets||{}) : {});
+  const [note,setNote]     = useState(() => hasDraft ? (draft.note||"") : "");
+  const [rest,setRest]     = useState(null);
   const [warnEmpty,setWarnEmpty] = useState(false);
 
-  // t0: beim Wiederherstellen anhand gespeicherter startTime + elapsed rekonstruieren
   const t0Ref    = useRef(null);
   const [elapsed,setElapsed] = useState(() => hasDraft ? (draft.elapsed||0) : 0);
 
+  // Fix 2: sync preselectedPlanId prop changes without wiping active training
+  const prevPreRef = useRef(preselectedPlanId);
   useEffect(() => {
-    if (!preselectedPlanId || phase === "active") return;
-    const exists = activePlans.some(p=>p.id===preselectedPlanId);
-    if (!exists) return;
-    setPlanId(preselectedPlanId);
-    setDayId(null);
-    setSets({});
-    setNote("");
-    setElapsed(0);
-    setWarnEmpty(false);
-    setPhase("preselect");
-  }, [preselectedPlanId, activePlans, phase]);
+    if (preselectedPlanId === prevPreRef.current) return;
+    prevPreRef.current = preselectedPlanId;
+    if (phase === "active" || phase === "done") return;
+    if (preselectedPlanId) { setPlanId(preselectedPlanId); setPhase("preselect"); }
+    else { setPhase("select"); }
+  }, [preselectedPlanId]); // eslint-disable-line
 
-  // t0 berechnen: aktuelle Zeit minus bereits vergangene Sekunden
   useEffect(() => {
     if (phase === "active" && t0Ref.current === null) {
       t0Ref.current = Date.now() - (elapsed * 1000);
     }
   }, [phase]);
 
-  // ── Timer ──
   useEffect(() => {
     if (phase !== "active") return;
     const iv = setInterval(() => setElapsed(Math.floor((Date.now()-t0Ref.current)/1000)), 1000);
     return () => clearInterval(iv);
   }, [phase]);
 
-  // ── Autosave: bei jeder Änderung im aktiven Training speichern ──
   useEffect(() => {
     if (phase !== "active") return;
     saveWorkoutDraft({ phase:"active", planId, dayId, sets, note, elapsed });
   }, [phase, sets, note, elapsed, planId, dayId]);
 
-  // ── Start ──
   const start = (pId, dId) => {
     t0Ref.current = Date.now();
-    setElapsed(0);
-    setWarnEmpty(false);
+    setElapsed(0); setWarnEmpty(false);
     setPlanId(pId); setDayId(dId);
     const day = activePlans.find(p=>p.id===pId)?.days.find(d=>d.id===dId);
     if (!day) return;
     const init = {};
-    day.exercises.forEach(ex => {
-      init[ex.eid] = init[ex.eid] || [];
-      init[ex.eid].push(...Array.from({length:ex.sets}, (_,i) => ({
-        setN:i+1, reps:ex.reps, weight:ex.weight, done:false,
-      })));
+    // Fix 1: key by instance position so duplicate exercises stay separate
+    day.exercises.forEach((ex, exIdx) => {
+      const key = instKey(ex.eid, exIdx);
+      init[key] = Array.from({length: ex.sets}, (_, i) => ({
+        setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
+      }));
     });
-    setSets(init);
-    setPhase("active");
+    setSets(init); setPhase("active");
   };
 
-  const toggle = (eid,idx,restSecs) => setSets(prev => {
-    const upd = {...prev,[eid]:prev[eid].map((s,i)=>i===idx?{...s,done:!s.done}:s)};
-    if (!prev[eid][idx].done && restSecs>0) setRest({secs:restSecs});
+  // Fix 1: ikey = instKey(eid, planExIdx) – unique per occurrence
+  const toggle = (ikey, idx, restSecs) => setSets(prev => {
+    if (!prev[ikey]?.[idx]) return prev;
+    const upd = {...prev, [ikey]: prev[ikey].map((s,i) => i===idx ? {...s,done:!s.done} : s)};
+    if (!prev[ikey][idx].done && restSecs>0) setRest({secs:restSecs});
     return upd;
   });
-  const upd    = (eid,idx,f,v) => setSets(p=>({...p,[eid]:p[eid].map((s,i)=>i===idx?{...s,[f]:parseFloat(v)||0}:s)}));
-  const addSet = (eid,tmpl)    => setSets(p=>({...p,[eid]:[...p[eid],{setN:p[eid].length+1,reps:tmpl.reps,weight:tmpl.weight,done:false}]}));
+  const upd    = (ikey,idx,f,v) => setSets(p=>({...p,[ikey]:(p[ikey]||[]).map((s,i)=>i===idx?{...s,[f]:parseFloat(v)||0}:s)}));
+  const addSet = (ikey,tmpl)    => setSets(p=>({...p,[ikey]:[...(p[ikey]||[]),{setN:(p[ikey]||[]).length+1,reps:tmpl.reps,weight:tmpl.weight,done:false}]}));
 
   const discardDraft = () => {
-    clearWorkoutDraft();
-    t0Ref.current = null;
+    clearWorkoutDraft(); t0Ref.current = null;
     setPlanId(preselectedPlanId||null);
     setDayId(null); setSets({}); setNote(""); setElapsed(0);
     setPhase(preselectedPlanId ? "preselect" : "select");
   };
 
-  // ── Abschließen ──
   const finish = () => {
     const day = activePlans.find(p=>p.id===planId)?.days.find(d=>d.id===dayId);
     if (!day) return;
     const allSets = [];
-    day.exercises.forEach(ex => (sets[ex.eid]||[]).filter(s=>s.done).forEach(s => allSets.push({eid:ex.eid,...s})));
+    // Fix 1: iterate by instance key to keep duplicate exercises separate
+    day.exercises.forEach((ex, exIdx) => {
+      const key = instKey(ex.eid, exIdx);
+      (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({eid:ex.eid,...s}));
+    });
     if (allSets.length === 0) { setWarnEmpty(true); return; }
-    setWarnEmpty(false);
-    clearWorkoutDraft();
+    setWarnEmpty(false); clearWorkoutDraft();
     onSave({id:uid(), planId, dayId, date:new Date().toISOString(), duration:Math.floor(elapsed/60), sets:allSets, note});
     setPhase("done");
   };
 
-  // ── Fertig-Screen ──
   if (phase==="done") return (
     <div style={{padding:"60px 24px",textAlign:"center"}}>
       <div style={{fontSize:80,marginBottom:20}}>🏆</div>
@@ -1663,31 +1877,23 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
     </div>
   );
 
-  // ── Plan-Auswahl ──
   const preselectedPlan = planId ? activePlans.find(p=>p.id===planId) : null;
   if (phase==="select" || phase==="preselect") return (
     <div style={{padding:"0 16px 24px"}}>
       <div style={{padding:"22px 0 14px",fontSize:24,fontWeight:900,color:T.text}}>Training starten</div>
 
-      {/* ── Resume-Banner: unterbrochenes Training wiederaufnehmen ── */}
       {hasDraft && (() => {
-        const draftPlan = activePlans.find(p=>p.id===draft.planId);
-        const draftDay  = draftPlan?.days.find(d=>d.id===draft.dayId);
-        const doneSets  = Object.values(draft.sets||{}).flat().filter(s=>s.done).length;
+        const dp = activePlans.find(p=>p.id===draft.planId);
+        const dd = dp?.days.find(d=>d.id===draft.dayId);
+        const dn = Object.values(draft.sets||{}).flat().filter(s=>s.done).length;
         return (
           <div style={{background:`${T.orange}18`,border:`1px solid ${T.orange}55`,borderRadius:14,padding:"14px 16px",marginBottom:16}}>
-            <div style={{fontSize:12,color:T.orange,fontWeight:800,letterSpacing:0.5,marginBottom:6}}>⚡ UNTERBROCHENES TRAINING</div>
-            <div style={{fontSize:15,fontWeight:700,color:T.text,marginBottom:2}}>{draftDay?.name||"Training"}</div>
-            <div style={{fontSize:12,color:T.sub,marginBottom:12}}>
-              {draftPlan?.name} · {doneSets} Sätze abgehakt · {fmt(draft.elapsed||0)}
-            </div>
+            <div style={{fontSize:12,color:T.orange,fontWeight:800,marginBottom:6}}>⚡ UNTERBROCHENES TRAINING</div>
+            <div style={{fontSize:15,fontWeight:700,color:T.text,marginBottom:2}}>{dd?.name||"Training"}</div>
+            <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{dp?.name} · {dn} Sätze · {fmt(draft.elapsed||0)}</div>
             <div style={{display:"flex",gap:8}}>
-              <Btn onClick={()=>setPhase("active")} style={{flex:2,padding:"10px 0",fontSize:14,borderRadius:10}}>
-                ▶ Fortsetzen
-              </Btn>
-              <Btn v="danger" onClick={discardDraft} style={{flex:1,padding:"10px 0",fontSize:13,borderRadius:10}}>
-                Verwerfen
-              </Btn>
+              <Btn onClick={()=>setPhase("active")} style={{flex:2,padding:"10px 0",fontSize:14,borderRadius:10}}>▶ Fortsetzen</Btn>
+              <Btn v="danger" onClick={discardDraft} style={{flex:1,padding:"10px 0",fontSize:13,borderRadius:10}}>Verwerfen</Btn>
             </div>
           </div>
         );
@@ -1695,17 +1901,13 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
 
       {phase==="preselect" && preselectedPlan ? (
         <>
-          <div style={{fontSize:11,color:T.sub,marginBottom:8,fontWeight:700,letterSpacing:1}}>
-            {preselectedPlan.name.toUpperCase()}
-          </div>
+          <div style={{fontSize:11,color:T.sub,marginBottom:8,fontWeight:700,letterSpacing:1}}>{preselectedPlan.name.toUpperCase()}</div>
           {preselectedPlan.days.map(day=>(
             <Card key={day.id} onClick={()=>start(planId,day.id)} style={{marginBottom:8}} glow>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div>
                   <div style={{fontSize:16,fontWeight:700,color:T.text}}>{day.name}</div>
-                  <div style={{fontSize:12,color:T.sub,marginTop:2}}>
-                    {day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze
-                  </div>
+                  <div style={{fontSize:12,color:T.sub,marginTop:2}}>{day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze</div>
                 </div>
                 <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 18px",borderRadius:10,fontSize:13}}>START</div>
               </div>
@@ -1713,6 +1915,10 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
           ))}
           <Btn v="ghost" onClick={()=>setPhase("select")} style={{marginTop:10,width:"100%"}}>Anderen Plan wählen</Btn>
         </>
+      ) : activePlans.length===0 ? (
+        <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16}}>
+          Kein aktiver Plan vorhanden.<br/><span style={{fontSize:12}}>Erstelle einen Plan unter "Pläne".</span>
+        </div>
       ) : (
         activePlans.map(plan=>(
           <div key={plan.id} style={{marginBottom:16}}>
@@ -1722,9 +1928,7 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div>
                     <div style={{fontSize:16,fontWeight:700,color:T.text}}>{day.name}</div>
-                    <div style={{fontSize:12,color:T.sub,marginTop:2}}>
-                      {day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze
-                    </div>
+                    <div style={{fontSize:12,color:T.sub,marginTop:2}}>{day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze</div>
                   </div>
                   <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 18px",borderRadius:10,fontSize:13}}>START</div>
                 </div>
@@ -1736,7 +1940,6 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
     </div>
   );
 
-  // ── Aktives Training ──
   const plan = activePlans.find(p=>p.id===planId);
   const day  = plan?.days.find(d=>d.id===dayId);
   if (!plan||!day) return null;
@@ -1748,7 +1951,6 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
     <div style={{padding:"0 16px 24px"}}>
       {rest&&<RestTimer seconds={rest.secs} onDone={()=>setRest(null)} onSkip={()=>setRest(null)}/>}
 
-      {/* Sticky header */}
       <div style={{position:"sticky",top:0,background:T.bg,padding:"14px 0 10px",zIndex:10,borderBottom:`1px solid ${T.border}`}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
           <div>
@@ -1761,66 +1963,36 @@ const WorkoutScreen = ({plans, allExercises, onSave, preselectedPlanId}) => {
           </div>
         </div>
         <PBar value={done} max={total} h={4}/>
-        {/* Autosave-Indikator */}
-        <div style={{fontSize:9,color:T.muted,textAlign:"right",marginTop:3,letterSpacing:0.5}}>
-          💾 wird automatisch gespeichert
-        </div>
+        <div style={{fontSize:9,color:T.muted,textAlign:"right",marginTop:3,letterSpacing:0.5}}>💾 automatisch gespeichert</div>
       </div>
 
-      {day.exercises.map(planEx=>{
-        const exercise = allExercises.find(e=>e.id===planEx.eid);
-        const exSets   = sets[planEx.eid]||[];
-        const allDone  = exSets.length>0 && exSets.every(s=>s.done);
-        return (
-          <Card key={planEx.eid} style={{marginTop:12}} accent={allDone?T.accentDim:T.border}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
-              <div style={{flex:1}}>
-                <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text}}>
-                  {exercise?.name||"?"}{allDone&&" ✓"}
-                </div>
-                <div style={{fontSize:11,color:T.sub}}>{exercise?.cat} · {exercise?.eq} · {planEx.rest}s</div>
-                {planEx.note&&<div style={{fontSize:10,color:T.muted,marginTop:2}}>💡 {planEx.note}</div>}
-              </div>
-              <Badge color={CAT_COLOR[exercise?.cat]||T.accent}>{exercise?.cat||"?"}</Badge>
-            </div>
-            {exSets.map((s,i)=>(
-              <div key={i} style={{display:"grid",gridTemplateColumns:"28px 1fr 12px 1fr 1fr 32px",alignItems:"center",gap:4,marginBottom:6,opacity:s.done?0.5:1}}>
-                <div style={{width:26,height:26,borderRadius:7,background:s.done?T.accent:T.bgInput,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:s.done?"#07070F":T.muted,cursor:"pointer"}} onClick={()=>toggle(planEx.eid,i,planEx.rest)}>
-                  {s.done?"✓":i+1}
-                </div>
-                <input type="number" value={s.weight} onChange={e=>upd(planEx.eid,i,"weight",e.target.value)}
-                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-                <span style={{textAlign:"center",color:T.muted,fontSize:12}}>×</span>
-                <input type="number" value={s.reps} onChange={e=>upd(planEx.eid,i,"reps",e.target.value)}
-                  aria-label={isTimeExercise(planEx.eid, exercise)?"Sekunden":"Wiederholungen"}
-                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-                <div style={{textAlign:"center",fontSize:10,color:T.muted,fontWeight:600,lineHeight:1.15}}>
-                  {isTimeExercise(planEx.eid, exercise) ? setTargetLabel(planEx.eid,s.reps,exercise) : (s.weight>0 ? `${(s.weight*s.reps).toFixed(0)}` : "Wdh")}
-                </div>
-                <button onClick={()=>toggle(planEx.eid,i,planEx.rest)} style={{width:30,height:30,borderRadius:8,border:"none",cursor:"pointer",background:s.done?T.accent+"33":T.bgAlt,color:s.done?T.accent:T.muted,fontSize:14}}>
-                  {s.done?"✓":"○"}
-                </button>
-              </div>
-            ))}
-            <button onClick={()=>addSet(planEx.eid,planEx)} style={{background:"none",border:`1px dashed ${T.border}`,borderRadius:8,width:"100%",padding:6,color:T.muted,fontSize:11,cursor:"pointer",marginTop:2}}>
-              + Satz
-            </button>
-          </Card>
-        );
-      })}
+      {day.exercises.map((planEx, planExIdx) => (
+        // Fix 1: WorkoutExerciseCard per instance – hooks valid, keys unique
+        <WorkoutExerciseCard
+          key={instKey(planEx.eid, planExIdx)}
+          planEx={planEx}
+          planExIdx={planExIdx}
+          allExercises={allExercises}
+          exerciseOverrides={exerciseOverrides}
+          sets={sets}
+          toggle={toggle}
+          upd={upd}
+          addSet={addSet}
+        />
+      ))}
 
       <div style={{marginTop:16}}><Lbl>NOTIZ</Lbl><Inp value={note} onChange={setNote} placeholder="Wie war das Training?"/></div>
 
       {warnEmpty && (
         <div style={{marginTop:10,padding:"10px 14px",background:T.red+"22",borderRadius:10,border:`1px solid ${T.red}44`,fontSize:13,color:T.red}}>
-          ⚠️ Bitte mindestens einen Satz abhaken, bevor du das Training abschließt.
+          ⚠️ Mindestens einen Satz abhaken bevor du das Training abschließt.
         </div>
       )}
 
       <Btn onClick={finish} full style={{padding:16,marginTop:14,fontSize:16}}>Training abschließen ✓</Btn>
     </div>
   );
-};
+}
 
 // ═══════════════════════════════════════════════════════
 // PROGRESS SCREEN
@@ -1882,7 +2054,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, onDeleteSession}
                 {exSets.map((s,i)=>(
                   <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:i<exSets.length-1?`1px solid ${T.border}`:"none"}}>
                     <span style={{fontSize:12,color:T.muted}}>Satz {s.setN}</span>
-                    <span style={{fontSize:13,fontWeight:700,color:T.text}}>{s.weight>0?`${s.weight} kg × `:""}{setTargetLabel(s.eid,s.reps,ex)}</span>
+                    <span style={{fontSize:13,fontWeight:700,color:T.text}}>{s.weight>0?`${s.weight} kg × `:""}{s.reps} Wdh</span>
                   </div>
                 ))}
               </Card>
@@ -2246,52 +2418,120 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
 };
 
 // ═══════════════════════════════════════════════════════
-// SETTINGS SCREEN  [FIX 7] App-Info korrigiert
+// SETTINGS SCREEN – with full backup / import / restore
 // ═══════════════════════════════════════════════════════
-const SettingsScreen = ({settings, onUpdate, sessions, metrics, plans, cardio, customExercises, exerciseOverrides, onReset, onRestore}) => {
-  const [weekGoal,setWeekGoal]=useState(String(settings.weeklyGoal||3));
-  const [confirmReset,setConfirmReset]=useState(false);
-  const [importMsg,setImportMsg]=useState(null);
+const SettingsScreen = ({
+  settings, onUpdate,
+  sessions, metrics, plans, cardio,
+  customExercises, exerciseOverrides,
+  onReset, onImport,
+}) => {
+  const [weekGoal,setWeekGoal] = useState(String(settings.weeklyGoal||3));
+  const [confirmReset,setConfirmReset] = useState(false);
+  const [importStatus,setImportStatus] = useState(null); // null | "ok" | "error" | string
   const importRef = useRef(null);
 
-  const totalVol = sessions.reduce((s,x)=>s+vol(x.sets),0);
-  const streak   = calcStreak(sessions,cardio);
+  const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
+  const streak   = useMemo(()=>calcStreak(sessions,cardio),[sessions,cardio]);
 
-  const exportData = () => {
-    const blob = new Blob(
-      [JSON.stringify({sessions,metrics,plans,settings,cardio,customExercises,exerciseOverrides,v:6,exportedAt:new Date().toISOString()},null,2)],
-      {type:"application/json"}
-    );
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement("a"); a.href=url;
-    a.download=`fittrack-v6-${new Date().toISOString().slice(0,10)}.json`;
-    a.click(); URL.revokeObjectURL(url);
-  };
+  // ── Export ───────────────────────────────────────────
+  const exportData = useCallback(() => {
+    const payload = {
+      _fittrack_version: 6,
+      exportedAt: new Date().toISOString(),
+      settings,
+      sessions,
+      cardio,
+      plans,
+      metrics,
+      customExercises: customExercises || [],
+      exerciseOverrides: exerciseOverrides || {},
+    };
+    try {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {type:"application/json"});
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `fittrack-backup-${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch(e) {
+      console.error("Export failed", e);
+    }
+  }, [settings, sessions, cardio, plans, metrics, customExercises, exerciseOverrides]);
 
-  const importData = e => {
+  // ── Import / Validate ────────────────────────────────
+  const handleImportFile = e => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = ""; // reset so same file can be re-selected
     const reader = new FileReader();
-    reader.onerror = () => setImportMsg({type:"error", text:"Backup konnte nicht gelesen werden."});
     reader.onload = ev => {
       try {
-        const restored = validateImportData(JSON.parse(ev.target.result));
-        if (!window.confirm("Backup wirklich importieren? Aktuelle Daten werden ersetzt.")) return;
-        onRestore(restored);
-        setImportMsg({type:"ok", text:"Backup erfolgreich importiert."});
-      } catch (err) {
-        setImportMsg({type:"error", text:err?.message || "Ungueltige Backup-Datei."});
-      } finally {
-        if (e.target) e.target.value = "";
+        const raw = JSON.parse(ev.target.result);
+
+        // Validation
+        if (typeof raw !== "object" || !raw) throw new Error("Kein gültiges JSON-Objekt");
+        if (!raw._fittrack_version) throw new Error("Keine FitTrack-Backup-Datei");
+
+        // Normalise – older exports may miss some fields
+        const imported = {
+          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
+          sessions:          Array.isArray(raw.sessions)   ? raw.sessions   : [],
+          cardio:            Array.isArray(raw.cardio)     ? raw.cardio     : [],
+          plans:             Array.isArray(raw.plans)      ? raw.plans      : [],
+          metrics:           Array.isArray(raw.metrics)    ? raw.metrics    : [],
+          customExercises:   Array.isArray(raw.customExercises) ? raw.customExercises : [],
+          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides) ? raw.exerciseOverrides : {},
+        };
+
+        // Sanity: sessions need id + date + sets
+        const validSessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
+        if (imported.sessions.length !== validSessions.length) {
+          console.warn(`FitTrack import: ${imported.sessions.length - validSessions.length} ungültige Sessions übersprungen`);
+        }
+        imported.sessions = validSessions;
+
+        // Sanity: plans need id + name + days
+        imported.plans = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
+
+        onImport({...imported, settings:{...DEFAULT_SETTINGS, ...imported.settings, onboarded:true}});
+        setImportStatus("ok");
+        setTimeout(()=>setImportStatus(null), 4000);
+      } catch(err) {
+        setImportStatus(`Fehler: ${err.message || "Ungültige Datei"}`);
+        setTimeout(()=>setImportStatus(null), 6000);
       }
+    };
+    reader.onerror = () => {
+      setImportStatus("Datei konnte nicht gelesen werden");
+      setTimeout(()=>setImportStatus(null), 6000);
     };
     reader.readAsText(file);
   };
+
+  const dataStats = {
+    trainings: sessions.length,
+    cardioAct: cardio.length,
+    pläne:     plans.length,
+    eigeneÜb:  (customExercises||[]).length,
+    körper:    metrics.length,
+  };
+  const lsUsageKB = (() => {
+    try {
+      let total = 0;
+      for(const k of Object.keys(localStorage)) {
+        if (k.startsWith(LS_PREFIX)) total += (localStorage.getItem(k)||"").length;
+      }
+      return (total / 1024).toFixed(1);
+    } catch { return "?"; }
+  })();
 
   return (
     <div style={{padding:"0 16px 24px"}}>
       <div style={{padding:"22px 0 14px",fontSize:24,fontWeight:900,color:T.text}}>Einstellungen</div>
 
+      {/* Profile card */}
       <Card style={{marginBottom:12}}>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
           <div style={{width:52,height:52,borderRadius:16,background:T.accentGlow,border:`2px solid ${T.accent}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>💪</div>
@@ -2310,6 +2550,7 @@ const SettingsScreen = ({settings, onUpdate, sessions, metrics, plans, cardio, c
         </div>
       </Card>
 
+      {/* Goals */}
       <Card style={{marginBottom:12}}>
         <Lbl>TRAININGSZIEL</Lbl>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -2327,21 +2568,71 @@ const SettingsScreen = ({settings, onUpdate, sessions, metrics, plans, cardio, c
         </div>
       </Card>
 
+      {/* ── Backup / Restore ──────────────────────────── */}
       <Card style={{marginBottom:12}}>
-        <Lbl>DATEN</Lbl>
-        <Btn v="ghost" onClick={exportData} full style={{marginBottom:8}}>📤 Alle Daten exportieren (JSON)</Btn>
-        <Btn v="secondary" onClick={()=>importRef.current?.click()} full style={{marginBottom:8}}>📥 Backup importieren</Btn>
-        <input ref={importRef} type="file" accept="application/json,.json" onChange={importData} style={{display:"none"}}/>
-        {importMsg&&<div style={{fontSize:12,color:importMsg.type==="ok"?T.green:T.red,marginBottom:8}}>{importMsg.text}</div>}
-        <div style={{fontSize:11,color:T.muted}}>{sessions.length} Kraft · {cardio.length} Cardio · {metrics.length} Körper</div>
+        <Lbl color={T.blue}>BACKUP & WIEDERHERSTELLUNG</Lbl>
+
+        {/* Data summary */}
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
+          {Object.entries(dataStats).map(([k,v])=>(
+            <div key={k} style={{background:T.bgInput,borderRadius:8,padding:"5px 10px",fontSize:11}}>
+              <span style={{color:T.text,fontWeight:700}}>{v}</span>
+              <span style={{color:T.muted}}> {k}</span>
+            </div>
+          ))}
+          <div style={{background:T.bgInput,borderRadius:8,padding:"5px 10px",fontSize:11}}>
+            <span style={{color:T.teal,fontWeight:700}}>{lsUsageKB} KB</span>
+            <span style={{color:T.muted}}> localStorage</span>
+          </div>
+        </div>
+
+        {/* Export */}
+        <Btn v="ghost" onClick={exportData} full style={{marginBottom:8}}>
+          📤 Backup exportieren (JSON)
+        </Btn>
+
+        {/* Import */}
+        <Btn v="ghost" onClick={()=>importRef.current?.click()} full style={{marginBottom:8}}>
+          📥 Backup importieren
+        </Btn>
+        <input
+          ref={importRef}
+          type="file"
+          accept=".json,application/json"
+          onChange={handleImportFile}
+          style={{display:"none"}}
+        />
+
+        {/* Status feedback */}
+        {importStatus && (
+          <div style={{
+            padding:"10px 12px", borderRadius:10, fontSize:13, fontWeight:600,
+            background: importStatus==="ok" ? T.green+"22" : T.red+"22",
+            color:      importStatus==="ok" ? T.green       : T.red,
+            border:`1px solid ${importStatus==="ok" ? T.green+"44" : T.red+"44"}`,
+          }}>
+            {importStatus==="ok"
+              ? "✓ Backup erfolgreich importiert – alle Daten wiederhergestellt"
+              : importStatus}
+          </div>
+        )}
+
+        <div style={{fontSize:11,color:T.muted,marginTop:8,lineHeight:1.6}}>
+          Das Backup enthält alle Trainings, Cardio, Pläne, Körperdaten und eigene Übungen.
+          Beim Import werden bestehende Daten vollständig ersetzt.
+        </div>
       </Card>
 
+      {/* Reset */}
       <Card style={{marginBottom:12}}>
         <Lbl>ZURÜCKSETZEN</Lbl>
         {!confirmReset
           ? <Btn v="danger" onClick={()=>setConfirmReset(true)} full>⚠️ Alle Daten löschen</Btn>
           : <div>
-              <div style={{fontSize:13,color:T.red,marginBottom:10}}>Wirklich alle Daten löschen?</div>
+              <div style={{fontSize:13,color:T.red,marginBottom:10,lineHeight:1.5}}>
+                Wirklich alle Daten unwiderruflich löschen?<br/>
+                <span style={{fontSize:11,color:T.muted}}>Erstelle vorher ein Backup!</span>
+              </div>
               <div style={{display:"flex",gap:8}}>
                 <Btn v="ghost" onClick={()=>setConfirmReset(false)} style={{flex:1}}>Abbrechen</Btn>
                 <Btn v="danger" onClick={()=>{onReset();setConfirmReset(false);}} style={{flex:1}}>Ja, löschen</Btn>
@@ -2350,12 +2641,11 @@ const SettingsScreen = ({settings, onUpdate, sessions, metrics, plans, cardio, c
         }
       </Card>
 
-      {/* [FIX 7] Korrekte App-Info */}
       <div style={{padding:14,background:T.bgAlt,borderRadius:14,border:`1px solid ${T.border}`}}>
         <div style={{fontSize:11,color:T.muted,lineHeight:1.8}}>
-          <span style={{color:T.sub,fontWeight:700}}>ℹ️ FITTRACK v5.0</span><br/>
+          <span style={{color:T.sub,fontWeight:700}}>ℹ️ FITTRACK v6.0</span><br/>
           React Web · JSX · localStorage<br/>
-          <span style={{color:T.accentDim}}>Phase 5: GAINSFIRE-Import · Cardio-Tracking · Progressiver Plan</span>
+          <span style={{color:T.accentDim}}>Backup-System · unitType · Bilder-Komprimierung · Cardio-Sort</span>
         </div>
       </div>
     </div>
@@ -2389,22 +2679,23 @@ function App() {
 
   const saveSession    = useCallback(s =>  { setSessions(p=>[s,...p]); setTab("progress"); }, []);
   const saveMetric     = useCallback(m =>  { setMetrics(p=>[...p,m]); },                      []);
-  const saveCardio     = useCallback(c =>  { setCardio(p=>sortByDateDesc([c,...p])); },          []);
+  const saveCardio     = useCallback(c =>  { setCardio(p=>[c,...p]); },                        []);
   const updateSettings = useCallback(u =>  { setSettings(p=>({...p,...u})); },                 []);
   const resetAll = useCallback(()=> {
-    setSessions([]); setMetrics([]); setCardio([]); setPlans(MY_PLANS);
+    setSessions([]); setMetrics([]); setCardio([]);
     setCustomExercises([]); setExerciseOverrides({});
     setSettings({...DEFAULT_SETTINGS,onboarded:false});
   }, []);
-  const restoreAll = useCallback(data => {
-    setSettings(data.settings);
-    setSessions(sortByDateDesc(data.sessions));
-    setMetrics(sortByDateDesc(data.metrics));
-    setPlans(data.plans);
-    setCardio(sortByDateDesc(data.cardio));
-    setCustomExercises(data.customExercises);
-    setExerciseOverrides(data.exerciseOverrides);
-    setTab("dashboard");
+
+  // Fix 4: Import handler – fully replaces all state from backup
+  const importAll = useCallback(({settings:s, sessions:se, cardio:ca, plans:pl, metrics:me, customExercises:cx, exerciseOverrides:eo}) => {
+    if (s)  setSettings(s);
+    if (se) setSessions(se);
+    if (ca) setCardio(ca);
+    if (pl) setPlans(pl);
+    if (me) setMetrics(me);
+    if (cx) setCustomExercises(cx);
+    if (eo) setExerciseOverrides(eo);
   }, []);
   const finishOnboarding = useCallback(({name,goal,weeklyGoal,weight}) => {
     setSettings(p=>({...p,name,fitnessGoal:goal,weeklyGoal,onboarded:true,bodyWeight:weight||null}));
@@ -2449,7 +2740,7 @@ function App() {
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
       case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio}/>;
       case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
-      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onRestore={restoreAll}/>;
+      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
       default:             return null;
     }
   };
