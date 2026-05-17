@@ -1870,6 +1870,9 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
   const [note,setNote]     = useState(() => hasDraft ? (draft.note||"") : "");
   const [rest,setRest]     = useState(null);
   const [warnEmpty,setWarnEmpty] = useState(false);
+  // "confirm" phase: plan+day selected, user sees overview before officially starting
+  const [confirmPlanId, setConfirmPlanId] = useState(null);
+  const [confirmDayId,  setConfirmDayId]  = useState(null);
 
   const t0Ref    = useRef(null);
   const [elapsed,setElapsed] = useState(() => hasDraft ? (draft.elapsed||0) : 0);
@@ -1918,6 +1921,13 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
     setSets(init); setPhase("active");
   };
 
+  // Select a day → go to confirm screen first
+  const selectDay = (pId, dId) => {
+    setConfirmPlanId(pId);
+    setConfirmDayId(dId);
+    setPhase("confirm");
+  };
+
   // Fix 1: ikey = instKey(eid, planExIdx) – unique per occurrence
   const toggle = (ikey, idx, restSecs) => setSets(prev => {
     if (!prev[ikey]?.[idx]) return prev;
@@ -1963,6 +1973,80 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
   );
 
   const preselectedPlan = planId ? activePlans.find(p=>p.id===planId) : null;
+  // ── Confirm screen ─────────────────────────────────────────────────
+  if (phase === "confirm") {
+    const cp  = activePlans.find(p=>p.id===confirmPlanId);
+    const cd  = cp?.days.find(d=>d.id===confirmDayId);
+    if (!cp || !cd) { setPhase("select"); return null; }
+    const totalSets = cd.exercises.reduce((s,e)=>s+e.sets, 0);
+    return (
+      <div style={{padding:"0 16px 32px"}}>
+        <div style={{padding:"22px 0 6px",display:"flex",alignItems:"center",gap:10}}>
+          <Btn v="ghost" onClick={()=>setPhase(planId?"preselect":"select")} style={{padding:"8px 14px"}}>←</Btn>
+          <div style={{fontSize:22,fontWeight:900,color:T.text}}>Bereit?</div>
+        </div>
+
+        {/* Plan + Day info */}
+        <div style={{fontSize:12,color:T.sub,marginBottom:16,paddingLeft:2}}>{cp.name}</div>
+
+        <Card style={{marginBottom:14}} glow>
+          <div style={{fontSize:20,fontWeight:900,color:T.accent,marginBottom:6}}>{cd.name}</div>
+          <div style={{display:"flex",gap:14,fontSize:13,color:T.sub,marginBottom:16}}>
+            <span>🏋 {cd.exercises.length} Übungen</span>
+            <span>📋 {totalSets} Sätze</span>
+          </div>
+
+          {/* Exercise list preview */}
+          {cd.exercises.map((ex, i) => {
+            const exercise = (allExercises||[]).find(e=>e.id===ex.eid);
+            const override = exerciseOverrides?.[ex.eid] || {};
+            const resolved = {...(exercise||{}), ...override};
+            const unitType = resolved.unitType || "reps";
+            return (
+              <div key={instKey(ex.eid, i)} style={{
+                display:"flex", justifyContent:"space-between", alignItems:"center",
+                padding:"7px 0",
+                borderBottom: i < cd.exercises.length-1 ? `1px solid ${T.border}` : "none",
+              }}>
+                <div>
+                  <div style={{fontSize:13,fontWeight:600,color:T.text}}>{resolved.name||"?"}</div>
+                  {resolved.trainingsnotiz && (
+                    <div style={{fontSize:10,color:T.teal,marginTop:1}}>📌 {resolved.trainingsnotiz}</div>
+                  )}
+                  {ex.note && (
+                    <div style={{fontSize:10,color:T.muted,marginTop:1}}>💡 {ex.note}</div>
+                  )}
+                </div>
+                <div style={{textAlign:"right",flexShrink:0,marginLeft:12}}>
+                  <span style={{fontSize:13,fontWeight:700,color:T.sub}}>
+                    {ex.sets}×{fmtRepsVal(ex.reps, unitType)}
+                  </span>
+                  {ex.weight>0 && unitType==="reps" && (
+                    <div style={{fontSize:11,color:T.muted}}>{ex.weight} kg</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </Card>
+
+        {/* The actual start button */}
+        <Btn
+          onClick={()=>start(confirmPlanId, confirmDayId)}
+          full
+          style={{padding:"18px 0", fontSize:18, borderRadius:16, letterSpacing:0.5}}
+        >
+          ▶ Training starten
+        </Btn>
+
+        <div style={{marginTop:10,textAlign:"center",fontSize:11,color:T.muted}}>
+          Tippe „←" um einen anderen Tag zu wählen
+        </div>
+      </div>
+    );
+  }
+
+  // ── Select / preselect screen ───────────────────────────────────────
   if (phase==="select" || phase==="preselect") return (
     <div style={{padding:"0 16px 24px"}}>
       <div style={{padding:"22px 0 14px",fontSize:24,fontWeight:900,color:T.text}}>Training starten</div>
@@ -1988,13 +2072,13 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
         <>
           <div style={{fontSize:11,color:T.sub,marginBottom:8,fontWeight:700,letterSpacing:1}}>{preselectedPlan.name.toUpperCase()}</div>
           {preselectedPlan.days.map(day=>(
-            <Card key={day.id} onClick={()=>start(planId,day.id)} style={{marginBottom:8}} glow>
+            <Card key={day.id} onClick={()=>selectDay(planId,day.id)} style={{marginBottom:8}} glow>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div>
                   <div style={{fontSize:16,fontWeight:700,color:T.text}}>{day.name}</div>
                   <div style={{fontSize:12,color:T.sub,marginTop:2}}>{day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze</div>
                 </div>
-                <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 18px",borderRadius:10,fontSize:13}}>START</div>
+                <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 16px",borderRadius:10,fontSize:13}}>Wählen ›</div>
               </div>
             </Card>
           ))}
@@ -2009,13 +2093,13 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
           <div key={plan.id} style={{marginBottom:16}}>
             <Lbl>{plan.name.toUpperCase()}</Lbl>
             {plan.days.map(day=>(
-              <Card key={day.id} onClick={()=>start(plan.id,day.id)} style={{marginBottom:8}}>
+              <Card key={day.id} onClick={()=>selectDay(plan.id,day.id)} style={{marginBottom:8}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div>
                     <div style={{fontSize:16,fontWeight:700,color:T.text}}>{day.name}</div>
                     <div style={{fontSize:12,color:T.sub,marginTop:2}}>{day.exercises.length} Übungen · {day.exercises.reduce((s,e)=>s+e.sets,0)} Sätze</div>
                   </div>
-                  <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 18px",borderRadius:10,fontSize:13}}>START</div>
+                  <div style={{background:T.accent,color:"#07070F",fontWeight:900,padding:"9px 16px",borderRadius:10,fontSize:13}}>Wählen ›</div>
                 </div>
               </Card>
             ))}
@@ -2075,6 +2159,29 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
       )}
 
       <Btn onClick={finish} full style={{padding:16,marginTop:14,fontSize:16}}>Training abschließen ✓</Btn>
+
+      {/* Abbrechen – klein und dezent, mit Sicherheitsabfrage */}
+      <button
+        onClick={() => {
+          const ok = window.confirm(
+            "Training wirklich abbrechen?\n\nDie aktuelle Einheit wird NICHT gespeichert."
+          );
+          if (!ok) return;
+          clearWorkoutDraft();
+          t0Ref.current = null;
+          setSets({}); setNote(""); setElapsed(0);
+          setPlanId(null); setDayId(null);
+          setPhase("select");
+        }}
+        style={{
+          display:"block", width:"100%", marginTop:10,
+          background:"none", border:"none", cursor:"pointer",
+          color:T.muted, fontSize:12, padding:"8px 0",
+          textDecoration:"underline", textUnderlineOffset:3,
+        }}
+      >
+        Training abbrechen
+      </button>
     </div>
   );
 }
