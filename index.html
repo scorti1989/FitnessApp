@@ -629,46 +629,131 @@ const BarChart = ({data, labels, color=T.blue, height=80}) => {
 // ═══════════════════════════════════════════════════════
 // REST TIMER
 // ═══════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────
+// AUDIO ENGINE – Web Audio API, offline, kein externes File
+// ─────────────────────────────────────────────────────────────────────
+const AudioEngine = (() => {
+  let ctx = null;
+
+  const getCtx = () => {
+    if (!ctx) {
+      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch(e) { return null; }
+    }
+    if (ctx.state === "suspended") ctx.resume();
+    return ctx;
+  };
+
+  // Einzelner Ton: freq Hz, dur Sekunden, vol 0-1
+  const tone = (freq, dur, vol = 0.45, delay = 0) => {
+    const c = getCtx(); if (!c) return;
+    const t   = c.currentTime + delay;
+    const osc = c.createOscillator();
+    const g   = c.createGain();
+    osc.connect(g); g.connect(c.destination);
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.start(t); osc.stop(t + dur + 0.05);
+  };
+
+  return {
+    // Kurzer hoher Tick – 10-Sekunden-Countdown
+    tick: () => tone(1050, 0.10, 0.38),
+
+    // "Los!"-Gong wenn Pause vorbei (zwei Töne, leicht harmonisch)
+    done: () => {
+      tone(660, 0.30, 0.55, 0.0);
+      tone(880, 0.45, 0.40, 0.08);
+    },
+  };
+})();
+
+// ─────────────────────────────────────────────────────────────────────
+// REST TIMER – mit Ticks ab 10 Sek und Gong am Ende
+// ─────────────────────────────────────────────────────────────────────
 const RestTimer = ({seconds, onDone, onSkip}) => {
   const [left, setLeft] = useState(seconds);
-  const ref = useRef(null);
+  const intervalRef = useRef(null);
+  // Merken welche Ticks schon abgespielt wurden (verhindert Doppeltöne)
+  const ticked = useRef(new Set());
+
   useEffect(() => {
-    ref.current = setInterval(() => setLeft(p => {
-      if (p <= 1) { clearInterval(ref.current); onDone(); return 0; }
-      return p-1;
-    }), 1000);
-    return () => clearInterval(ref.current);
-  }, []);
-  const pct=(left/seconds)*100, r=44, circ=2*Math.PI*r, m=Math.floor(left/60), s=left%60;
+    intervalRef.current = setInterval(() => {
+      setLeft(prev => {
+        const next = prev - 1;
+
+        // Ticks für 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 Sek – jede Sekunde einmal
+        if (next > 0 && next <= 10 && !ticked.current.has(next)) {
+          ticked.current.add(next);
+          AudioEngine.tick();
+        }
+
+        // Timer abgelaufen → Gong + Callback
+        if (next <= 0) {
+          clearInterval(intervalRef.current);
+          AudioEngine.done();
+          onDone();
+          return 0;
+        }
+        return next;
+      });
+    }, 1000);
+
+    return () => clearInterval(intervalRef.current);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Wenn der Nutzer +/-Zeit drückt, neue Ticks erlauben
+  const adjust = delta => {
+    setLeft(l => {
+      const next = Math.max(0, l + delta);
+      // Ticks für den neuen Bereich freigeben
+      ticked.current = new Set(
+        [...ticked.current].filter(v => v > next)
+      );
+      return next;
+    });
+  };
+
+  const pct  = (left / seconds) * 100;
+  const r    = 44;
+  const circ = 2 * Math.PI * r;
+  const m    = Math.floor(left / 60);
+  const s    = left % 60;
+  // Kreis wird rot in den letzten 10 Sekunden
+  const ringColor = left <= 10 ? T.orange : T.accent;
+
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(7,7,15,0.93)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:300,backdropFilter:"blur(10px)"}}>
       <div style={{fontSize:11,color:T.sub,letterSpacing:2,marginBottom:24}}>PAUSE</div>
       <div style={{position:"relative",width:130,height:130,marginBottom:28}}>
         <svg width="130" height="130" style={{transform:"rotate(-90deg)"}}>
           <circle cx="65" cy="65" r={r} fill="none" stroke={T.border} strokeWidth="7"/>
-          <circle cx="65" cy="65" r={r} fill="none" stroke={T.accent} strokeWidth="7"
+          <circle cx="65" cy="65" r={r} fill="none" stroke={ringColor} strokeWidth="7"
             strokeDasharray={circ} strokeDashoffset={circ*(1-pct/100)} strokeLinecap="round"
-            style={{transition:"stroke-dashoffset 1s linear"}}/>
+            style={{transition:"stroke-dashoffset 1s linear, stroke 0.4s"}}/>
         </svg>
         <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
-          <div style={{fontSize:38,fontWeight:900,color:T.accent,fontVariantNumeric:"tabular-nums"}}>
+          <div style={{fontSize:38,fontWeight:900,color:left<=10?T.orange:T.accent,fontVariantNumeric:"tabular-nums",transition:"color 0.4s"}}>
             {m>0?`${m}:${s.toString().padStart(2,"0")}`:s}
           </div>
           <div style={{fontSize:10,color:T.muted}}>sek</div>
         </div>
       </div>
       <div style={{display:"flex",gap:8,marginBottom:24}}>
-        {[-15,+15,+30].map(d => (
-          <button key={d} onClick={()=>setLeft(l=>Math.max(0,l+d))} style={{
-            background:T.bgAlt, color:d<0?T.red:T.green,
-            border:`1px solid ${T.border}`, borderRadius:10,
-            padding:"8px 14px", fontWeight:700, fontSize:13, cursor:"pointer",
+        {[-15,+15,+30].map(d=>(
+          <button key={d} onClick={()=>adjust(d)} style={{
+            background:T.bgAlt,color:d<0?T.red:T.green,
+            border:`1px solid ${T.border}`,borderRadius:10,
+            padding:"8px 14px",fontWeight:700,fontSize:13,cursor:"pointer",
           }}>{d>0?"+":""}{d}s</button>
         ))}
       </div>
       <div style={{display:"flex",gap:10}}>
         <Btn v="ghost" onClick={onSkip} style={{padding:"10px 24px"}}>Überspringen</Btn>
-        <Btn onClick={onDone} style={{padding:"10px 28px"}}>Fertig ✓</Btn>
+        <Btn onClick={()=>{AudioEngine.done();onDone();}} style={{padding:"10px 28px"}}>Fertig ✓</Btn>
       </div>
     </div>
   );
