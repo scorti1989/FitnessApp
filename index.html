@@ -762,18 +762,131 @@ const RestTimer = ({seconds, onDone, onSkip}) => {
 // ═══════════════════════════════════════════════════════
 // ONBOARDING
 // ═══════════════════════════════════════════════════════
-const OnboardingScreen = ({onDone}) => {
-  const [step,setStep]=useState(0);
-  const [name,setName]=useState("");
-  const [goal,setGoal]=useState("");
-  const [days,setDays]=useState(3);
-  const [weight,setWeight]=useState("");
+const OnboardingScreen = ({onDone, onImport}) => {
+  const [step,setStep]   = useState(0);
+  const [name,setName]   = useState("");
+  const [goal,setGoal]   = useState("");
+  const [days,setDays]   = useState(3);
+  const [weight,setWeight] = useState("");
+  // Backup-Import state
+  const [importState, setImportState] = useState(null); // null | "loading" | "ok" | "error"
+  const [importMsg,   setImportMsg]   = useState("");
+  const importRef = useRef(null);
+
+  const handleImportFile = e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    setImportState("loading");
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const raw = JSON.parse(ev.target.result);
+        if (typeof raw !== "object" || !raw)        throw new Error("Kein gültiges JSON");
+        if (!raw._fittrack_version)                  throw new Error("Keine FitTrack-Backup-Datei");
+
+        const imported = {
+          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
+          sessions:          Array.isArray(raw.sessions)          ? raw.sessions          : [],
+          cardio:            Array.isArray(raw.cardio)            ? raw.cardio            : [],
+          plans:             Array.isArray(raw.plans)             ? raw.plans             : [],
+          metrics:           Array.isArray(raw.metrics)           ? raw.metrics           : [],
+          customExercises:   Array.isArray(raw.customExercises)   ? raw.customExercises   : [],
+          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides)
+                               ? raw.exerciseOverrides : {},
+        };
+        imported.sessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
+        imported.plans    = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
+        // Mark as onboarded so the app opens normally after import
+        imported.settings = {...DEFAULT_SETTINGS, ...imported.settings, onboarded: true};
+
+        onImport(imported);
+        setImportState("ok");
+        setImportMsg(`${imported.sessions.length} Trainings, ${imported.plans.length} Pläne wiederhergestellt.`);
+      } catch(err) {
+        setImportState("error");
+        setImportMsg(err.message || "Ungültige Datei");
+      }
+    };
+    reader.onerror = () => { setImportState("error"); setImportMsg("Datei konnte nicht gelesen werden"); };
+    reader.readAsText(file);
+  };
 
   const steps = [
     {
       title:"Willkommen bei FitTrack 💪",
       sub:"Privates Trainings-Tagebuch. Offline, nur für dich.",
-      content:<div><Lbl>DEIN NAME (optional)</Lbl><Inp value={name} onChange={setName} placeholder="z.B. Max"/></div>,
+      content:(
+        <div>
+          <Lbl>DEIN NAME (optional)</Lbl>
+          <Inp value={name} onChange={setName} placeholder="z.B. Max"/>
+
+          {/* ── Backup wiederherstellen ── */}
+          <div style={{marginTop:28}}>
+            <div style={{
+              height:1, background:T.border, marginBottom:20,
+              position:"relative",
+            }}>
+              <span style={{
+                position:"absolute", top:-9, left:"50%", transform:"translateX(-50%)",
+                background:T.bg, padding:"0 10px",
+                fontSize:11, color:T.muted, fontWeight:700, letterSpacing:1,
+              }}>ODER</span>
+            </div>
+
+            <div style={{
+              border:`1px solid ${T.border}`, borderRadius:14,
+              padding:"16px 16px 14px",
+              background:T.bgAlt,
+            }}>
+              <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>
+                Backup wiederherstellen
+              </div>
+              <div style={{fontSize:12,color:T.sub,marginBottom:14,lineHeight:1.6}}>
+                Hast du bereits Daten aus FitTrack? Lade deine Backup-Datei (.json) hoch –
+                alle Trainings, Pläne und Einstellungen werden sofort wiederhergestellt.
+              </div>
+
+              <Btn v="secondary" onClick={()=>importRef.current?.click()} full
+                style={{fontSize:13,padding:"10px 0"}}>
+                📥 Backup-Datei hochladen
+              </Btn>
+              <input
+                ref={importRef}
+                type="file"
+                accept=".json,application/json"
+                onChange={handleImportFile}
+                style={{display:"none"}}
+              />
+
+              {/* Status */}
+              {importState === "loading" && (
+                <div style={{marginTop:10,fontSize:12,color:T.sub,textAlign:"center"}}>
+                  Lade Backup…
+                </div>
+              )}
+              {importState === "ok" && (
+                <div style={{
+                  marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
+                  background:T.green+"18",color:T.green,border:`1px solid ${T.green}44`,
+                  lineHeight:1.5,
+                }}>
+                  ✓ Backup erfolgreich importiert!<br/>
+                  <span style={{color:T.sub}}>{importMsg}</span>
+                </div>
+              )}
+              {importState === "error" && (
+                <div style={{
+                  marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
+                  background:T.red+"18",color:T.red,border:`1px solid ${T.red}44`,
+                }}>
+                  ✗ {importMsg}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ),
     },
     {
       title:"Was ist dein Ziel?",
@@ -829,16 +942,29 @@ const OnboardingScreen = ({onDone}) => {
         <div style={{fontSize:14,color:T.sub,marginBottom:32,lineHeight:1.6}}>{cur.sub}</div>
         {cur.content}
       </div>
-      <div style={{display:"flex",gap:10,marginTop:32}}>
-        {step>0&&<Btn v="ghost" onClick={()=>setStep(s=>s-1)} style={{flex:1}}>← Zurück</Btn>}
-        <Btn
-          onClick={isLast
-            ? ()=>onDone({name:name||"Athlet",goal:goal||"Fitness",weeklyGoal:days,weight:parseFloat(weight)||null})
-            : ()=>setStep(s=>s+1)}
-          disabled={!canNext}
-          style={{flex:2,padding:14,fontSize:16}}
-        >{isLast?"Los geht's! 🚀":"Weiter →"}</Btn>
-      </div>
+
+      {/* Buttons – beim erfolgreichen Import wird "Weiter" durch einen Hinweis ersetzt */}
+      {importState === "ok" ? (
+        <div style={{marginTop:32,textAlign:"center"}}>
+          <div style={{fontSize:13,color:T.sub,marginBottom:12}}>
+            Die App öffnet sich automatisch mit deinen Daten.
+          </div>
+          <div style={{fontSize:12,color:T.muted}}>
+            Falls die App nicht reagiert, tippe kurz auf eine andere Seite.
+          </div>
+        </div>
+      ) : (
+        <div style={{display:"flex",gap:10,marginTop:32}}>
+          {step>0&&<Btn v="ghost" onClick={()=>setStep(s=>s-1)} style={{flex:1}}>← Zurück</Btn>}
+          <Btn
+            onClick={isLast
+              ? ()=>onDone({name:name||"Athlet",goal:goal||"Fitness",weeklyGoal:days,weight:parseFloat(weight)||null})
+              : ()=>setStep(s=>s+1)}
+            disabled={!canNext}
+            style={{flex:2,padding:14,fontSize:16}}
+          >{isLast?"Los geht's! 🚀":"Weiter →"}</Btn>
+        </div>
+      )}
     </div>
   );
 };
@@ -2899,7 +3025,7 @@ function App() {
     setTab("workout");
   }, []);
 
-  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding}/>;
+  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding} onImport={importAll}/>;
 
   const TABS = [
     {id:"dashboard", icon:"⌂",  label:"Home"},
