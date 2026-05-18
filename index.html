@@ -297,7 +297,49 @@ function repsFieldLabel(unitType) {
 const DEFAULT_SETTINGS = {
   weeklyGoal:4, weightGoal:null, unit:"kg",
   fitnessGoal:"Muskelaufbau", name:"", onboarded:false, bodyWeight:null,
+  // Timer tick thresholds (seconds before end where beeps start)
+  timerSettings: {
+    restTickStart:     10,   // Pausen-Timer
+    exerciseTickStart: 10,   // Zeitübungs-Timer
+  },
+  // Default rest durations by category/equipment (seconds)
+  restRules: {
+    warmup:     30,
+    stretching: 30,
+    machine:    60,
+    cable:      75,
+    dumbbell:   90,
+    barbell:    90,
+    bodyweight: 60,
+    default:    60,
+  },
 };
+
+// Helper: return default rest (secs) for an exercise based on settings rules
+function getDefaultRestForExercise(exercise, settings) {
+  const rules = { ...DEFAULT_SETTINGS.restRules, ...(settings?.restRules || {}) };
+  if (!exercise) return rules.default;
+  const cat = exercise.cat || "";
+  const eq  = exercise.eq  || "";
+  if (cat === "Aufwärmen") return rules.warmup;
+  if (cat === "Dehnung")   return rules.stretching;
+  if (eq  === "Maschine")  return rules.machine;
+  if (eq  === "Kabel")     return rules.cable;
+  if (eq  === "Kurzhantel")return rules.dumbbell;
+  if (eq  === "Langhantel")return rules.barbell;
+  if (eq  === "Körpergewicht") return rules.bodyweight;
+  return rules.default;
+}
+
+// Merge settings with defaults (for backward-compat with old backups)
+function mergeWithDefaults(saved) {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...saved,
+    timerSettings: { ...DEFAULT_SETTINGS.timerSettings, ...(saved?.timerSettings || {}) },
+    restRules:     { ...DEFAULT_SETTINGS.restRules,     ...(saved?.restRules     || {}) },
+  };
+}
 
 // ── Zusätzliche Übungen: Warm-up, Mobilisierung, Dehnung ──────────────
 // Diese werden zu EDB gemergt (custom exercises folgen später im State)
@@ -674,24 +716,24 @@ const AudioEngine = (() => {
 // ─────────────────────────────────────────────────────────────────────
 // REST TIMER – mit Ticks ab 10 Sek und Gong am Ende
 // ─────────────────────────────────────────────────────────────────────
-const RestTimer = ({seconds, onDone, onSkip}) => {
+// ─────────────────────────────────────────────────────────────────────
+// RestTimer – compact top overlay (Punkt 5)
+// tickStart: seconds before end where beeping begins (from settings)
+// ─────────────────────────────────────────────────────────────────────
+const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
   const [left, setLeft] = useState(seconds);
   const intervalRef = useRef(null);
-  // Merken welche Ticks schon abgespielt wurden (verhindert Doppeltöne)
   const ticked = useRef(new Set());
 
   useEffect(() => {
     intervalRef.current = setInterval(() => {
       setLeft(prev => {
         const next = prev - 1;
-
-        // Ticks für 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 Sek – jede Sekunde einmal
-        if (next > 0 && next <= 10 && !ticked.current.has(next)) {
+        // Ticks in the final tickStart seconds
+        if (next > 0 && next <= tickStart && !ticked.current.has(next)) {
           ticked.current.add(next);
           AudioEngine.tick();
         }
-
-        // Timer abgelaufen → Gong + Callback
         if (next <= 0) {
           clearInterval(intervalRef.current);
           AudioEngine.done();
@@ -701,59 +743,161 @@ const RestTimer = ({seconds, onDone, onSkip}) => {
         return next;
       });
     }, 1000);
-
     return () => clearInterval(intervalRef.current);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Wenn der Nutzer +/-Zeit drückt, neue Ticks erlauben
   const adjust = delta => {
     setLeft(l => {
       const next = Math.max(0, l + delta);
-      // Ticks für den neuen Bereich freigeben
-      ticked.current = new Set(
-        [...ticked.current].filter(v => v > next)
-      );
+      ticked.current = new Set([...ticked.current].filter(v => v > next));
       return next;
     });
   };
 
   const pct  = (left / seconds) * 100;
-  const r    = 44;
+  const r    = 30;
   const circ = 2 * Math.PI * r;
   const m    = Math.floor(left / 60);
   const s    = left % 60;
-  // Kreis wird rot in den letzten 10 Sekunden
-  const ringColor = left <= 10 ? T.orange : T.accent;
+  const nearEnd = left <= tickStart;
 
+  // Punkt 5: compact overlay – top area, not fullscreen
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(7,7,15,0.93)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:300,backdropFilter:"blur(10px)"}}>
-      <div style={{fontSize:11,color:T.sub,letterSpacing:2,marginBottom:24}}>PAUSE</div>
-      <div style={{position:"relative",width:130,height:130,marginBottom:28}}>
-        <svg width="130" height="130" style={{transform:"rotate(-90deg)"}}>
-          <circle cx="65" cy="65" r={r} fill="none" stroke={T.border} strokeWidth="7"/>
-          <circle cx="65" cy="65" r={r} fill="none" stroke={ringColor} strokeWidth="7"
-            strokeDasharray={circ} strokeDashoffset={circ*(1-pct/100)} strokeLinecap="round"
-            style={{transition:"stroke-dashoffset 1s linear, stroke 0.4s"}}/>
-        </svg>
-        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
-          <div style={{fontSize:38,fontWeight:900,color:left<=10?T.orange:T.accent,fontVariantNumeric:"tabular-nums",transition:"color 0.4s"}}>
-            {m>0?`${m}:${s.toString().padStart(2,"0")}`:s}
+    <div style={{
+      position:"fixed", top:80, left:16, right:16,
+      background:T.bgCard, borderRadius:18,
+      border:`2px solid ${nearEnd ? T.orange : T.accent}66`,
+      boxShadow:`0 8px 40px rgba(0,0,0,0.7)`,
+      zIndex:300, padding:"14px 16px 12px",
+    }}>
+      <div style={{display:"flex", alignItems:"center", gap:14}}>
+        {/* Circular progress */}
+        <div style={{position:"relative", width:72, height:72, flexShrink:0}}>
+          <svg width="72" height="72" style={{transform:"rotate(-90deg)"}}>
+            <circle cx="36" cy="36" r={r} fill="none" stroke={T.border} strokeWidth="5"/>
+            <circle cx="36" cy="36" r={r} fill="none"
+              stroke={nearEnd ? T.orange : T.accent} strokeWidth="5"
+              strokeDasharray={circ}
+              strokeDashoffset={circ * (1 - Math.max(0, pct) / 100)}
+              strokeLinecap="round"
+              style={{transition:"stroke-dashoffset 1s linear, stroke 0.4s"}}/>
+          </svg>
+          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+            <div style={{fontSize:20,fontWeight:900,color:nearEnd?T.orange:T.accent,fontVariantNumeric:"tabular-nums",lineHeight:1}}>
+              {m>0?`${m}:${s.toString().padStart(2,"0")}`:s}
+            </div>
+            <div style={{fontSize:9,color:T.muted}}>PAUSE</div>
           </div>
-          <div style={{fontSize:10,color:T.muted}}>sek</div>
+        </div>
+
+        {/* Right side: adjust + actions */}
+        <div style={{flex:1}}>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            {[-15,+15,+30].map(d=>(
+              <button key={d} onClick={()=>adjust(d)} style={{
+                flex:1, background:T.bgAlt, color:d<0?T.red:T.green,
+                border:`1px solid ${T.border}`, borderRadius:8,
+                padding:"5px 0", fontWeight:700, fontSize:12, cursor:"pointer",
+              }}>{d>0?"+":""}{d}s</button>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <Btn v="ghost" onClick={onSkip} style={{flex:1,padding:"7px 0",fontSize:12}}>Überspr.</Btn>
+            <Btn onClick={()=>{AudioEngine.done();onDone();}} style={{flex:1,padding:"7px 0",fontSize:12}}>Fertig ✓</Btn>
+          </div>
         </div>
       </div>
-      <div style={{display:"flex",gap:8,marginBottom:24}}>
-        {[-15,+15,+30].map(d=>(
-          <button key={d} onClick={()=>adjust(d)} style={{
-            background:T.bgAlt,color:d<0?T.red:T.green,
-            border:`1px solid ${T.border}`,borderRadius:10,
-            padding:"8px 14px",fontWeight:700,fontSize:13,cursor:"pointer",
-          }}>{d>0?"+":""}{d}s</button>
-        ))}
-      </div>
-      <div style={{display:"flex",gap:10}}>
-        <Btn v="ghost" onClick={onSkip} style={{padding:"10px 24px"}}>Überspringen</Btn>
-        <Btn onClick={()=>{AudioEngine.done();onDone();}} style={{padding:"10px 28px"}}>Fertig ✓</Btn>
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// ExerciseTimer – for unitType "secs"/"mins" exercises (Punkt 6+7)
+// Counts DOWN to zero, then counts UP showing overtime.
+// Does NOT auto-complete the set – user taps "Satz beenden".
+// tickStart: seconds before zero where beeps start.
+// ─────────────────────────────────────────────────────────────────────
+const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
+  const [elapsed, setElapsed] = useState(0);
+  const intervalRef = useRef(null);
+  const ticked      = useRef(new Set());
+  const donePlayed  = useRef(false);
+
+  useEffect(() => {
+    intervalRef.current = setInterval(() => {
+      setElapsed(prev => {
+        const next = prev + 1;
+        const remaining = targetSecs - next;
+
+        // Ticks in final tickStart seconds before target
+        if (remaining > 0 && remaining <= tickStart && !ticked.current.has(remaining)) {
+          ticked.current.add(remaining);
+          AudioEngine.tick();
+        }
+        // Done sound exactly at target (once)
+        if (next === targetSecs && !donePlayed.current) {
+          donePlayed.current = true;
+          AudioEngine.done();
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(intervalRef.current);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const remaining  = targetSecs - elapsed;
+  const overtime   = elapsed > targetSecs;
+  const displayVal = overtime ? elapsed - targetSecs : Math.abs(remaining);
+  const dm = Math.floor(displayVal / 60);
+  const ds = displayVal % 60;
+  const timeStr = dm > 0
+    ? `${dm}:${ds.toString().padStart(2,"0")}`
+    : `${ds}`;
+  const pct = Math.min(100, (elapsed / targetSecs) * 100);
+  const r = 30, circ = 2*Math.PI*r;
+  const nearEnd = remaining > 0 && remaining <= tickStart;
+
+  return (
+    <div style={{
+      position:"fixed", top:80, left:16, right:16,
+      background:T.bgCard, borderRadius:18,
+      border:`2px solid ${overtime ? T.green : nearEnd ? T.orange : T.blue}66`,
+      boxShadow:"0 8px 40px rgba(0,0,0,0.7)",
+      zIndex:300, padding:"14px 16px 12px",
+    }}>
+      <div style={{display:"flex", alignItems:"center", gap:14}}>
+        <div style={{position:"relative", width:72, height:72, flexShrink:0}}>
+          <svg width="72" height="72" style={{transform:"rotate(-90deg)"}}>
+            <circle cx="36" cy="36" r={r} fill="none" stroke={T.border} strokeWidth="5"/>
+            <circle cx="36" cy="36" r={r} fill="none"
+              stroke={overtime ? T.green : nearEnd ? T.orange : T.blue}
+              strokeWidth="5" strokeDasharray={circ}
+              strokeDashoffset={circ * (1 - pct / 100)}
+              strokeLinecap="round"
+              style={{transition:"stroke-dashoffset 0.9s linear, stroke 0.4s"}}/>
+          </svg>
+          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+            <div style={{fontSize:9,color:T.muted,lineHeight:1,marginBottom:1}}>
+              {overtime?"OVER":"ÜBUNG"}
+            </div>
+            <div style={{fontSize:18,fontWeight:900,fontVariantNumeric:"tabular-nums",lineHeight:1,
+              color: overtime ? T.green : nearEnd ? T.orange : T.blue}}>
+              {overtime ? `+${timeStr}` : timeStr}
+            </div>
+          </div>
+        </div>
+
+        <div style={{flex:1}}>
+          <div style={{fontSize:12,color:T.sub,marginBottom:6}}>
+            Ziel: {fmtRepsVal(targetSecs,"secs")}
+            {overtime && <span style={{color:T.green,marginLeft:8,fontWeight:700}}>Ziel erreicht ✓</span>}
+          </div>
+          <Btn onClick={onFinish}
+            v={overtime ? "green" : "secondary"}
+            full style={{padding:"9px 0",fontSize:13}}>
+            {overtime ? "Satz beenden ✓" : "Satz jetzt beenden"}
+          </Btn>
+        </div>
       </div>
     </div>
   );
@@ -798,7 +942,8 @@ const OnboardingScreen = ({onDone, onImport}) => {
         imported.sessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
         imported.plans    = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
         // Mark as onboarded so the app opens normally after import
-        imported.settings = {...DEFAULT_SETTINGS, ...imported.settings, onboarded: true};
+        // Punkt 10: deep-merge timerSettings + restRules on import
+        imported.settings = mergeWithDefaults({...imported.settings, onboarded: true});
 
         onImport(imported);
         setImportState("ok");
@@ -1518,7 +1663,7 @@ const ExerciseDBScreen = ({
 // ═══════════════════════════════════════════════════════
 // PLAN EDITOR  – vollständig editierbar
 // ═══════════════════════════════════════════════════════
-const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSave, onCancel}) => {
+const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSave, onCancel, settings}) => {
   const [name,setName]=useState(plan?.name||"");
   const [desc,setDesc]=useState(plan?.desc||"");
   const [days,setDays]=useState(()=>JSON.parse(JSON.stringify(plan?.days||[])));
@@ -1532,10 +1677,23 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
   const updDayName=(i,v)=> setDays(d=>d.map((x,j)=>j===i?{...x,name:v}:x));
 
   const addEx = ex => {
+    // Punkt 4: auto-set rest from settings rules
+    const defaultRest = getDefaultRestForExercise(ex, settings);
     setDays(d=>d.map((x,i)=>i===activeDay
-      ?{...x,exercises:[...x.exercises,{eid:ex.id,sets:3,reps:10,weight:0,rest:90,note:""}]}
+      ?{...x,exercises:[...x.exercises,{eid:ex.id,sets:3,reps:10,weight:0,rest:defaultRest,note:""}]}
       :x));
     setShowDB(false);
+  };
+  // Punkt 4: apply rest rules to all exercises in current day
+  const applyRestRules = () => {
+    if(!window.confirm("Pausen aller Übungen dieses Tages nach den Einstellungen überschreiben?")) return;
+    setDays(d=>d.map((day,i)=>i===activeDay?{
+      ...day,
+      exercises:day.exercises.map(ex=>{
+        const exercise=(allExercises||[]).find(e=>e.id===ex.eid);
+        return {...ex, rest:getDefaultRestForExercise(exercise, settings)};
+      }),
+    }:day));
   };
   const remEx    = (di,ei) => setDays(d=>d.map((x,i)=>i===di?{...x,exercises:x.exercises.filter((_,j)=>j!==ei)}:x));
   const updEx    = (di,ei,f,v) => setDays(d=>d.map((x,i)=>i===di?{
@@ -1647,7 +1805,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                 </div>
                 {/* Set fields */}
                 <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:8}}>
-                  {[{l:"Sätze",f:"sets",v:ex.sets},{l:"Wdh",f:"reps",v:ex.reps},{l:"kg",f:"weight",v:ex.weight},{l:"Pause(s)",f:"rest",v:ex.rest}].map(fi=>(
+                  {[{l:"Sätze",f:"sets",v:ex.sets},{l:(()=>{const e=(allExercises||[]).find(x=>x.id===ex.eid);const ut=e?.unitType||"reps";return ut==="secs"?"Sek":ut==="mins"?"Min":"Wdh";})(),f:"reps",v:ex.reps},{l:"kg",f:"weight",v:ex.weight},{l:"Pause (s)",f:"rest",v:ex.rest}].map(fi=>(
                     <div key={fi.f}>
                       <div style={{fontSize:9,color:T.muted,textAlign:"center",marginBottom:3}}>{fi.l}</div>
                       <input type="number" value={fi.v} onChange={e=>updEx(activeDay,j,fi.f,e.target.value)}
@@ -1662,7 +1820,13 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
               </div>
             );
           })}
-          <Btn v="secondary" onClick={()=>setShowDB(true)} full style={{marginTop:6}}>+ Übung hinzufügen</Btn>
+          <div style={{display:"flex",gap:8,marginTop:6}}>
+            <Btn v="secondary" onClick={()=>setShowDB(true)} style={{flex:2}}>+ Übung hinzufügen</Btn>
+            <Btn v="ghost" onClick={applyRestRules} style={{flex:1,fontSize:11,padding:"8px 4px"}}
+              title="Pausen aller Übungen dieses Tages nach den Einstellungen setzen">
+              ⏱ Pausen
+            </Btn>
+          </div>
         </Card>
       )}
     </div>
@@ -1684,7 +1848,7 @@ const ProgressionTip = ({plan}) => {
   );
 };
 
-const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSelectPlan}) => {
+const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSelectPlan, settings}) => {
   const [view,setView]     = useState("list"); // list | detail | edit
   const [showArchive,setShowArchive] = useState(false);
   const [sel,setSel]       = useState(null);
@@ -1720,6 +1884,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
       setCustomExercises={setCustomExercises}
       onSave={save}
       onCancel={()=>setView(editing?"detail":"list")}
+      settings={settings}
     />
   );
 
@@ -1827,136 +1992,185 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 // ─────────────────────────────────────────────────────────────────────
 const WorkoutExerciseCard = ({
   planEx, planExIdx, allExercises, exerciseOverrides,
-  sets, toggle, upd, addSet,
+  sets, toggle, upd, addSet, setExTimer, exTimer, settings,
 }) => {
   const ikey     = instKey(planEx.eid, planExIdx);
   const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
   const override = exerciseOverrides?.[planEx.eid] || {};
   const resolved = {...(exercise||{}), ...override};
   const exSets   = sets[ikey]||[];
+  const doneCount= exSets.filter(s=>s.done).length;
   const allDone  = exSets.length>0 && exSets.every(s=>s.done);
   const unitType = resolved.unitType || "reps";
+  const isTimeBased = unitType === "secs" || unitType === "mins";
   const repLabel = repsFieldLabel(unitType);
-  // Fix 2: only desc/link/img trigger the expandable panel and its toggle button
   const hasExpandableInfo = !!(resolved.desc || resolved.link || resolved.img);
-  // Fix 3: visible indicator icons (same condition, explicit name)
   const hasExtraInfo = hasExpandableInfo;
   const [showInfo, setShowInfo] = useState(false); // safe: called in component, not .map()
+  // Punkt 9: auto-collapse on allDone, manual re-open stays open
+  const [collapsed, setCollapsed]       = useState(false);
+  const [manuallyOpened, setManuallyOpened] = useState(false);
+  useEffect(() => {
+    if (allDone && !manuallyOpened) setCollapsed(true);
+    if (!allDone) { setCollapsed(false); setManuallyOpened(false); }
+  }, [allDone]); // eslint-disable-line
+  // Is the exercise timer currently running for this card?
+  const isThisTimerActive = exTimer?.ikey === ikey;
+
 
   return (
-    <Card key={ikey} style={{marginTop:12}} accent={allDone?T.accentDim:T.border}>
-      {/* Header */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
-        <div style={{flex:1}}>
-          <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text}}>
-            {resolved.name||"?"}{allDone&&" ✓"}
+    <Card key={ikey} style={{marginTop:12}}
+      accent={allDone ? T.accentDim : isThisTimerActive ? T.blue : T.border}>
+
+      {/* ── Header – always visible ─────────────────────────── */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:collapsed?0:6}}>
+        <div style={{flex:1}} onClick={()=>{
+          if(collapsed){setCollapsed(false);setManuallyOpened(true);}
+        }} style={{flex:1,cursor:collapsed?"pointer":"default"}}>
+          <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text,display:"flex",gap:6,alignItems:"center"}}>
+            {resolved.name||"?"}
+            {allDone && <span style={{fontSize:11,color:T.accentDim}}>✓</span>}
+            {isThisTimerActive && <span style={{fontSize:11,color:T.blue,fontWeight:800}}>⏱</span>}
           </div>
           <div style={{fontSize:11,color:T.sub}}>
             {resolved.cat}{resolved.eq?` · ${resolved.eq}`:""}
             {planEx.rest>0&&` · ${planEx.rest}s Pause`}
+            {/* Punkt 9: progress when collapsed */}
+            {collapsed && exSets.length>0 && (
+              <span style={{marginLeft:8,color:T.accentDim,fontWeight:700}}>
+                {doneCount}/{exSets.length} Sätze
+              </span>
+            )}
           </div>
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center"}}>
-          {/* Fix 2: toggle button only when expandable content exists */}
-          {hasExpandableInfo&&(
+          {hasExpandableInfo&&!collapsed&&(
             <button onClick={()=>setShowInfo(v=>!v)} style={{
               background:showInfo?T.blue+"33":T.bgAlt,
               border:`1px solid ${showInfo?T.blue+"88":T.border}`,
               borderRadius:7,padding:"3px 8px",cursor:"pointer",
-              color:showInfo?T.blue:T.muted,fontSize:11,fontWeight:700,lineHeight:"18px",
+              color:showInfo?T.blue:T.muted,fontSize:11,fontWeight:700,
             }}>ℹ</button>
           )}
+          {/* Collapse toggle */}
+          <button onClick={()=>{
+            if(collapsed){setCollapsed(false);setManuallyOpened(true);}
+            else setCollapsed(true);
+          }} style={{background:"none",border:"none",cursor:"pointer",
+            color:T.muted,fontSize:16,padding:"2px 4px",lineHeight:1}}>
+            {collapsed?"▼":"▲"}
+          </button>
           <Badge color={CAT_COLOR_EXT[resolved.cat]||T.accent}>{resolved.cat||"?"}</Badge>
         </div>
       </div>
-      {/* Fix 3+4: always-visible micro-indicators for extra content types */}
-      {hasExtraInfo&&(
-        <div style={{display:"flex",gap:5,marginBottom:6,marginTop:-2,flexWrap:"wrap"}}>
-          {resolved.img&&(
-            <span style={{fontSize:10,color:T.purple,background:T.purple+"18",
-              border:`1px solid ${T.purple}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
-              🖼 Bild
-            </span>
-          )}
-          {resolved.desc&&(
-            <span style={{fontSize:10,color:T.blue,background:T.blue+"18",
-              border:`1px solid ${T.blue}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
-              📝 Info
-            </span>
-          )}
-          {resolved.link&&(
-            <span style={{fontSize:10,color:T.teal,background:T.teal+"18",
-              border:`1px solid ${T.teal}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>
-              🎥 Video
-            </span>
-          )}
-        </div>
-      )}
 
-      {/* Trainingsnotiz – immer sichtbar */}
-      {resolved.trainingsnotiz&&(
-        <div style={{fontSize:11,color:T.teal,marginBottom:6,padding:"4px 8px",
-          background:T.teal+"15",borderRadius:6,border:`1px solid ${T.teal}33`}}>
-          📌 {resolved.trainingsnotiz}
-        </div>
-      )}
-      {planEx.note&&(
-        <div style={{fontSize:10,color:T.muted,marginBottom:6}}>💡 {planEx.note}</div>
-      )}
+      {/* ── Collapsible body ────────────────────────────────── */}
+      {!collapsed && (<>
 
-      {/* Aufklappbarer Info-Bereich */}
-      {showInfo&&(
-        <div style={{marginBottom:10,padding:"10px 12px",background:T.bgAlt,
-          borderRadius:10,border:`1px solid ${T.border}`}}>
-          {resolved.img&&(
-            <img src={resolved.img} alt={resolved.name}
-              style={{width:"100%",borderRadius:8,maxHeight:160,objectFit:"cover",marginBottom:8}}/>
-          )}
-          {resolved.desc&&(
-            <div style={{fontSize:12,color:T.sub,lineHeight:1.6,marginBottom:resolved.link?8:0}}>
-              {resolved.desc}
-            </div>
-          )}
-          {resolved.link&&(
-            <a href={resolved.link} target="_blank" rel="noreferrer"
-              style={{display:"flex",alignItems:"center",gap:6,padding:"7px 10px",
-                background:T.bgCard,borderRadius:8,color:T.blue,fontSize:12,
-                fontWeight:700,textDecoration:"none",marginTop:resolved.desc?6:0}}>
-              🎥 Anleitungsvideo
-            </a>
-          )}
-        </div>
-      )}
-
-      {/* Satz-Zeilen */}
-      {exSets.map((s,i)=>(
-        <div key={i} style={{display:"grid",gridTemplateColumns:"28px 1fr 12px 1fr 1fr 32px",alignItems:"center",gap:4,marginBottom:6,opacity:s.done?0.5:1}}>
-          <div style={{width:26,height:26,borderRadius:7,background:s.done?T.accent:T.bgInput,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:s.done?"#07070F":T.muted,cursor:"pointer"}}
-            onClick={()=>toggle(ikey,i,planEx.rest)}>{s.done?"✓":i+1}</div>
-          {unitType==="reps" ? (
-            <input type="number" value={s.weight} onChange={e=>upd(ikey,i,"weight",e.target.value)}
-              style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-          ) : (
-            <div style={{background:T.bgInput,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:T.muted,minHeight:34}}>—</div>
-          )}
-          <span style={{textAlign:"center",color:T.muted,fontSize:12}}>×</span>
-          <input type="number" value={s.reps} onChange={e=>upd(ikey,i,"reps",e.target.value)}
-            style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-          <div style={{textAlign:"center",fontSize:11,fontWeight:700,color:unitType==="reps"?T.muted:T.teal}}>
-            {unitType==="reps" && s.weight>0 ? `${(s.weight*s.reps).toFixed(0)}` : repLabel}
+        {/* Trainingsnotiz */}
+        {resolved.trainingsnotiz&&(
+          <div style={{fontSize:11,color:T.teal,marginBottom:6,padding:"4px 8px",
+            background:T.teal+"15",borderRadius:6,border:`1px solid ${T.teal}33`}}>
+            📌 {resolved.trainingsnotiz}
           </div>
-          <button onClick={()=>toggle(ikey,i,planEx.rest)} style={{width:30,height:30,borderRadius:8,border:"none",cursor:"pointer",background:s.done?T.accent+"33":T.bgAlt,color:s.done?T.accent:T.muted,fontSize:14}}>
-            {s.done?"✓":"○"}
-          </button>
-        </div>
-      ))}
-      <button onClick={()=>addSet(ikey,planEx)} style={{background:"none",border:`1px dashed ${T.border}`,borderRadius:8,width:"100%",padding:6,color:T.muted,fontSize:11,cursor:"pointer",marginTop:2}}>
-        + Satz
-      </button>
+        )}
+        {planEx.note&&(
+          <div style={{fontSize:10,color:T.muted,marginBottom:6}}>💡 {planEx.note}</div>
+        )}
+
+        {/* Extra info badges */}
+        {hasExtraInfo&&(
+          <div style={{display:"flex",gap:5,marginBottom:6,flexWrap:"wrap"}}>
+            {resolved.img&&<span style={{fontSize:10,color:T.purple,background:T.purple+"18",border:`1px solid ${T.purple}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>🖼 Bild</span>}
+            {resolved.desc&&<span style={{fontSize:10,color:T.blue,background:T.blue+"18",border:`1px solid ${T.blue}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>📝 Info</span>}
+            {resolved.link&&<span style={{fontSize:10,color:T.teal,background:T.teal+"18",border:`1px solid ${T.teal}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>🎥 Video</span>}
+          </div>
+        )}
+
+        {/* Expandable info panel */}
+        {showInfo&&(
+          <div style={{marginBottom:10,padding:"10px 12px",background:T.bgAlt,borderRadius:10,border:`1px solid ${T.border}`}}>
+            {resolved.img&&<img src={resolved.img} alt={resolved.name} style={{width:"100%",borderRadius:8,maxHeight:160,objectFit:"cover",marginBottom:8}}/>}
+            {resolved.desc&&<div style={{fontSize:12,color:T.sub,lineHeight:1.6,marginBottom:resolved.link?8:0}}>{resolved.desc}</div>}
+            {resolved.link&&<a href={resolved.link} target="_blank" rel="noreferrer"
+              style={{display:"flex",alignItems:"center",gap:6,padding:"7px 10px",background:T.bgCard,borderRadius:8,color:T.blue,fontSize:12,fontWeight:700,textDecoration:"none",marginTop:resolved.desc?6:0}}>
+              🎥 Anleitungsvideo
+            </a>}
+          </div>
+        )}
+
+        {/* ── Set rows ──────────────────────────────────────── */}
+        {exSets.map((s,i)=>(
+          <div key={i} style={{
+            display:"grid",
+            gridTemplateColumns: isTimeBased ? "28px 1fr 32px" : "28px 1fr 12px 1fr 1fr 32px",
+            alignItems:"center",gap:4,marginBottom:6,opacity:s.done?0.5:1,
+          }}>
+            {/* Set number / done indicator */}
+            <div style={{width:26,height:26,borderRadius:7,
+              background:s.done?T.accent:isThisTimerActive&&exTimer?.setIdx===i?T.blue+"44":T.bgInput,
+              display:"flex",alignItems:"center",justifyContent:"center",
+              fontSize:11,fontWeight:700,
+              color:s.done?"#07070F":isThisTimerActive&&exTimer?.setIdx===i?T.blue:T.muted,
+              cursor:"pointer"}}
+              onClick={()=>{
+                if(isTimeBased&&!s.done){
+                  // Punkt 7: start exercise timer instead of direct toggle
+                  const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
+                  setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
+                } else {
+                  toggle(ikey,i,planEx.rest);
+                }
+              }}>
+              {s.done?"✓":isThisTimerActive&&exTimer?.setIdx===i?"⏱":i+1}
+            </div>
+
+            {isTimeBased ? (
+              /* Time-based: show target time, no weight field */
+              <div style={{background:T.bgInput,borderRadius:8,padding:"7px 10px",
+                color:T.teal,fontSize:13,fontWeight:700,textAlign:"center"}}>
+                {fmtRepsVal(s.reps, unitType)}
+              </div>
+            ) : (
+              /* Rep-based: weight × reps */
+              <>
+                <input type="number" value={s.weight} onChange={e=>upd(ikey,i,"weight",e.target.value)}
+                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                <span style={{textAlign:"center",color:T.muted,fontSize:11}}>×</span>
+                <input type="number" value={s.reps} onChange={e=>upd(ikey,i,"reps",e.target.value)}
+                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                {/* Punkt 8: volume display */}
+                <div style={{textAlign:"center",fontSize:11,fontWeight:700,color:T.muted}}>
+                  {s.weight>0 ? `${(s.weight*s.reps).toFixed(0)} kg` : "—"}
+                </div>
+              </>
+            )}
+
+            {/* Done / start button */}
+            <button onClick={()=>{
+              if(isTimeBased&&!s.done){
+                const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
+                setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
+              } else {
+                toggle(ikey,i,planEx.rest);
+              }
+            }} style={{width:30,height:30,borderRadius:8,border:"none",cursor:"pointer",
+              background:s.done?T.accent+"33":isTimeBased&&!s.done?T.blue+"33":T.bgAlt,
+              color:s.done?T.accent:isTimeBased&&!s.done?T.blue:T.muted,fontSize:14}}>
+              {s.done?"✓":isTimeBased?"▶":"○"}
+            </button>
+          </div>
+        ))}
+
+        <button onClick={()=>addSet(ikey,planEx)} style={{
+          background:"none",border:`1px dashed ${T.border}`,borderRadius:8,
+          width:"100%",padding:6,color:T.muted,fontSize:11,cursor:"pointer",marginTop:2,
+        }}>+ Satz</button>
+
+      </>)}
     </Card>
   );
 };
-
 // ═══════════════════════════════════════════════════════
 // WORKOUT SCREEN  – mit localStorage Session-Recovery
 // ═══════════════════════════════════════════════════════
@@ -1982,7 +2196,7 @@ function clearWorkoutDraft() {
   try { localStorage.removeItem(WS_KEY); } catch {}
 }
 
-const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselectedPlanId}) => {
+const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, onSave, preselectedPlanId}) => {
   // Fix 3: only non-archived plans
   const activePlans = useMemo(() => (plans||[]).filter(p => !p.archived), [plans]);
 
@@ -1995,6 +2209,8 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
   const [sets,setSets]     = useState(() => hasDraft ? (draft.sets||{}) : {});
   const [note,setNote]     = useState(() => hasDraft ? (draft.note||"") : "");
   const [rest,setRest]     = useState(null);
+  // ExerciseTimer state: {ikey, setIdx, targetSecs} or null
+  const [exTimer, setExTimer] = useState(null);
   const [warnEmpty,setWarnEmpty] = useState(false);
   // "confirm" phase: plan+day selected, user sees overview before officially starting
   const [confirmPlanId, setConfirmPlanId] = useState(null);
@@ -2244,7 +2460,28 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
 
   return (
     <div style={{padding:"0 16px 24px"}}>
-      {rest&&<RestTimer seconds={rest.secs} onDone={()=>setRest(null)} onSkip={()=>setRest(null)}/>}
+      {rest&&<RestTimer
+          seconds={rest.secs}
+          onDone={()=>setRest(null)}
+          onSkip={()=>setRest(null)}
+          tickStart={settings?.timerSettings?.restTickStart ?? 10}
+        />}
+        {/* Exercise timer overlay (Punkt 6) */}
+        {exTimer&&<ExerciseTimer
+          targetSecs={exTimer.targetSecs}
+          tickStart={settings?.timerSettings?.exerciseTickStart ?? 10}
+          onFinish={()=>{
+            // Mark set done, optionally start rest
+            const {ikey, setIdx, restSecs} = exTimer;
+            setSets(prev=>{
+              if(!prev[ikey]?.[setIdx]) return prev;
+              const upd={...prev,[ikey]:prev[ikey].map((s,i)=>i===setIdx?{...s,done:true}:s)};
+              return upd;
+            });
+            setExTimer(null);
+            if(restSecs>0) setRest({secs:restSecs});
+          }}
+        />}
 
       <div style={{position:"sticky",top:0,background:T.bg,padding:"14px 0 10px",zIndex:10,borderBottom:`1px solid ${T.border}`}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
@@ -2273,6 +2510,9 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, onSave, preselec
           toggle={toggle}
           upd={upd}
           addSet={addSet}
+          setExTimer={setExTimer}
+          exTimer={exTimer}
+          settings={settings}
         />
       ))}
 
@@ -2755,7 +2995,7 @@ const SettingsScreen = ({
   // ── Export ───────────────────────────────────────────
   const exportData = useCallback(() => {
     const payload = {
-      _fittrack_version: 6,
+      _fittrack_version: 7,
       exportedAt: new Date().toISOString(),
       settings,
       sessions,
@@ -2942,6 +3182,74 @@ const SettingsScreen = ({
       </Card>
 
       {/* Reset */}
+      {/* ── Timer-Einstellungen (Punkt 1+2) ──────────────── */}
+      <Card style={{marginBottom:12}}>
+        <Lbl color={T.blue}>TIMER & SOUND</Lbl>
+        {[
+          {key:"restTickStart",     label:"Pausen-Sound ab (Sek vor Ende)"},
+          {key:"exerciseTickStart", label:"Übungs-Sound ab (Sek vor Ziel)"},
+        ].map(({key,label})=>(
+          <div key={key} style={{marginBottom:10}}>
+            <div style={{fontSize:12,color:T.sub,marginBottom:4}}>{label}</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {[5,10,15,20].map(v=>(
+                <button key={v} onClick={()=>onUpdate({timerSettings:{
+                  ...DEFAULT_SETTINGS.timerSettings,
+                  ...(settings.timerSettings||{}), [key]:v,
+                }})} style={{
+                  background:(settings.timerSettings?.[key]??10)===v?T.accent:T.bgInput,
+                  color:(settings.timerSettings?.[key]??10)===v?"#07070F":T.sub,
+                  border:`1px solid ${(settings.timerSettings?.[key]??10)===v?T.accent:T.border}`,
+                  borderRadius:8,padding:"7px 12px",fontSize:13,fontWeight:700,cursor:"pointer",
+                }}>{v}s</button>
+              ))}
+              {/* Custom value */}
+              <input type="number" min="1" max="60"
+                value={settings.timerSettings?.[key]??10}
+                onChange={e=>{const n=parseInt(e.target.value);if(n>0)onUpdate({timerSettings:{
+                  ...DEFAULT_SETTINGS.timerSettings,...(settings.timerSettings||{}),[key]:n,
+                }});}}
+                style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+                  padding:"7px 8px",color:T.text,fontSize:13,fontWeight:700,
+                  width:54,textAlign:"center",boxSizing:"border-box"}}/>
+            </div>
+          </div>
+        ))}
+      </Card>
+
+      {/* ── Standard-Pausen nach Gerät/Kategorie (Punkt 3) ── */}
+      <Card style={{marginBottom:12}}>
+        <Lbl color={T.blue}>STANDARD-PAUSEN (Sekunden)</Lbl>
+        <div style={{fontSize:11,color:T.muted,marginBottom:10,lineHeight:1.5}}>
+          Werden beim Hinzufügen von Übungen und bei „⏱ Pausen" im Plan-Editor verwendet.
+        </div>
+        {[
+          {key:"warmup",    label:"Aufwärmen"},
+          {key:"stretching",label:"Dehnung"},
+          {key:"machine",   label:"Maschine"},
+          {key:"cable",     label:"Kabel"},
+          {key:"dumbbell",  label:"Kurzhantel"},
+          {key:"barbell",   label:"Langhantel"},
+          {key:"bodyweight",label:"Körpergewicht"},
+          {key:"default",   label:"Sonstiges"},
+        ].map(({key,label})=>{
+          const val = (settings.restRules?.[key] ?? DEFAULT_SETTINGS.restRules[key]);
+          return(
+            <div key={key} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <div style={{flex:1,fontSize:13,color:T.sub}}>{label}</div>
+              <input type="number" min="0" max="600" value={val}
+                onChange={e=>{const n=parseInt(e.target.value);if(n>=0)onUpdate({restRules:{
+                  ...DEFAULT_SETTINGS.restRules,...(settings.restRules||{}),[key]:n,
+                }});}}
+                style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+                  padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,
+                  width:64,textAlign:"center",boxSizing:"border-box"}}/>
+              <span style={{fontSize:11,color:T.muted,width:18}}>s</span>
+            </div>
+          );
+        })}
+      </Card>
+
       <Card style={{marginBottom:12}}>
         <Lbl>ZURÜCKSETZEN</Lbl>
         {!confirmReset
@@ -3051,8 +3359,8 @@ function App() {
   const Screen = () => {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
-      case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan}/>;
-      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} onSave={saveSession} preselectedPlanId={preselectedPlanId}/>;
+      case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings}/>;
+      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} onSave={saveSession} preselectedPlanId={preselectedPlanId}/>;
       case "cardio":       return <CardioScreen cardio={cardio} onSave={saveCardio} settings={settings}/>;
       case "progress":     return <ProgressScreen sessions={sessions} plans={plans} cardio={cardio} allExercises={allExercises} exerciseOverrides={exerciseOverrides} onDeleteSession={id=>setSessions(p=>p.filter(x=>x.id!==id))}/>;
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
