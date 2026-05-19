@@ -91,7 +91,7 @@ const EDB=[
   {id:"e40",name:"Beinbeugen sitzend",   cat:"Beine",     eq:"Maschine",      muscle:"hamstrings"},
   {id:"e41",name:"Vorgebeugt. Seitheben",cat:"Schultern", eq:"Kurzhantel",    muscle:"shoulders"},
   {id:"e42",name:"Hüftstrecken Kabel",  cat:"Beine",     eq:"Kabel",         muscle:"glutes"},
-  {id:"e43",name:"Crosstrainer",         cat:"Core",      eq:"Maschine",      muscle:"core"},
+  {id:"e43",name:"Crosstrainer",         cat:"Core",      eq:"Maschine",      muscle:"core",       unitType:"secs"},
 ];
 const CATS=["Alle","Brust","Rücken","Beine","Schultern","Arme","Core"];
 
@@ -127,9 +127,14 @@ function isoWeekKey(date) {
   return `${year}-W${String(weekNum).padStart(2,"0")}`;
 }
 
-// [FIX 2] vol() – nur done===true Sätze; done===undefined (Seed-Daten) gelten als done
 const isDone = s => s.done !== false;
-const vol    = sets => sets.filter(isDone).reduce((sum,x) => sum + (x.weight||0)*(x.reps||0), 0);
+
+// vol() sums weight×reps for strength sets only (weight>0 = rep-based)
+// Time exercises have weight=0 so they contribute 0 naturally, but
+// we explicitly guard to make intent clear.
+const vol = sets => sets
+  .filter(x => isDone(x) && (x.weight||0) > 0)
+  .reduce((sum, x) => sum + (x.weight||0) * (x.reps||0), 0);
 
 const calcKcal = (type, durationMin, bodyWeightKg) =>
   Math.round((CARDIO_MET[type]||5) * ((bodyWeightKg||75)/60) * (durationMin/60) * 60);
@@ -172,100 +177,698 @@ function getPRs(sessions) {
 // ═══════════════════════════════════════════════════════
 // ACHIEVEMENTS  [FIX 2 + FIX 3]
 // ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════
+// ANALYTICS HELPERS  (Punkte 1–5, 10)
+// ═══════════════════════════════════════════════════════
+
+// Muscle group membership by exercise category
+const MUSCLE_GROUPS = {
+  Brust:     { label:"Brust",    push:true,  upper:true,  targetSets:10 },
+  Rücken:    { label:"Rücken",   pull:true,  upper:true,  targetSets:10 },
+  Beine:     { label:"Beine",    push:false, upper:false, targetSets:10 },
+  Schultern: { label:"Schultern",push:true,  upper:true,  targetSets:8  },
+  Arme:      { label:"Arme",     push:false, upper:true,  targetSets:6  },
+  Core:      { label:"Core",     core:true,  upper:false, targetSets:6  },
+  Aufwärmen: { label:"Aufwärmen",mobility:true,           targetSets:0  },
+  Dehnung:   { label:"Dehnung",  mobility:true,           targetSets:0  },
+};
+
+// Estimated 1RM using Epley formula
+function calc1RM(weight, reps) {
+  if (!weight || weight <= 0 || !reps || reps <= 0) return 0;
+  return +(weight * (1 + reps / 30)).toFixed(1);
+}
+
+// Get all strength (weight>0, non-time) history for one exercise
+function getExHistory(sessions, eid) {
+  const rows = [];
+  sessions.forEach(s => {
+    s.sets.filter(x => isDone(x) && x.eid===eid && x.weight>0).forEach(x => {
+      rows.push({ date:s.date, weight:x.weight, reps:x.reps,
+                  vol:x.weight*x.reps, rm1:calc1RM(x.weight,x.reps) });
+    });
+  });
+  return rows.sort((a,b)=>new Date(a.date)-new Date(b.date));
+}
+
+// Get time-exercise history (unitType secs/mins) for one exercise
+function getTimeExHistory(sessions, eid) {
+  const rows = [];
+  sessions.forEach(s => {
+    s.sets.filter(x => isDone(x) && x.eid===eid && x.reps>0 && (!x.weight||x.weight===0)).forEach(x => {
+      rows.push({ date:s.date, reps:x.reps });
+    });
+  });
+  return rows.sort((a,b)=>new Date(a.date)-new Date(b.date));
+}
+
+// Linear trend slope (positive = improving)
+function calcTrend(values) {
+  if (values.length < 2) return 0;
+  const n = values.length;
+  const xMean = (n-1)/2;
+  const yMean = values.reduce((a,b)=>a+b,0)/n;
+  let num=0, den=0;
+  values.forEach((y,x)=>{ num+=(x-xMean)*(y-yMean); den+=(x-xMean)**2; });
+  return den===0 ? 0 : num/den;
+}
+
+// % change between first and last value
+function pctChange(arr) {
+  if (arr.length < 2 || arr[0]===0) return null;
+  return +((arr[arr.length-1]-arr[0])/arr[0]*100).toFixed(1);
+}
+
+// Best set for an exercise
+function getBestSet(sessions, eid) {
+  let best = null;
+  sessions.forEach(s => s.sets.filter(x=>isDone(x)&&x.eid===eid&&x.weight>0).forEach(x => {
+    if (!best || x.weight > best.weight) best = {...x, date:s.date};
+  }));
+  return best;
+}
+
+// Weekly set count per muscle group (last N weeks, default 1)
+function getWeeklySets(sessions, allExercises, weeksBack=1) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - weeksBack*7);
+  const counts = {};
+  Object.keys(MUSCLE_GROUPS).forEach(k => { counts[k]=0; });
+  sessions
+    .filter(s => new Date(s.date) >= cutoff)
+    .forEach(s => s.sets.filter(isDone).forEach(x => {
+      const ex = (allExercises||[]).find(e=>e.id===x.eid);
+      const cat = ex?.cat;
+      if (cat && counts[cat]!==undefined) counts[cat]++;
+    }));
+  return counts;
+}
+
+// Muscle status label
+function getMuscleStatus(sets, target) {
+  if (target===0) return null;
+  const ratio = sets/target;
+  if (ratio >= 1.4) return { label:"Sehr hoch", color:T.orange };
+  if (ratio >= 0.8) return { label:"Optimal",   color:T.green  };
+  if (ratio >= 0.4) return { label:"Niedrig",   color:T.blue   };
+  return               { label:"Vernachlässigt",color:T.red    };
+}
+
+// Push/Pull/Upper/Lower ratios
+function getPushPullRatio(sets) {
+  const push = (sets.Brust||0) + (sets.Schultern||0);
+  const pull = sets.Rücken||0;
+  const total = push+pull;
+  if (total===0) return null;
+  return { push:+(push/total*100).toFixed(0), pull:+(pull/total*100).toFixed(0) };
+}
+
+// Days since each muscle group was last trained
+function getLastTrainedDays(sessions, allExercises) {
+  const last = {};
+  [...sessions]
+    .sort((a,b)=>new Date(b.date)-new Date(a.date))
+    .forEach(s => s.sets.filter(isDone).forEach(x => {
+      const ex = (allExercises||[]).find(e=>e.id===x.eid);
+      const cat = ex?.cat;
+      if (cat && last[cat]===undefined) {
+        const d = Math.floor((Date.now()-new Date(s.date))/86400000);
+        last[cat] = d;
+      }
+    }));
+  return last;
+}
+
+// Recovery status per muscle group
+function getRecoveryStatus(daysSince) {
+  if (daysSince === undefined) return { label:"Nicht trainiert", color:T.muted };
+  if (daysSince < 1) return { label:"Heute trainiert – erholen",  color:T.orange };
+  if (daysSince < 2) return { label:"Gestern – Erholung läuft",   color:T.blue   };
+  if (daysSince < 4) return { label:"Bereit für nächste Einheit", color:T.green  };
+  return                    { label:"Lange nicht trainiert",       color:T.red    };
+}
+
+// Weekly summary: volume, sessions, top muscle, records, cardio time
+function buildWeeklySummary(sessions, cardio, allExercises) {
+  const { sessions:ws, cardio:wc } = getWeekActivities(sessions, cardio);
+  const weekVol   = ws.reduce((s,x)=>s+vol(x.sets),0);
+  const weekTime  = ws.reduce((s,x)=>s+(x.duration||0),0);
+  const cardioMin = wc.reduce((s,c)=>s+(c.duration||0),0);
+  const setCounts = getWeeklySets(sessions, allExercises, 1);
+  const topMuscle = Object.entries(setCounts)
+    .filter(([k])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility)
+    .sort((a,b)=>b[1]-a[1])[0];
+  const neglected = Object.entries(setCounts)
+    .filter(([k,v])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&MUSCLE_GROUPS[k].targetSets>0&&v===0)
+    .map(([k])=>k);
+  const mobilityMins = ws.reduce((s,sess)=>{
+    return s + sess.sets.filter(isDone).reduce((a,x)=>{
+      const ex=(allExercises||[]).find(e=>e.id===x.eid);
+      if(ex?.cat==="Dehnung"||ex?.cat==="Aufwärmen") return a+(x.reps||0);
+      return a;
+    },0);
+  },0) / 60; // Fix 4: divide ONCE after outer reduce (secs→mins)
+  return { weekVol, weekTime, cardioMin, topMuscle:topMuscle?.[0]||null,
+           neglected, mobilityMins:+mobilityMins.toFixed(1),
+           sessionCount:ws.length };
+}
+
+// Motivational recommendations (Punkt 10)
+function buildRecommendations(sessions, cardio, allExercises, streak) {
+  const tips = [];
+  const sets4w = getWeeklySets(sessions, allExercises, 4);
+  const { sessions:ws } = getWeekActivities(sessions, cardio);
+
+  // Muscle imbalance
+  const pushSets  = (sets4w.Brust||0)+(sets4w.Schultern||0);
+  const pullSets  = sets4w.Rücken||0;
+  if (pushSets > pullSets*1.5 && pullSets > 0)
+    tips.push({ icon:"⚠️", text:"Du trainierst Push-Muskeln deutlich mehr als Pull. Mehr Rückenübungen wären ausgewogen." });
+  else if (pullSets > pushSets*1.5 && pushSets > 0)
+    tips.push({ icon:"⚠️", text:"Viel Rücken-Training – mehr Brust/Schulter würde das Gleichgewicht verbessern." });
+
+  if ((sets4w.Beine||0) === 0 && sessions.length > 3)
+    tips.push({ icon:"🦵", text:"Beine wurden kaum trainiert. Ein Bein-Tag würde die Balance deutlich verbessern." });
+
+  if (streak >= 7)
+    tips.push({ icon:"🔥", text:`${streak} Tage Serie – Ausnahme Konsistenz! Weiter so.` });
+  else if (streak >= 3)
+    tips.push({ icon:"⚡", text:`${streak} Tage am Stück – starker Start. Dranbleiben!` });
+
+  if (ws.length >= 4)
+    tips.push({ icon:"💪", text:"Sehr gute Woche – Wochenziel bereits erreicht oder übertroffen." });
+
+  const cardioMin = cardio.filter(c=>{
+    const cutoff=new Date(); cutoff.setDate(cutoff.getDate()-7);
+    return new Date(c.date)>=cutoff;
+  }).reduce((s,c)=>s+(c.duration||0),0);
+  if (cardioMin >= 90)
+    tips.push({ icon:"🏃", text:`${cardioMin} Minuten Cardio diese Woche – top Ausdauerarbeit.` });
+  else if (cardioMin === 0 && sessions.length > 2)
+    tips.push({ icon:"🏃", text:"Kein Cardio diese Woche. Schon 20 Minuten verbessern Regeneration und Ausdauer." });
+
+  if (tips.length === 0)
+    tips.push({ icon:"✅", text:"Starke Trainingsbasis. Bleib konstant und steigere das Gewicht schrittweise." });
+
+  return tips.slice(0,4);
+}
+
+// Newly unlocked badges (for overlay after session save)
+function getNewlyUnlockedBadges(prevSessions, newSessions, metrics, streak, cardio, allDefs, allExercises=[]) {
+  const before = new Set(allDefs.filter(a=>a.check(prevSessions,metrics,streak,cardio,allExercises)).map(a=>a.id));
+  return allDefs.filter(a=>!before.has(a.id) && a.check(newSessions,metrics,streak,cardio,allExercises));
+}
+
+// ═══════════════════════════════════════════════════════
+// PROGRESSION & DELOAD HELPERS
+// ═══════════════════════════════════════════════════════
+
+// Return merged progressionSettings with safe defaults
+function getProgressionSettings(settings) {
+  return {
+    ...DEFAULT_SETTINGS.progressionSettings,
+    ...(settings?.progressionSettings || {}),
+    defaultRepRange: {
+      ...DEFAULT_SETTINGS.progressionSettings.defaultRepRange,
+      ...(settings?.progressionSettings?.defaultRepRange || {}),
+    },
+    incrementRules: {
+      ...DEFAULT_SETTINGS.progressionSettings.incrementRules,
+      ...(settings?.progressionSettings?.incrementRules || {}),
+    },
+  };
+}
+
+// Weight increment for an exercise based on its equipment
+function getIncrementForExercise(exercise, settings) {
+  const ps = getProgressionSettings(settings);
+  const eq = exercise?.eq || "";
+  if (eq === "Maschine")      return ps.incrementRules.machine;
+  if (eq === "Kabel")         return ps.incrementRules.cable;
+  if (eq === "Kurzhantel")    return ps.incrementRules.dumbbell;
+  if (eq === "Langhantel")    return ps.incrementRules.barbell;
+  if (eq === "Körpergewicht") return ps.incrementRules.bodyweight;
+  return ps.incrementRules.default;
+}
+
+// Rep range for a given plan exercise (uses plan override or global settings)
+function getRepRangeForPlanExercise(planExercise, settings) {
+  const ps = getProgressionSettings(settings);
+  return {
+    min: planExercise?.repRangeMin ?? ps.defaultRepRange.min,
+    max: planExercise?.repRangeMax ?? ps.defaultRepRange.max,
+  };
+}
+
+// Round weight to nearest increment (e.g. 41.3 → 41.5 for 2.5 increment)
+function roundWeight(weight, increment) {
+  if (!increment || increment <= 0) return weight;
+  return Math.round(weight / increment) * increment;
+}
+
+// Apply deload percentage to a weight
+function applyDeloadToWeight(weight, settings, exercise) {
+  const ps = getProgressionSettings(settings);
+  if (!weight || weight <= 0) return 0;
+  const factor = 1 - (ps.deloadPercent / 100);
+  // Use device-specific increment when exercise is provided, else fall back to default
+  const inc = exercise
+    ? getIncrementForExercise(exercise, settings)
+    : (ps.incrementRules?.default || 2.5);
+  return roundWeight(weight * factor, inc);
+}
+
+// Central set-reduction for deload strategy "sets" and "both"
+// Returns new set count, minimum 1.
+function applyDeloadToSets(originalSets, reductionPercent) {
+  if (!originalSets || originalSets < 1) return 1;
+  const reduced = Math.floor(originalSets * (1 - reductionPercent / 100));
+  return Math.max(1, reduced);
+}
+
+// Start a deload: sets lastDeloadDate + activeDeloadUntil in settings
+// Returns the partial settings update to pass to onUpdate
+function startDeload(settings) {
+  const now = new Date();
+  const until = new Date(now);
+  until.setDate(until.getDate() + 7);
+  return {
+    lastDeloadDate:    now.toISOString(),
+    activeDeloadUntil: until.toISOString(),
+  };
+}
+
+// End a deload early
+function endDeload() {
+  return {
+    activeDeloadUntil: null,
+  };
+}
+
+// Is a deload currently active?
+function isDeloadActive(settings) {
+  if (!settings?.activeDeloadUntil) return false;
+  return new Date(settings.activeDeloadUntil) > new Date();
+}
+
+// How many days remain in an active deload (0 if none)
+function deloadDaysRemaining(settings) {
+  if (!isDeloadActive(settings)) return 0;
+  const ms = new Date(settings.activeDeloadUntil) - new Date();
+  return Math.max(0, Math.ceil(ms / 86400000));
+}
+
+// Get strength history for one exercise (only sets with weight > 0, not warmup)
+// Returns array of {date, sets:[{weight,reps}]} one entry per session
+function getExercisePerformanceHistory(eid, sessions) {
+  if (!eid || !sessions?.length) return [];
+  const history = [];
+  [...sessions]
+    .sort((a,b) => new Date(a.date) - new Date(b.date))
+    .forEach(sess => {
+      const workSets = sess.sets.filter(s =>
+        isDone(s) && s.eid === eid &&
+        (s.weight||0) > 0 &&
+        !s.note?.toLowerCase().includes("eingewöhnung")  // skip warmup sets
+      );
+      if (workSets.length > 0) {
+        history.push({
+          date: sess.date,
+          sets: workSets.map(s => ({ weight:s.weight, reps:s.reps||0 })),
+        });
+      }
+    });
+  return history;
+}
+
+// Core algorithm: calculate progression suggestion for one exercise
+// Returns: { action, suggestedWeight, suggestedReps, reason, isDeload, confidence }
+function calculateProgressionSuggestion(planExercise, exercise, sessions, settings) {
+  const ps = getProgressionSettings(settings);
+  if (!ps.enabled) return null;
+
+  const unitType = exercise?.unitType || "reps";
+  // Only for strength (rep-based) exercises
+  if (unitType !== "reps") return null;
+  // Skip bodyweight exercises (increment = 0)
+  const increment = getIncrementForExercise(exercise, settings);
+  const repRange  = getRepRangeForPlanExercise(planExercise, settings);
+  const eid       = planExercise?.eid;
+  if (!eid) return null;
+
+  const history = getExercisePerformanceHistory(eid, sessions);
+  if (history.length < (ps.minSessionsBeforeSuggestion || 2)) return null;
+
+  // Check if deload is active
+  if (isDeloadActive(settings) && ps.deloadEnabled) {
+    const strategy   = ps.deloadStrategy || "weight";
+    // Use last known weight from history if planExercise.weight is 0
+    const history_   = getExercisePerformanceHistory(eid, sessions);
+    const baseWeight = (planExercise?.weight || 0) > 0
+      ? planExercise.weight
+      : (history_.length > 0 ? (history_[history_.length-1].sets[0]?.weight || 0) : 0);
+    const deloadWt   = (strategy === "sets")
+      ? baseWeight                                        // sets strategy: weight unchanged
+      : applyDeloadToWeight(baseWeight, settings, exercise);        // weight / both: reduce weight
+    const deloadSets = (strategy === "weight")
+      ? (planExercise?.sets || 3)                         // weight strategy: sets unchanged
+      : applyDeloadToSets(planExercise?.sets || 3, ps.volumeDeloadPercent || 30);
+    const strategyLabel =
+      strategy === "weight" ? `-${ps.deloadPercent}% Gewicht` :
+      strategy === "sets"   ? `-${ps.volumeDeloadPercent}% Sätze` :
+                              `-${ps.deloadPercent}% Gewicht & weniger Sätze`;
+    return {
+      action:          "deload",
+      suggestedWeight: deloadWt,
+      suggestedReps:   repRange.min,
+      suggestedSets:   deloadSets,
+      reason:          `Entlastungswoche aktiv – ${strategyLabel}`,
+      isDeload:        true,
+      confidence:      "high",
+    };
+  }
+
+  // Last session's work sets for this exercise
+  const lastSession = history[history.length - 1];
+  const lastSets    = lastSession.sets;
+  if (!lastSets.length) return null;
+
+  const lastWeight = lastSets[0].weight;
+  const minReps    = Math.min(...lastSets.map(s => s.reps));
+  const avgReps    = lastSets.reduce((a,s)=>a+s.reps,0) / lastSets.length;
+
+  // Check stagnation (last 2–3 sessions same or declining weight)
+  const stagnation = detectExerciseStagnation(eid, sessions, settings);
+
+  // ── DELOAD recommendation based on stagnation ──────────────
+  if (stagnation?.stagnating && ps.deloadEnabled && ps.autoDeloadOnStagnation) {
+    const strategy_  = ps.deloadStrategy || "weight";
+    const deloadWt_  = strategy_ === "sets"
+      ? lastWeight
+      : (applyDeloadToWeight(lastWeight, settings, exercise) || lastWeight);
+    const deloadSets_= strategy_ === "weight"
+      ? (planExercise?.sets || 3)
+      : applyDeloadToSets(planExercise?.sets || 3, ps.volumeDeloadPercent || 30);
+    return {
+      action:          "deload",
+      suggestedWeight: deloadWt_,
+      suggestedReps:   repRange.min,
+      suggestedSets:   deloadSets_,
+      reason:          "Leichte Woche empfohlen – frisch wieder einsteigen",
+      isDeload:        true,
+      confidence:      "medium",
+    };
+  }
+
+  // ── PROGRESSION logic by mode ───────────────────────────────
+  const mode = ps.mode || "normal";
+  let readyToProgress = false;
+
+  if (mode === "conservative") {
+    // All sets must reach the upper rep range target
+    readyToProgress = minReps >= repRange.max;
+  } else if (mode === "aggressive") {
+    // Most sets (≥ 60%) at or above lower rep range target
+    const setsAboveMin = lastSets.filter(s => s.reps >= repRange.min).length;
+    readyToProgress = setsAboveMin / lastSets.length >= 0.6 && avgReps >= repRange.min;
+  } else {
+    // normal: average reps ≥ upper range, minimum reps ≥ lower range
+    readyToProgress = avgReps >= repRange.max && minReps >= repRange.min;
+  }
+
+  if (readyToProgress && increment > 0) {
+    const newWeight = roundWeight(lastWeight + increment, increment);
+    return {
+      action:          "increase",
+      suggestedWeight: newWeight,
+      suggestedReps:   repRange.min,
+      reason:          `Zielbereich erreicht – +${increment} kg bereit`,
+      isDeload:        false,
+      confidence:      "high",
+    };
+  }
+
+  // Below rep range minimum – consider backing off slightly
+  if (minReps < repRange.min - 2 && lastSets.length >= 2) {
+    return {
+      action:          "hold",
+      suggestedWeight: lastWeight,
+      suggestedReps:   repRange.min,
+      reason:          "Gewicht halten – sauber ausführen",
+      isDeload:        false,
+      confidence:      "medium",
+    };
+  }
+
+  // On track – hold weight
+  return {
+    action:          "hold",
+    suggestedWeight: lastWeight,
+    suggestedReps:   repRange.min,
+    reason:          "Solide Leistung – weiter so",
+    isDeload:        false,
+    confidence:      "low",
+  };
+}
+
+// Detect stagnation for one exercise over last N sessions
+function detectExerciseStagnation(eid, sessions, settings) {
+  const history = getExercisePerformanceHistory(eid, sessions);
+  if (history.length < 3) return { stagnating: false };
+  const last3 = history.slice(-3);
+  // Check if weight stayed the same or declined across last 3 sessions
+  const weights = last3.map(h => h.sets[0]?.weight || 0);
+  const noProgress = weights[2] <= weights[0]; // not higher than 3 sessions ago
+  // Check if min reps declined
+  const minReps = last3.map(h => Math.min(...h.sets.map(s=>s.reps||0)));
+  const repsDeclined = minReps[2] < minReps[0];
+  return {
+    stagnating: noProgress && repsDeclined,
+    sessionsChecked: last3.length,
+    weightTrend: weights[2] - weights[0],
+  };
+}
+
+// Detect whether a global deload is recommended based on recent training load
+function detectDeloadRecommendation(sessions, settings) {
+  const ps = getProgressionSettings(settings);
+  if (!ps.deloadEnabled) return null;
+
+  // Already in active deload – confirm it (auto-expire handled by isDeloadActive)
+  if (isDeloadActive(settings)) {
+    const daysLeft = deloadDaysRemaining(settings);
+    return {
+      recommend: true,
+      reason:    `Aktiver Deload – noch ${daysLeft} ${daysLeft===1?"Tag":"Tage"}`,
+      urgency:   "active",
+    };
+  }
+
+  const now = Date.now();
+  // Periodic deload: time since last deload
+  if (settings?.lastDeloadDate) {
+    const weeksSince = (now - new Date(settings.lastDeloadDate)) / (7*86400000);
+    if (weeksSince >= ps.deloadEveryWeeks) {
+      return {
+        recommend: true,
+        reason:    `${Math.round(weeksSince)} Wochen seit letzter Entlastung`,
+        urgency:   "scheduled",
+      };
+    }
+  } else if ((sessions||[]).length >= ps.deloadEveryWeeks) {
+    return {
+      recommend: true,
+      reason:    `${sessions.length} Trainings – erste Deload-Woche empfohlen`,
+      urgency:   "scheduled",
+    };
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════
+// ACHIEVEMENT DEFS  (Punkt 7 – massiv erweitert)
+// ═══════════════════════════════════════════════════════
 const ACHIEVEMENT_DEFS = [
-  {
-    id:"first_workout", icon:"🏁", name:"Erster Schritt",
+  // ── Start ──────────────────────────────────────────
+  { id:"first_workout",   icon:"🏁", name:"Erster Schritt",     cat:"Start",
     desc:"Erstes Training abgeschlossen",
-    check: s => s.length >= 1,
-  },
+    check: s=>s.length>=1 },
+  { id:"total_10",        icon:"💪", name:"Fleißig",             cat:"Konsistenz",
+    desc:"10 Trainings absolviert",
+    check: s=>s.length>=10 },
+  { id:"total_50",        icon:"🏆", name:"Harter Kern",         cat:"Konsistenz",
+    desc:"50 Trainings absolviert",
+    check: s=>s.length>=50 },
+  { id:"total_100",       icon:"💯", name:"Centurion",           cat:"Konsistenz",
+    desc:"100 Trainings absolviert",
+    check: s=>s.length>=100 },
+
+  // ── Streaks ─────────────────────────────────────────
+  { id:"streak_3",        icon:"⚡", name:"Starke Woche",        cat:"Konsistenz",
+    desc:"3 Tage Streak",
+    check:(_,__,streak)=>streak>=3 },
+  { id:"streak_7",        icon:"🔥", name:"Feuer-Woche",         cat:"Konsistenz",
+    desc:"7 Tage Streak",
+    check:(_,__,streak)=>streak>=7 },
+  { id:"streak_14",       icon:"💥", name:"Zwei-Wochen-Feuer",   cat:"Konsistenz",
+    desc:"14 Tage Streak",
+    check:(_,__,streak)=>streak>=14 },
+  { id:"streak_30",       icon:"🌋", name:"Monats-Maschine",     cat:"Konsistenz",
+    desc:"30 Tage Streak",
+    check:(_,__,streak)=>streak>=30 },
+
+  // ── Konsistenz ──────────────────────────────────────
   {
-    // [FIX 3] isoWeekKey statt eigener Inline-Logik
-    id:"week_warrior", icon:"⚡", name:"Wochenkämpfer",
+    id:"week_warrior",    icon:"⚡", name:"Wochenkämpfer",       cat:"Konsistenz",
     desc:"5 Trainings in einer Woche",
-    check: s => {
-      const w = {};
-      s.forEach(x => { const k=isoWeekKey(x.date); w[k]=(w[k]||0)+1; });
-      return Object.values(w).some(v => v >= 5);
-    },
-  },
-  { id:"streak_7",  icon:"🔥", name:"Feuer-Woche",     desc:"7 Tage Streak",  check:(_,__,streak)=>streak>=7  },
-  { id:"streak_30", icon:"💥", name:"Monats-Maschine", desc:"30 Tage Streak", check:(_,__,streak)=>streak>=30 },
-  { id:"total_10",  icon:"💪", name:"Fleißig",          desc:"10 Trainings absolviert", check: s=>s.length>=10 },
-  { id:"total_50",  icon:"🏆", name:"Harter Kern",      desc:"50 Trainings absolviert", check: s=>s.length>=50 },
-  {
-    // [FIX 2] nur isDone-Sätze für Volumen
-    id:"volume_5t", icon:"🏗", name:"Fünf Tonnen",
-    desc:"5 Tonnen Gesamtvolumen",
-    check: s => s.reduce((a,x) => a + vol(x.sets), 0) >= 5000,
+    check: s=>{const w={};s.forEach(x=>{const k=isoWeekKey(x.date);w[k]=(w[k]||0)+1;});return Object.values(w).some(v=>v>=5);},
   },
   {
-    // [FIX 2] nur isDone-Sätze für PR-Zählung
-    id:"pr_hunter", icon:"🎯", name:"PR-Jäger",
-    desc:"5 persönliche Rekorde",
-    check: s => Object.keys(getPRs(s)).length >= 5,
-  },
-  {
-    // [FIX 2] nur isDone-Sätze für Gewichtsprüfung
-    id:"heavy_lifter", icon:"💎", name:"Schwerer Junge",
-    desc:"50 kg+ auf einer Übung",
-    check: s => s.some(x => x.sets.some(y => isDone(y) && y.weight >= 50)),
-  },
-  { id:"cardio_5",   icon:"🏃", name:"Läufer",    desc:"5 Cardio-Aktivitäten",  check:(_,__,___,c)=>c.length>=5 },
-  {
-    id:"cardio_10km", icon:"🌍", name:"10 km Club",
-    desc:"10 km in einer Einheit",
-    // [FIX] distance kann null sein → sicherer Vergleich
-    check: (_,__,___,c) => c.some(x => (x.distance||0) >= 10),
-  },
-  {
-    // [FIX 3] isoWeekKey für korrekte Wochenzuordnung
-    id:"combo", icon:"⚖", name:"Allrounder",
-    desc:"Kraft + Cardio in derselben Woche",
-    check: (s,_,__,cardio) => {
-      const sWeeks = new Set(s.map(x => isoWeekKey(x.date)));
-      return cardio.some(c => sWeeks.has(isoWeekKey(c.date)));
-    },
-  },
-  {
-    id:"early_bird", icon:"🌅", name:"Frühaufsteher",
-    desc:"Training vor 8 Uhr",
-    check: s => s.some(x => new Date(x.date).getHours() < 8),
-  },
-  {
-    // [FIX 3] isoWeekKey für konsistente Wochenlogik
-    id:"consistent_4w", icon:"📅", name:"Konsequent",
+    id:"consistent_4w",   icon:"📅", name:"Konsequent",          cat:"Konsistenz",
     desc:"4 Wochen in Folge trainiert",
-    check: s => {
-      if (s.length < 4) return false;
-      const ws = [...new Set(s.map(x => isoWeekKey(x.date)))].sort();
-      let consec=0, max=0, prev=null;
-      ws.forEach(w => {
-        if (prev) {
-          const [y1,n1] = [parseInt(prev.split("-W")[0]), parseInt(prev.split("-W")[1])];
-          const [y2,n2] = [parseInt(w.split("-W")[0]),    parseInt(w.split("-W")[1])];
-          // Aufeinanderfolgende ISO-Wochen (auch Jahreswechsel KW52→KW01)
-          const consecutive = (y1===y2 && n2-n1===1) || (y2-y1===1 && n1>=52 && n2===1);
-          consec = consecutive ? consec+1 : 1;
-        } else {
-          consec = 1;
-        }
-        if (consec > max) max = consec;
-        prev = w;
+    check: s=>{
+      if(s.length<4)return false;
+      const ws=[...new Set(s.map(x=>isoWeekKey(x.date)))].sort();
+      let consec=0,max=0,prev=null;
+      ws.forEach(w=>{
+        if(prev){
+          const[y1,n1]=[parseInt(prev.split("-W")[0]),parseInt(prev.split("-W")[1])];
+          const[y2,n2]=[parseInt(w.split("-W")[0]),parseInt(w.split("-W")[1])];
+          const ok=(y1===y2&&n2-n1===1)||(y2-y1===1&&n1>=52&&n2===1);
+          consec=ok?consec+1:1;
+        }else{consec=1;}
+        if(consec>max)max=consec;prev=w;
       });
-      return max >= 4;
+      return max>=4;
     },
   },
   {
-    // [FIX 2] nur isDone-Sätze für Plank-Zählung
-    id:"plank_master", icon:"🧘", name:"Plank-Meister",
+    id:"consistency_king",icon:"👑", name:"Consistency King",    cat:"Konsistenz",
+    desc:"8 Wochen in Folge trainiert",
+    check: s=>{
+      if(s.length<8)return false;
+      const ws=[...new Set(s.map(x=>isoWeekKey(x.date)))].sort();
+      let consec=0,max=0,prev=null;
+      ws.forEach(w=>{
+        if(prev){
+          const[y1,n1]=[parseInt(prev.split("-W")[0]),parseInt(prev.split("-W")[1])];
+          const[y2,n2]=[parseInt(w.split("-W")[0]),parseInt(w.split("-W")[1])];
+          const ok=(y1===y2&&n2-n1===1)||(y2-y1===1&&n1>=52&&n2===1);
+          consec=ok?consec+1:1;
+        }else{consec=1;}
+        if(consec>max)max=consec;prev=w;
+      });
+      return max>=8;
+    },
+  },
+
+  // ── Volumen ─────────────────────────────────────────
+  { id:"volume_1t",   icon:"🏗", name:"Eine Tonne",       cat:"Volumen",
+    desc:"1 Tonne Gesamtvolumen",       check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=1000 },
+  { id:"volume_5t",   icon:"🏗", name:"Fünf Tonnen",      cat:"Volumen",
+    desc:"5 Tonnen Gesamtvolumen",      check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=5000 },
+  { id:"volume_50t",  icon:"🏋", name:"Fifty Tonnen",     cat:"Volumen",
+    desc:"50 Tonnen Gesamtvolumen",     check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=50000 },
+  { id:"volume_100t", icon:"🚀", name:"Century Lifter",   cat:"Volumen",
+    desc:"100 Tonnen Gesamtvolumen",    check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=100000 },
+
+  // ── Sätze ────────────────────────────────────────────
+  { id:"sets_50",   icon:"📋", name:"Satzsammler",    cat:"Volumen",
+    desc:"50 abgeschlossene Sätze",     check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=50 },
+  { id:"sets_250",  icon:"📋", name:"Fleißige Hände", cat:"Volumen",
+    desc:"250 abgeschlossene Sätze",    check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=250 },
+  { id:"sets_1000", icon:"📋", name:"Tausend Sätze",  cat:"Volumen",
+    desc:"1000 abgeschlossene Sätze",   check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=1000 },
+
+  // ── Trainingszeit ────────────────────────────────────
+  { id:"time_5h",  icon:"⏱", name:"5 Stunden Eisen",   cat:"Zeit",
+    desc:"5h Gesamttrainingszeit",      check:s=>s.reduce((a,x)=>a+(x.duration||0),0)>=300 },
+  { id:"time_20h", icon:"⏱", name:"20 Stunden Härte",  cat:"Zeit",
+    desc:"20h Gesamttrainingszeit",     check:s=>s.reduce((a,x)=>a+(x.duration||0),0)>=1200 },
+  { id:"time_100h",icon:"⏱", name:"100-Stunden-Held",  cat:"Zeit",
+    desc:"100h Gesamttrainingszeit",    check:s=>s.reduce((a,x)=>a+(x.duration||0),0)>=6000 },
+
+  // ── Kraft / PRs ──────────────────────────────────────
+  { id:"pr_hunter",   icon:"🎯", name:"PR-Jäger",       cat:"Kraft",
+    desc:"5 persönliche Rekorde",       check:s=>Object.keys(getPRs(s)).length>=5 },
+  { id:"pr_collector",icon:"🏅", name:"PR-Sammler",     cat:"Kraft",
+    desc:"10 persönliche Rekorde",      check:s=>Object.keys(getPRs(s)).length>=10 },
+  { id:"heavy_lifter",icon:"💎", name:"Schwerer Junge",  cat:"Kraft",
+    desc:"50 kg+ auf einer Übung",      check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=50)) },
+  { id:"century_club",icon:"💯", name:"Century Club",    cat:"Kraft",
+    desc:"100 kg+ auf einer Übung",     check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=100)) },
+
+  // ── Cardio ────────────────────────────────────────────
+  { id:"cardio_5",   icon:"🏃", name:"Läufer",           cat:"Cardio",
+    desc:"5 Cardio-Aktivitäten",        check:(_,__,___,c)=>c.length>=5 },
+  { id:"cardio_20",  icon:"🏃", name:"Ausdauerathlet",   cat:"Cardio",
+    desc:"20 Cardio-Aktivitäten",       check:(_,__,___,c)=>c.length>=20 },
+  { id:"cardio_10km",icon:"🌍", name:"10 km Club",       cat:"Cardio",
+    desc:"10 km in einer Einheit",      check:(_,__,___,c)=>c.some(x=>(x.distance||0)>=10) },
+  { id:"cardio_100min",icon:"⏱",name:"Cardio-Hundert",  cat:"Cardio",
+    desc:"100 Min Cardio in einer Woche",
+    check:(_,__,___,c)=>{
+      const w={};
+      c.forEach(x=>{const k=isoWeekKey(x.date);w[k]=(w[k]||0)+(x.duration||0);});
+      return Object.values(w).some(v=>v>=100);
+    },
+  },
+
+  // ── Mobility / Zeitübungen ───────────────────────────
+  { id:"plank_master",icon:"🧘", name:"Plank-Meister",   cat:"Mobility",
     desc:"Plank 3× in einer Einheit",
-    check: s => s.some(x => x.sets.filter(y => isDone(y) && y.eid==="e23").length >= 3),
+    check:s=>s.some(x=>x.sets.filter(y=>isDone(y)&&y.eid==="e23").length>=3) },
+  { id:"plank_5min",  icon:"🧘", name:"5-Minuten-Plank", cat:"Mobility",
+    desc:"Plank ≥ 300 Sek in einer Einheit",
+    check:s=>s.some(x=>x.sets.filter(isDone).some(y=>y.eid==="e23"&&(y.reps||0)>=300)) },
+  { id:"mobility_fan",icon:"🌿", name:"Mobility Master", cat:"Mobility",
+    desc:"10 Dehneinheiten abgeschlossen",
+    check:s=>{
+      let count=0;
+      s.forEach(sess=>sess.sets.filter(isDone).forEach(x=>{if(x.eid&&x.eid.startsWith("s"))count++;}));
+      return count>=10;
+    },
+  },
+
+  // ── Spezial ──────────────────────────────────────────
+  { id:"early_bird",  icon:"🌅", name:"Frühaufsteher",   cat:"Spezial",
+    desc:"Training vor 8 Uhr",          check:s=>s.some(x=>new Date(x.date).getHours()<8) },
+  { id:"night_owl",   icon:"🌙", name:"Nachteule",        cat:"Spezial",
+    desc:"Training nach 21 Uhr",        check:s=>s.some(x=>new Date(x.date).getHours()>=21) },
+  { id:"leg_day_hero",icon:"🦵", name:"Leg Day Hero",     cat:"Spezial",
+    desc:"4 verschiedene Bein-Übungen in einer Session",
+    check:(s,_,__,___,allExercises)=>s.some(sess=>{
+      // Only count exercises in category "Beine"
+      const legEids = new Set(
+        sess.sets
+          .filter(isDone)
+          .map(x=>x.eid)
+          .filter(id => {
+            const ex = (allExercises||[]).find(e=>e.id===id);
+            return ex?.cat === "Beine";
+          })
+      );
+      return legEids.size >= 4;
+    }),
+  },
+  {
+    id:"combo",        icon:"⚖", name:"Allrounder",       cat:"Spezial",
+    desc:"Kraft + Cardio in derselben Woche",
+    check:(s,_,__,cardio)=>{
+      const sWeeks=new Set(s.map(x=>isoWeekKey(x.date)));
+      return cardio.some(c=>sWeeks.has(isoWeekKey(c.date)));
+    },
   },
 ];
 
-function calcAchievements(sessions, metrics, streak, cardio) {
-  return ACHIEVEMENT_DEFS.map(a => ({ ...a, unlocked: a.check(sessions, metrics, streak, cardio) }));
+function calcAchievements(sessions, metrics, streak, cardio, allExercises=[]) {
+  return ACHIEVEMENT_DEFS.map(a => ({
+    ...a,
+    unlocked: a.check(sessions, metrics, streak, cardio, allExercises),
+  }));
 }
+
 
 // ═══════════════════════════════════════════════════════
 // UNIT TYPE HELPERS  (Fix 6 – Zeit vs. Wdh)
@@ -297,22 +900,34 @@ function repsFieldLabel(unitType) {
 const DEFAULT_SETTINGS = {
   weeklyGoal:4, weightGoal:null, unit:"kg",
   fitnessGoal:"Muskelaufbau", name:"", onboarded:false, bodyWeight:null,
-  // Timer tick thresholds (seconds before end where beeps start)
   timerSettings: {
-    restTickStart:     10,   // Pausen-Timer
-    exerciseTickStart: 10,   // Zeitübungs-Timer
+    restTickStart:     10,
+    exerciseTickStart: 10,
   },
-  // Default rest durations by category/equipment (seconds)
   restRules: {
-    warmup:     30,
-    stretching: 30,
-    machine:    60,
-    cable:      75,
-    dumbbell:   90,
-    barbell:    90,
-    bodyweight: 60,
-    default:    60,
+    warmup:30, stretching:30, machine:60, cable:75,
+    dumbbell:90, barbell:90, bodyweight:60, default:60,
   },
+  // ── Progressions-System ────────────────────────────────
+  progressionSettings: {
+    enabled:                   true,
+    mode:                      "normal",   // "conservative"|"normal"|"aggressive"
+    deloadEnabled:             true,
+    deloadStrategy:            "weight",   // "weight"|"sets"|"both"
+    deloadEveryWeeks:          6,
+    autoDeloadOnStagnation:    true,
+    showSuggestionsInWorkout:  true,
+    minSessionsBeforeSuggestion: 2,
+    defaultRepRange:           { min:8, max:12 },
+    incrementRules: {
+      machine:4.0, cable:2.5, dumbbell:1.0,
+      barbell:2.5, bodyweight:0, default:2.5,
+    },
+    deloadPercent:       15,
+    volumeDeloadPercent: 30,
+  },
+  lastDeloadDate:    null,
+  activeDeloadUntil: null,
 };
 
 // Helper: return default rest (secs) for an exercise based on settings rules
@@ -333,20 +948,28 @@ function getDefaultRestForExercise(exercise, settings) {
 
 // Merge settings with defaults (for backward-compat with old backups)
 function mergeWithDefaults(saved) {
+  const ps = DEFAULT_SETTINGS.progressionSettings;
   return {
     ...DEFAULT_SETTINGS,
     ...saved,
     timerSettings: { ...DEFAULT_SETTINGS.timerSettings, ...(saved?.timerSettings || {}) },
     restRules:     { ...DEFAULT_SETTINGS.restRules,     ...(saved?.restRules     || {}) },
+    progressionSettings: {
+      ...ps,
+      ...(saved?.progressionSettings || {}),
+      defaultRepRange: { ...ps.defaultRepRange,  ...(saved?.progressionSettings?.defaultRepRange  || {}) },
+      incrementRules:  { ...ps.incrementRules,   ...(saved?.progressionSettings?.incrementRules   || {}) },
+    },
   };
 }
+
 
 // ── Zusätzliche Übungen: Warm-up, Mobilisierung, Dehnung ──────────────
 // Diese werden zu EDB gemergt (custom exercises folgen später im State)
 const EXTRA_EDB = [
-  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"reps",
+  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"secs",
    desc:"15× vorwärts, 15× rückwärts. Arme hängen locker, große Kreisbewegung."},
-  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",      unitType:"reps",
+  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",      unitType:"secs",
    desc:"15× rechts, 15× links. Hände zu Fäusten, langsam im vollen Radius kreisen."},
   {id:"w3", name:"Crosstrainer",        cat:"Aufwärmen", eq:"Maschine",      muscle:"core",      unitType:"secs",
    desc:"Lockeres Aufwärmen, mittleres Tempo."},
@@ -489,7 +1112,11 @@ const LS_PREFIX = "ft5_";
 function lsGet(key, fallback) {
   try {
     const v = localStorage.getItem(LS_PREFIX + key);
-    return v ? JSON.parse(v) : fallback;
+    if (!v) return fallback;
+    const parsed = JSON.parse(v);
+    // Fix 1: deep-merge settings so new fields are always present
+    if (key === "settings") return mergeWithDefaults(parsed);
+    return parsed;
   } catch {
     return fallback;
   }
@@ -893,7 +1520,7 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
             {overtime && <span style={{color:T.green,marginLeft:8,fontWeight:700}}>Ziel erreicht ✓</span>}
           </div>
           <Btn onClick={onFinish}
-            v={overtime ? "green" : "secondary"}
+            v={overtime ? "teal" : "secondary"}
             full style={{padding:"9px 0",fontSize:13}}>
             {overtime ? "Satz beenden ✓" : "Satz jetzt beenden"}
           </Btn>
@@ -1663,7 +2290,7 @@ const ExerciseDBScreen = ({
 // ═══════════════════════════════════════════════════════
 // PLAN EDITOR  – vollständig editierbar
 // ═══════════════════════════════════════════════════════
-const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSave, onCancel, settings}) => {
+const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSave, onCancel, settings, sessions}) => {
   const [name,setName]=useState(plan?.name||"");
   const [desc,setDesc]=useState(plan?.desc||"");
   const [days,setDays]=useState(()=>JSON.parse(JSON.stringify(plan?.days||[])));
@@ -1695,6 +2322,20 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
       }),
     }:day));
   };
+  // Progression anwenden: update planned weights based on last performance
+  const applyProgression = () => {
+    if (!window.confirm("Geplante Gewichte anhand deiner bisherigen Leistung aktualisieren?\n\nBestehende Einträge werden überschrieben.")) return;
+    setDays(d=>d.map((day,i)=>i!==activeDay?day:{
+      ...day,
+      exercises:day.exercises.map(ex=>{
+        const exercise=(allExercises||[]).find(e=>e.id===ex.eid);
+        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings);
+        if(!suggestion||suggestion.suggestedWeight<=0) return ex;
+        return {...ex, weight:suggestion.suggestedWeight};
+      }),
+    }));
+  };
+
   const remEx    = (di,ei) => setDays(d=>d.map((x,i)=>i===di?{...x,exercises:x.exercises.filter((_,j)=>j!==ei)}:x));
   const updEx    = (di,ei,f,v) => setDays(d=>d.map((x,i)=>i===di?{
     ...x,exercises:x.exercises.map((e,j)=>j===ei?{...e,[f]:isNaN(Number(v))?v:Number(v)}:e)
@@ -1826,6 +2467,12 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
               title="Pausen aller Übungen dieses Tages nach den Einstellungen setzen">
               ⏱ Pausen
             </Btn>
+            {getProgressionSettings(settings).enabled&&(sessions||[]).length>=getProgressionSettings(settings).minSessionsBeforeSuggestion&&(
+              <Btn v="ghost" onClick={applyProgression} style={{flex:1,fontSize:11,padding:"8px 4px"}}
+                title="Gewichte anhand letzter Trainingsleistung aktualisieren">
+                📈 Prog.
+              </Btn>
+            )}
           </div>
         </Card>
       )}
@@ -1848,7 +2495,7 @@ const ProgressionTip = ({plan}) => {
   );
 };
 
-const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSelectPlan, settings}) => {
+const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerciseOverrides, customExercises, setCustomExercises, onSelectPlan, settings, sessions}) => {
   const [view,setView]     = useState("list"); // list | detail | edit
   const [showArchive,setShowArchive] = useState(false);
   const [sel,setSel]       = useState(null);
@@ -1885,6 +2532,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
       onSave={save}
       onCancel={()=>setView(editing?"detail":"list")}
       settings={settings}
+      sessions={sessions}
     />
   );
 
@@ -1992,7 +2640,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 // ─────────────────────────────────────────────────────────────────────
 const WorkoutExerciseCard = ({
   planEx, planExIdx, allExercises, exerciseOverrides,
-  sets, toggle, upd, addSet, setExTimer, exTimer, settings,
+  sets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
 }) => {
   const ikey     = instKey(planEx.eid, planExIdx);
   const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
@@ -2016,6 +2664,40 @@ const WorkoutExerciseCard = ({
   }, [allDone]); // eslint-disable-line
   // Is the exercise timer currently running for this card?
   const isThisTimerActive = exTimer?.ikey === ikey;
+  // Progression suggestion (only for strength exercises, computed once)
+  const ps = getProgressionSettings(settings);
+  const suggestion = useMemo(() => {
+    if (!ps.showSuggestionsInWorkout || isTimeBased) return null;
+    return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planEx?.eid, planExIdx, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
+
+  // Apply suggestion to all sets of this exercise
+  // Apply suggestion: update weight for all undone sets in one batched call.
+  // If deload with set reduction (suggestedSets), also trim excess undone sets.
+  const applySuggestion = () => {
+    if (!suggestion) return;
+    const ikey_ = instKey(planEx.eid, planExIdx);
+    setSets(prev => {
+      const curSets  = prev[ikey_] || [];
+      let updated    = curSets.map(s =>
+        s.done ? s : {
+          ...s,
+          weight: suggestion.suggestedWeight > 0 ? suggestion.suggestedWeight : s.weight,
+        }
+      );
+      // For deload with set reduction: keep done sets + trim undone sets to target count
+      if (suggestion.isDeload && suggestion.suggestedSets != null) {
+        const doneSets  = updated.filter(s => s.done);
+        const undoneSets= updated.filter(s => !s.done);
+        const keepUndone= Math.max(0, suggestion.suggestedSets - doneSets.length);
+        updated = [...doneSets, ...undoneSets.slice(0, keepUndone)];
+        // Always keep at least 1 set total
+        if (updated.length === 0 && curSets.length > 0) updated = [curSets[0]];
+      }
+      return { ...prev, [ikey_]: updated };
+    });
+  };
 
 
   return (
@@ -2077,6 +2759,46 @@ const WorkoutExerciseCard = ({
         {planEx.note&&(
           <div style={{fontSize:10,color:T.muted,marginBottom:6}}>💡 {planEx.note}</div>
         )}
+
+        {/* ── Progression suggestion box ─────────────────── */}
+        {suggestion&&(()=>{
+          const repRange = getRepRangeForPlanExercise(planEx, settings);
+          return (
+          <div style={{
+            marginBottom:8, padding:"8px 10px", borderRadius:10,
+            background: suggestion.isDeload ? T.orange+"18" : T.teal+"18",
+            border:`1px solid ${suggestion.isDeload ? T.orange+"55" : T.teal+"55"}`,
+          }}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:11,fontWeight:800,letterSpacing:0.3,marginBottom:2,
+                  color: suggestion.isDeload ? T.orange : T.teal}}>
+                  {suggestion.isDeload ? "⬇ DELOAD" : suggestion.action==="increase" ? "↑ PROGRESSION" : "→ HALTEN"}
+                </div>
+                <div style={{fontSize:12,color:suggestion.isDeload?T.orange:T.teal,fontWeight:700,marginBottom:2}}>
+                  {suggestion.suggestedWeight>0 ? `${suggestion.suggestedWeight} kg` : "—"}
+                  {" × "}{repRange.min}–{repRange.max} Wdh
+                </div>
+                <div style={{fontSize:10,color:T.sub}}>{suggestion.reason}</div>
+                {suggestion.isDeload&&suggestion.suggestedSets!=null&&(
+                  <div style={{fontSize:10,color:T.orange,marginTop:2,fontWeight:700}}>
+                    → {suggestion.suggestedSets} Sätze empfohlen
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={applySuggestion}
+                style={{
+                  background: suggestion.isDeload ? T.orange : T.teal,
+                  color:"#07070F", border:"none", borderRadius:7,
+                  padding:"5px 10px", fontSize:11, fontWeight:800,
+                  cursor:"pointer", flexShrink:0, whiteSpace:"nowrap",
+                }}
+              >Übernehmen</button>
+            </div>
+          </div>
+          );
+        })()}
 
         {/* Extra info badges */}
         {hasExtraInfo&&(
@@ -2141,7 +2863,14 @@ const WorkoutExerciseCard = ({
                   style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
                 {/* Punkt 8: volume display */}
                 <div style={{textAlign:"center",fontSize:11,fontWeight:700,color:T.muted}}>
-                  {s.weight>0 ? `${(s.weight*s.reps).toFixed(0)} kg` : "—"}
+                  {s.weight>0
+                    ? <><span style={{color:T.text}}>{s.weight} kg</span>
+                        <span style={{color:T.muted}}> × </span>
+                        <span style={{color:T.text}}>{s.reps} Wdh</span>
+                        <div style={{fontSize:9,color:T.muted,marginTop:1}}>
+                          Vol: {(s.weight*s.reps).toFixed(0)} kg
+                        </div></>
+                    : "—"}
                 </div>
               </>
             )}
@@ -2196,7 +2925,7 @@ function clearWorkoutDraft() {
   try { localStorage.removeItem(WS_KEY); } catch {}
 }
 
-const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, onSave, preselectedPlanId}) => {
+const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessions, onSave, preselectedPlanId}) => {
   // Fix 3: only non-archived plans
   const activePlans = useMemo(() => (plans||[]).filter(p => !p.archived), [plans]);
 
@@ -2513,6 +3242,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, onSave
           setExTimer={setExTimer}
           exTimer={exTimer}
           settings={settings}
+          sessions={sessions}
         />
       ))}
 
@@ -2553,27 +3283,77 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, onSave
 }
 
 // ═══════════════════════════════════════════════════════
-// PROGRESS SCREEN
+// PROGRESS SCREEN  (Punkte 1–5, 9, 10)
 // ═══════════════════════════════════════════════════════
-const ProgressScreen = ({sessions, plans, cardio, allExercises, onDeleteSession}) => {
+const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverrides, settings, onDeleteSession}) => {
   const [view,setView]         = useState("overview");
-  const [selEx,setSelEx]       = useState("e36");
+  const [selEx,setSelEx]       = useState(null);
   const [detailSess,setDetailSess] = useState(null);
 
+  // ── Pre-computed data ─────────────────────────────────
   const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>s.sets.filter(isDone).map(x=>x.eid)))],[sessions]);
   const prs       = useMemo(()=>getPRs(sessions),[sessions]);
   const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
-  const exHistory = useMemo(()=>
-    sessions
-      .flatMap(s=>s.sets.filter(x=>isDone(x)&&x.eid===selEx&&x.weight>0).map(x=>({date:s.date,weight:x.weight,reps:x.reps})))
-      .sort((a,b)=>new Date(a.date)-new Date(b.date)),
-    [sessions,selEx]
-  );
+  const weekSets  = useMemo(()=>getWeeklySets(sessions,allExercises,1),[sessions,allExercises]);
+  const sets4w    = useMemo(()=>getWeeklySets(sessions,allExercises,4),[sessions,allExercises]);
+  const lastTrained=useMemo(()=>getLastTrainedDays(sessions,allExercises),[sessions,allExercises]);
+  const summary   = useMemo(()=>buildWeeklySummary(sessions,cardio,allExercises),[sessions,cardio,allExercises]);
+  const recs      = useMemo(()=>buildRecommendations(sessions,cardio,allExercises,calcStreak(sessions,cardio)),[sessions,cardio,allExercises]);
+  // Progression tab data
+  const deloadRec = useMemo(()=>detectDeloadRecommendation(sessions,settings),[sessions,settings]);
+  const progData  = useMemo(()=>{
+    if(!sessions||sessions.length<2) return [];
+    const ps = getProgressionSettings(settings);
+    const strengthEids=[...new Set(
+      sessions.flatMap(s=>s.sets.filter(x=>isDone(x)&&(x.weight||0)>0).map(x=>x.eid))
+    )];
+    return strengthEids.slice(0,12).map(eid=>{
+      const ex=(allExercises||[]).find(e=>e.id===eid);
+      if(!ex||(ex.unitType&&ex.unitType!=="reps")) return null;
+      const planEx={eid, weight:0, sets:3, reps:10};
+      // Fix 2: use actual last-known weight so deload suggestion is non-zero
+      const history=getExercisePerformanceHistory(eid, sessions);
+      const lastKnownWeight = history.length>0 ? (history[history.length-1].sets[0]?.weight||0) : 0;
+      const planExWithWeight = {...planEx, weight: lastKnownWeight};
+      const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings);
+      const stag=detectExerciseStagnation(eid,sessions,settings);
+      return { eid, name:ex.name, cat:ex.cat, suggestion:sug, stagnation:stag };
+    }).filter(Boolean);
+  },[sessions,allExercises,settings]);
+
+  // Selected exercise analytics
+  const exObj     = useMemo(()=>selEx?(allExercises||[]).find(e=>e.id===selEx):null,[selEx,allExercises]);
+  const exUnitType= exObj?.unitType||"reps";
+  const isTimeEx  = exUnitType==="secs"||exUnitType==="mins";
+  const exHistory = useMemo(()=>selEx?getExHistory(sessions,selEx):[]   ,[sessions,selEx]);
+  const timeHist  = useMemo(()=>selEx?getTimeExHistory(sessions,selEx):[] ,[sessions,selEx]);
+
+  // Trend analysis for selected exercise
+  const exTrend = useMemo(()=>{
+    if (!selEx || exHistory.length < 2) return null;
+    const wt = exHistory.map(h=>h.weight);
+    const rp = exHistory.map(h=>h.reps);
+    const vl = exHistory.map(h=>h.vol);
+    const rm = exHistory.map(h=>h.rm1);
+    const now30 = exHistory.filter(h=>new Date(h.date)>new Date(Date.now()-30*86400000));
+    return {
+      weightPct:  pctChange(wt),
+      repsPct:    pctChange(rp),
+      volPct:     pctChange(vl),
+      rm1Pct:     pctChange(rm),
+      slope:      calcTrend(wt),
+      bestSet:    getBestSet(sessions,selEx),
+      best1RM:    Math.max(0,...rm),
+      last30Sets: now30.length,
+      latestWt:   wt[wt.length-1],
+      firstWt:    wt[0],
+    };
+  },[sessions,selEx,exHistory]);
 
   // Session detail overlay
   if (detailSess) {
     const byEx = {};
-    detailSess.sets.filter(isDone).forEach(s => { if (!byEx[s.eid]) byEx[s.eid]=[]; byEx[s.eid].push(s); });
+    detailSess.sets.filter(isDone).forEach(s=>{if(!byEx[s.eid])byEx[s.eid]=[];byEx[s.eid].push(s);});
     return (
       <div style={{position:"fixed",inset:0,background:T.bg,zIndex:200,overflowY:"auto"}}>
         <div style={{padding:"16px 16px 0",display:"flex",gap:10,alignItems:"center"}}>
@@ -2598,19 +3378,19 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, onDeleteSession}
             {detailSess.note&&<div style={{marginTop:12,padding:"10px 12px",background:T.accentGlow,borderRadius:10,fontSize:12,color:T.accentDim,fontStyle:"italic"}}>"{detailSess.note}"</div>}
           </Card>
           {Object.entries(byEx).map(([eid,exSets])=>{
-            const ex=allExercises.find(e=>e.id===eid);
+            const ex=(allExercises||[]).find(e=>e.id===eid);
             const best=Math.max(0,...exSets.map(s=>s.weight||0));
             return (
               <Card key={eid} style={{marginBottom:10}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
                   <div>
                     <div style={{fontSize:14,fontWeight:700,color:T.text}}>{ex?.name||eid}</div>
                     <div style={{fontSize:11,color:T.sub}}>{ex?.cat}</div>
                   </div>
-                  {best>0&&<div style={{textAlign:"right"}}><div style={{fontSize:13,fontWeight:700,color:T.orange}}>{best} kg top</div></div>}
+                  {best>0&&<div style={{fontSize:13,fontWeight:700,color:T.orange}}>{best} kg top</div>}
                 </div>
                 {exSets.map((s,i)=>(
-                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:i<exSets.length-1?`1px solid ${T.border}`:"none"}}>
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:i<exSets.length-1?`1px solid ${T.border}`:"none"}}>
                     <span style={{fontSize:12,color:T.muted}}>Satz {s.setN}</span>
                     <span style={{fontSize:13,fontWeight:700,color:T.text}}>{s.weight>0?`${s.weight} kg × `:""}{s.reps} Wdh</span>
                   </div>
@@ -2623,78 +3403,342 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, onDeleteSession}
     );
   }
 
+  // ── Tab bar ─────────────────────────────────────────
+  const tabs=[{v:"overview",l:"📊 Woche"},{v:"muscles",l:"💪 Muskeln"},{v:"exercises",l:"🏋 Übungen"},{v:"progress",l:"📈 Progression"},{v:"history",l:"📋 Verlauf"}];
+
   return (
     <div style={{padding:"0 16px 24px"}}>
-      <div style={{padding:"22px 0 14px"}}>
+      <div style={{padding:"22px 0 10px"}}>
         <div style={{fontSize:24,fontWeight:900,color:T.text,marginBottom:12}}>Fortschritt</div>
-        <div style={{display:"flex",gap:7,overflowX:"auto",paddingBottom:2}}>
-          {[{v:"overview",l:"📊 Übersicht"},{v:"exercises",l:"🏋 Übungen"},{v:"history",l:"📋 Verlauf"}].map(b=>(
-            <button key={b.v} onClick={()=>setView(b.v)} style={{background:view===b.v?T.accent:T.bgCard,color:view===b.v?"#07070F":T.sub,border:`1px solid ${view===b.v?T.accent:T.border}`,borderRadius:9,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>{b.l}</button>
+        <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:2}}>
+          {tabs.map(b=>(
+            <button key={b.v} onClick={()=>setView(b.v)} style={{background:view===b.v?T.accent:T.bgCard,color:view===b.v?"#07070F":T.sub,border:`1px solid ${view===b.v?T.accent:T.border}`,borderRadius:9,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>{b.l}</button>
           ))}
         </div>
       </div>
 
-      {view==="overview" && <>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:14}}>
-          {[{l:"Kraft",v:sessions.length,c:T.accent},{l:"Cardio",v:cardio.length,c:T.green},{l:"Vol. ges.",v:`${Math.round(totalVol/1000)}t`,c:T.blue}].map(s=>(
+      {/* ── OVERVIEW TAB ─────────────────────────────── */}
+      {view==="overview" && (<>
+        {/* KPI row */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+          {[
+            {l:"DIESE WOCHE",v:summary.sessionCount,c:T.accent},
+            {l:"TRAINING MIN",v:summary.weekTime,c:T.blue},
+            {l:"CARDIO MIN",v:summary.cardioMin,c:T.green},
+          ].map(s=>(
             <Card key={s.l} style={{padding:12,textAlign:"center"}}>
               <div style={{fontSize:22,fontWeight:900,color:s.c}}>{s.v}</div>
               <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
             </Card>
           ))}
         </div>
-        {sessions.length>1 && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+          <Card style={{padding:12,textAlign:"center"}}>
+            <div style={{fontSize:18,fontWeight:900,color:T.accent}}>{sessions.length}</div>
+            <div style={{fontSize:9,color:T.muted,marginTop:2}}>GESAMT KRAFT</div>
+          </Card>
+          <Card style={{padding:12,textAlign:"center"}}>
+            <div style={{fontSize:18,fontWeight:900,color:T.blue}}>{Math.round(totalVol/1000)} t</div>
+            <div style={{fontSize:9,color:T.muted,marginTop:2}}>GESAMT VOLUMEN</div>
+          </Card>
+        </div>
+
+        {/* Volume sparkline */}
+        {sessions.length>2 && (
           <Card style={{marginBottom:12}}>
-            <Lbl>TRAININGSVOLUMEN</Lbl>
-            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={70}/>
+            <Lbl>VOLUMEN LETZTE 8 EINHEITEN</Lbl>
+            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={68}/>
           </Card>
         )}
-      </>}
 
-      {view==="exercises" && <>
+        {/* Weekly summary coach card */}
+        <Card style={{marginBottom:12,background:`linear-gradient(135deg,${T.accent}08,${T.bgCard})`}} glow>
+          <Lbl color={T.accent}>WOCHEN-COACH</Lbl>
+          {summary.topMuscle&&<div style={{fontSize:13,color:T.sub,marginBottom:6}}>
+            Meist trainiert: <b style={{color:T.text}}>{summary.topMuscle}</b>
+          </div>}
+          {summary.neglected.length>0&&<div style={{fontSize:13,color:T.sub,marginBottom:6}}>
+            Vernachlässigt: <b style={{color:T.orange}}>{summary.neglected.join(", ")}</b>
+          </div>}
+          {summary.mobilityMins>0&&<div style={{fontSize:13,color:T.sub,marginBottom:6}}>
+            Mobility: <b style={{color:T.teal}}>{summary.mobilityMins} Min</b>
+          </div>}
+          <div style={{fontSize:12,color:T.muted}}>
+            {summary.sessionCount} Training{summary.sessionCount!==1?"s":""}
+            {summary.weekTime>0&&` · ${summary.weekTime} Min`}
+            {summary.cardioMin>0&&` · ${summary.cardioMin} Min Cardio`}
+          </div>
+        </Card>
+
+        {/* Recommendations */}
+        {recs.length>0&&(
+          <Card style={{marginBottom:12}}>
+            <Lbl color={T.blue}>EMPFEHLUNGEN</Lbl>
+            {recs.map((r,i)=>(
+              <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"6px 0",borderBottom:i<recs.length-1?`1px solid ${T.border}`:"none"}}>
+                <span style={{fontSize:16,flexShrink:0}}>{r.icon}</span>
+                <div style={{fontSize:13,color:T.sub,lineHeight:1.5}}>{r.text}</div>
+              </div>
+            ))}
+          </Card>
+        )}
+
+        {/* PRs overview */}
+        {Object.keys(prs).length>0&&(
+          <Card style={{marginBottom:12}}>
+            <Lbl color={T.orange}>BESTLEISTUNGEN 🏆</Lbl>
+            {Object.entries(prs).slice(0,5).map(([eid,kg])=>{
+              const ex=(allExercises||[]).find(e=>e.id===eid);
+              return(
+                <div key={eid} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:`1px solid ${T.border}`}}>
+                  <span style={{fontSize:13,color:T.text}}>{ex?.name||eid}</span>
+                  <Badge color={T.orange}>{kg} kg</Badge>
+                </div>
+              );
+            })}
+          </Card>
+        )}
+      </>)}
+
+      {/* ── MUSCLES TAB ──────────────────────────────── */}
+      {view==="muscles" && (<>
+        {/* Push/Pull */}
+        {(()=>{const pp=getPushPullRatio(sets4w);return pp&&(
+          <Card style={{marginBottom:12}}>
+            <Lbl>PUSH / PULL (4 Wochen)</Lbl>
+            <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:6}}>
+              <div style={{flex:pp.push,background:T.accent+"55",borderRadius:6,height:16,minWidth:4}}/>
+              <div style={{flex:pp.pull,background:T.blue+"55",borderRadius:6,height:16,minWidth:4}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}>
+              <span style={{color:T.accent}}>Push {pp.push}%</span>
+              <span style={{color:T.blue}}>Pull {pp.pull}%</span>
+            </div>
+          </Card>
+        );})()}
+
+        {/* Muscle group bars */}
+        <Card style={{marginBottom:12}}>
+          <Lbl>SÄTZE PRO MUSKELGRUPPE (diese Woche)</Lbl>
+          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility).map(([cat,mg])=>{
+            const sets=weekSets[cat]||0;
+            const status=getMuscleStatus(sets,mg.targetSets);
+            const days=lastTrained[cat];
+            return(
+              <div key={cat} style={{marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+                  <div style={{fontSize:13,fontWeight:600,color:T.text}}>{cat}</div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    {status&&<span style={{fontSize:10,color:status.color,fontWeight:700}}>{status.label}</span>}
+                    <span style={{fontSize:13,fontWeight:700,color:T.text}}>{sets}</span>
+                  </div>
+                </div>
+                <PBar value={sets} max={mg.targetSets||1} color={status?.color||T.blue} h={6}/>
+                {days!==undefined&&(
+                  <div style={{fontSize:10,color:T.muted,marginTop:2}}>
+                    Zuletzt: {days===0?"heute":days===1?"gestern":`vor ${days} Tagen`}
+                    {" · "}{getRecoveryStatus(days).label}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </Card>
+
+        {/* Recovery status */}
+        <Card style={{marginBottom:12}}>
+          <Lbl>REGENERATIONS-STATUS</Lbl>
+          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility).map(([cat])=>{
+            const days=lastTrained[cat];
+            if(days===undefined)return null;
+            const st=getRecoveryStatus(days);
+            return(
+              <div key={cat} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${T.border}`}}>
+                <span style={{fontSize:13,color:T.text}}>{cat}</span>
+                <span style={{fontSize:11,color:st.color,fontWeight:700}}>{st.label}</span>
+              </div>
+            );
+          })}
+        </Card>
+      </>)}
+
+      {/* ── EXERCISES TAB ────────────────────────────── */}
+      {view==="exercises" && (<>
         <Lbl>ÜBUNG WÄHLEN</Lbl>
-        <div style={{display:"flex",gap:6,overflowX:"auto",marginBottom:14,paddingBottom:2}}>
+        <div style={{display:"flex",gap:6,overflowX:"auto",marginBottom:12,paddingBottom:2}}>
           {usedEids.map(eid=>{
-            const ex=allExercises.find(e=>e.id===eid);
+            const ex=(allExercises||[]).find(e=>e.id===eid);
             if(!ex)return null;
-            return (
-              <button key={eid} onClick={()=>setSelEx(eid)} style={{background:selEx===eid?T.accent:T.bgCard,color:selEx===eid?"#07070F":T.sub,border:`1px solid ${selEx===eid?T.accent:T.border}`,borderRadius:8,padding:"6px 14px",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>{ex.name}</button>
+            return(
+              <button key={eid} onClick={()=>setSelEx(eid)} style={{background:selEx===eid?T.accent:T.bgCard,color:selEx===eid?"#07070F":T.sub,border:`1px solid ${selEx===eid?T.accent:T.border}`,borderRadius:8,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>{ex.name}</button>
             );
           })}
         </div>
-        {selEx&&(
-          <Card>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+
+        {selEx && exObj && (<>
+          {/* Exercise header */}
+          <Card style={{marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
               <div>
-                <div style={{fontSize:15,fontWeight:700,color:T.text}}>{allExercises.find(e=>e.id===selEx)?.name}</div>
-                <div style={{fontSize:11,color:T.sub}}>{allExercises.find(e=>e.id===selEx)?.eq}</div>
+                <div style={{fontSize:16,fontWeight:900,color:T.text}}>{exObj.name}</div>
+                <div style={{fontSize:11,color:T.sub}}>{exObj.cat} · {exObj.eq}</div>
               </div>
               {prs[selEx]&&<Badge color={T.orange}>🏆 {prs[selEx]} kg</Badge>}
             </div>
-            {exHistory.length>1
-              ? <>
-                  <Lbl>GEWICHTSVERLAUF</Lbl>
-                  <LineChart data={exHistory.map(h=>h.weight)} color={T.accent} height={80}/>
-                  <div style={{display:"flex",gap:16,marginTop:10,fontSize:12,color:T.sub}}>
-                    <span>Start: <b style={{color:T.text}}>{exHistory[0]?.weight} kg</b></span>
-                    <span>Aktuell: <b style={{color:T.accent}}>{exHistory[exHistory.length-1]?.weight} kg</b></span>
+
+            {!isTimeEx && exTrend && (<>
+              {/* Trend indicators */}
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
+                {[
+                  {l:"GEWICHT",v:exTrend.latestWt?`${exTrend.latestWt} kg`:"—",pct:exTrend.weightPct,c:T.accent},
+                  {l:"EST. 1RM", v:exTrend.best1RM>0?`${exTrend.best1RM} kg`:"—",pct:exTrend.rm1Pct,c:T.orange},
+                  {l:"VOLUMEN",  v:exTrend.volPct!==null?`${exTrend.volPct>0?"+":""}${exTrend.volPct}%`:"—",pct:exTrend.volPct,c:T.blue},
+                ].map(s=>(
+                  <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
+                    <div style={{fontSize:14,fontWeight:900,color:s.c}}>{s.v}</div>
+                    {s.pct!==null&&(
+                      <div style={{fontSize:10,marginTop:2,color:s.pct>0?T.green:s.pct<0?T.red:T.muted,fontWeight:700}}>
+                        {s.pct>0?"↑":"↓"} {Math.abs(s.pct)}%
+                      </div>
+                    )}
+                    <div style={{fontSize:9,color:T.muted,marginTop:1}}>{s.l}</div>
                   </div>
-                </>
-              : <div style={{color:T.muted,fontSize:13,textAlign:"center",padding:"20px 0"}}>Zu wenig Daten.</div>
-            }
+                ))}
+              </div>
+
+              {/* Coaching insight */}
+              {exTrend.weightPct!==null&&(
+                <div style={{padding:"8px 10px",background:T.accentGlow,borderRadius:8,fontSize:12,color:T.accentDim,marginBottom:10}}>
+                  {exTrend.weightPct>0
+                    ? `📈 +${exTrend.weightPct}% stärker seit dem ersten Eintrag`
+                    : exTrend.weightPct<0
+                    ? `📉 ${exTrend.weightPct}% – Gewicht gesunken, Technik prüfen`
+                    : `➡️ Gewicht stabil – bereit für den nächsten Schritt?`}
+                </div>
+              )}
+
+              {/* Weight chart */}
+              {exHistory.length>1&&(<>
+                <Lbl>GEWICHTSVERLAUF</Lbl>
+                <LineChart data={exHistory.map(h=>h.weight)} color={T.accent} height={80}/>
+                <div style={{display:"flex",gap:16,marginTop:8,fontSize:12,color:T.sub}}>
+                  <span>Start: <b style={{color:T.text}}>{exTrend.firstWt} kg</b></span>
+                  <span>Aktuell: <b style={{color:T.accent}}>{exTrend.latestWt} kg</b></span>
+                  {exTrend.slope>0.05&&<span style={{color:T.green,fontWeight:700}}>↑ Trend</span>}
+                  {exTrend.slope<-0.05&&<span style={{color:T.red,fontWeight:700}}>↓ Trend</span>}
+                </div>
+              </>)}
+            </>)}
+
+            {/* Time exercise analysis (Punkt 5) */}
+            {isTimeEx && timeHist.length>0&&(<>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+                {[
+                  {l:"BEST",     v:fmtRepsVal(Math.max(...timeHist.map(h=>h.reps)),exUnitType),c:T.green},
+                  {l:"Ø DAUER",  v:fmtRepsVal(Math.round(timeHist.reduce((a,h)=>a+h.reps,0)/timeHist.length),exUnitType),c:T.blue},
+                ].map(s=>(
+                  <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
+                    <div style={{fontSize:16,fontWeight:900,color:s.c}}>{s.v}</div>
+                    <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
+                  </div>
+                ))}
+              </div>
+              {timeHist.length>1&&(<>
+                <Lbl>VERLAUF</Lbl>
+                <LineChart data={timeHist.map(h=>h.reps)} color={T.teal} height={72}/>
+                {(()=>{const pc=pctChange(timeHist.map(h=>h.reps));return pc!==null&&(
+                  <div style={{fontSize:12,color:pc>0?T.green:T.muted,marginTop:6,fontWeight:700}}>
+                    {pc>0?`↑ +${pc}% verbessert`:`→ ${pc}% verändert`} seit Beginn
+                  </div>
+                );})()}
+              </>)}
+            </>)}
+          </Card>
+        </>)}
+
+        {!selEx&&usedEids.length>0&&(
+          <div style={{textAlign:"center",padding:"30px 0",color:T.muted,fontSize:13}}>Übung antippen um Analyse zu sehen</div>
+        )}
+        {usedEids.length===0&&(
+          <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16}}>Noch keine Trainingsdaten.</div>
+        )}
+      </>)}
+
+      {/* ── PROGRESSION TAB ─────────────────────────── */}
+      {view==="progress" && (<>
+        {/* Deload recommendation */}
+        {deloadRec&&(
+          <Card style={{marginBottom:12,background:T.orange+"12",border:`1px solid ${T.orange}44`}}>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+              <span style={{fontSize:22}}>⬇</span>
+              <div>
+                <div style={{fontSize:14,fontWeight:800,color:T.orange,marginBottom:4}}>Entlastung empfohlen</div>
+                <div style={{fontSize:12,color:T.sub,lineHeight:1.5}}>{deloadRec.reason}</div>
+                <div style={{fontSize:11,color:T.muted,marginTop:4}}>
+                  {deloadRec.urgency==="active" ? "Aktiver Deload läuft" : "Nächste Einheit leichter trainieren"}
+                </div>
+              </div>
+            </div>
           </Card>
         )}
-      </>}
+        {!deloadRec&&(
+          <Card style={{marginBottom:12,background:T.teal+"12",border:`1px solid ${T.teal}44`}}>
+            <div style={{fontSize:13,color:T.teal,fontWeight:700}}>✅ Keine Entlastung nötig</div>
+            <div style={{fontSize:11,color:T.sub,marginTop:2}}>Trainingsbelastung im grünen Bereich</div>
+          </Card>
+        )}
 
-      {view==="history" && <>
+        {/* Per-exercise progression cards */}
+        {progData.length===0&&(
+          <div style={{textAlign:"center",padding:"30px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16}}>
+            Noch zu wenig Trainingsdaten für Vorschläge.
+          </div>
+        )}
+        {progData.map(item=>{
+          const sug=item.suggestion;
+          if(!sug) return null;
+          const col=sug.isDeload?T.orange:sug.action==="increase"?T.green:T.sub;
+          return(
+            <Card key={item.eid} style={{marginBottom:8}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:14,fontWeight:700,color:T.text}}>{item.name}</div>
+                  <div style={{fontSize:11,color:T.sub,marginBottom:4}}>{item.cat}</div>
+                  <div style={{fontSize:12,color:col,fontWeight:700}}>{sug.reason}</div>
+                  {sug.action==="increase"&&(
+                    <div style={{fontSize:11,color:T.green,marginTop:2}}>→ {sug.suggestedWeight} kg empfohlen</div>
+                  )}
+                  {sug.isDeload&&(
+                    <div style={{fontSize:11,color:T.orange,marginTop:2}}>
+                      {sug.suggestedWeight>0&&`→ ${sug.suggestedWeight} kg`}
+                      {sug.suggestedSets!=null&&` · ${sug.suggestedSets} Sätze`}
+                    </div>
+                  )}
+                </div>
+                <Badge color={col} style={{flexShrink:0,marginTop:2}}>
+                  {sug.isDeload?"Deload":sug.action==="increase"?"↑ Plus":"Halten"}
+                </Badge>
+              </div>
+              {item.stagnation?.stagnating&&(
+                <div style={{fontSize:10,color:T.muted,marginTop:4,borderTop:`1px solid ${T.border}`,paddingTop:4}}>
+                  ⚠ Keine Steigerung seit {item.stagnation.sessionsChecked} Einheiten
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </>)}
+
+      {/* ── HISTORY TAB ──────────────────────────────── */}
+      {view==="history" && (<>
         <Lbl>ALLE TRAININGS ({sessions.length})</Lbl>
-        {sessions.length===0 && (
+        {sessions.length===0&&(
           <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16,fontSize:14}}>Noch keine Trainings.</div>
         )}
         {sessions.map(sess=>{
-          const v   = vol(sess.sets);
-          const dn  = plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
-          return (
+          const v=vol(sess.sets);
+          const dn=plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
+          return(
             <Card key={sess.id} style={{marginBottom:8,padding:0,overflow:"hidden"}}>
               <div style={{display:"flex",alignItems:"stretch"}}>
                 <div onClick={()=>setDetailSess(sess)} style={{flex:1,padding:"12px 14px",cursor:"pointer"}}>
@@ -2713,129 +3757,283 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, onDeleteSession}
                     </div>
                   </div>
                 </div>
-                {/* [FIX: sichtbarer Lösch-Button] */}
                 <button
-                  onClick={e=>{ e.stopPropagation(); if(window.confirm(`"${dn}" wirklich löschen?`)) onDeleteSession(sess.id); }}
+                  onClick={e=>{e.stopPropagation();if(window.confirm(`"${dn}" wirklich löschen?`))onDeleteSession(sess.id);}}
                   style={{background:T.red+"18",border:"none",borderLeft:`1px solid ${T.red}33`,cursor:"pointer",padding:"0 16px",color:T.red,fontSize:18,flexShrink:0,borderRadius:"0 18px 18px 0"}}
                 >🗑</button>
               </div>
             </Card>
           );
         })}
-      </>}
+      </>)}
     </div>
   );
 };
+
 
 // ═══════════════════════════════════════════════════════
 // BODY SCREEN
 // ═══════════════════════════════════════════════════════
-const BodyScreen = ({metrics, settings, onSaveMetric, onUpdateSettings}) => {
-  const [weight,setWeight]=useState("");
-  const [waist,setWaist]=useState("");
-  const [goalW,setGoalW]=useState(settings.weightGoal!=null?String(settings.weightGoal):"");
+// ═══════════════════════════════════════════════════════
+// BODY SCREEN  (Punkt 6 – erweiterte Körperdaten)
+// ═══════════════════════════════════════════════════════
+// Metric fields definition (reused in form + history)
+const BODY_FIELDS = [
+  { key:"weight",         label:"Gewicht",        unit:"kg", primary:true  },
+  { key:"waist",          label:"Taille",         unit:"cm" },
+  { key:"chest",          label:"Brust",          unit:"cm" },
+  { key:"armLeft",        label:"Oberarm L",      unit:"cm" },
+  { key:"armRight",       label:"Oberarm R",      unit:"cm" },
+  { key:"hips",           label:"Hüfte",          unit:"cm" },
+  { key:"thighLeft",      label:"Oberschenkel L", unit:"cm" },
+  { key:"thighRight",     label:"Oberschenkel R", unit:"cm" },
+  { key:"calfLeft",       label:"Wade L",         unit:"cm" },
+  { key:"calfRight",      label:"Wade R",         unit:"cm" },
+  { key:"bodyFat",        label:"Körperfett",     unit:"%"  },
+];
 
-  const latest = metrics[metrics.length-1];
-  const first  = metrics[0];
-  const diff   = latest&&first ? (latest.weight-first.weight).toFixed(1) : null;
+const BodyScreen = ({metrics, settings, onSaveMetric, onUpdateSettings}) => {
+  const blankForm = () => Object.fromEntries(BODY_FIELDS.map(f=>[f.key,""]));
+  const [form, setForm]   = useState(blankForm);
+  const [showAll, setShowAll] = useState(false);
+  const [goalW, setGoalW] = useState(settings.weightGoal!=null?String(settings.weightGoal):"");
+  const [selField, setSelField] = useState("weight");
+
+  const latest = metrics[metrics.length-1] || {};
+  const first  = metrics[0] || {};
 
   const save = () => {
-    const w = parseFloat(weight);
+    const w = parseFloat(form.weight);
     if (!w || w <= 0) return;
-    onSaveMetric({id:uid(), date:new Date().toISOString(), weight:w, waist:parseFloat(waist)||null});
+    const entry = { id:uid(), date:new Date().toISOString() };
+    BODY_FIELDS.forEach(f=>{
+      const v = parseFloat(form[f.key]);
+      if (!isNaN(v) && v>0) entry[f.key]=v;
+    });
+    onSaveMetric(entry);
     onUpdateSettings({bodyWeight:w});
-    setWeight(""); setWaist("");
+    setForm(blankForm());
   };
+
+  const setF = (key,val) => setForm(p=>({...p,[key]:val}));
+
+  // Diff for a field between first and latest entry
+  const diff = key => {
+    const l = latest[key], f = first[key];
+    // Fix 7: use == null instead of !l so value 0 is handled correctly
+    if (l == null || f == null || l === f) return null;
+    const d = (l - f).toFixed(1);
+    return { d, pos: parseFloat(d) > 0 };
+  };
+
+  const histData = useMemo(()=>
+    [...metrics].sort((a,b)=>new Date(a.date)-new Date(b.date)).map(m=>m[selField]||0).filter(v=>v>0),
+    [metrics,selField]
+  );
 
   return (
     <div style={{padding:"0 16px 24px"}}>
       <div style={{padding:"22px 0 14px",fontSize:24,fontWeight:900,color:T.text}}>Körperdaten</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:14}}>
+
+      {/* Quick stats */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
         {[
-          {l:"AKTUELL",  v:latest?`${latest.weight}kg`:"—",  c:T.accent},
-          {l:"ZIEL",     v:settings.weightGoal!=null?`${settings.weightGoal}kg`:"—", c:T.blue},
-          {l:"DIFF",     v:diff!=null?`${parseFloat(diff)>0?"+":""}${diff}kg`:"—",   c:parseFloat(diff)>0?T.orange:T.green},
+          {l:"GEWICHT",v:latest.weight?`${latest.weight} kg`:"—",c:T.accent},
+          {l:"ZIEL",    v:settings.weightGoal!=null?`${settings.weightGoal} kg`:"—",c:T.blue},
+          {l:"DIFF",    v:(()=>{const d=diff("weight");return d?`${d.pos?"+":""}${d.d} kg`:"—";})(),
+                        c:(()=>{const d=diff("weight");return !d?T.muted:d.pos?T.orange:T.green;})()},
         ].map(s=>(
           <Card key={s.l} style={{padding:12,textAlign:"center"}}>
-            <div style={{fontSize:18,fontWeight:900,color:s.c}}>{s.v}</div>
+            <div style={{fontSize:16,fontWeight:900,color:s.c}}>{s.v}</div>
             <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
           </Card>
         ))}
       </div>
-      {metrics.length>1 && <Card style={{marginBottom:12}}><Lbl>GEWICHTSVERLAUF</Lbl><LineChart data={metrics.map(m=>m.weight)} color={T.accent} height={90}/></Card>}
+
+      {/* Chart for selected field */}
+      {metrics.length>1&&(
+        <Card style={{marginBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+            <Lbl>{BODY_FIELDS.find(f=>f.key===selField)?.label.toUpperCase()} VERLAUF</Lbl>
+            <select value={selField} onChange={e=>setSelField(e.target.value)}
+              style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"4px 8px",color:T.text,fontSize:12,cursor:"pointer"}}>
+              {BODY_FIELDS.filter(f=>metrics.some(m=>m[f.key])).map(f=>(
+                <option key={f.key} value={f.key}>{f.label}</option>
+              ))}
+            </select>
+          </div>
+          {histData.length>1
+            ? <LineChart data={histData} color={T.accent} height={88}/>
+            : <div style={{fontSize:12,color:T.muted,textAlign:"center",padding:"16px 0"}}>Zu wenig Daten für diese Messung.</div>}
+          {(()=>{const d=diff(selField);return d&&(
+            <div style={{fontSize:12,marginTop:6,color:d.pos?T.orange:T.green,fontWeight:700}}>
+              {d.pos?"↑":"↓"} {Math.abs(d.d)} {BODY_FIELDS.find(f=>f.key===selField)?.unit} seit Beginn
+            </div>
+          );})()}
+        </Card>
+      )}
+
+      {/* New entry form */}
       <Card style={{marginBottom:12}}>
         <Lbl>NEUER EINTRAG</Lbl>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
-          <div><Lbl>Gewicht (kg)</Lbl><Inp value={weight} onChange={setWeight} placeholder="80.5" type="number"/></div>
-          <div><Lbl>Bauchumfang (cm)</Lbl><Inp value={waist} onChange={setWaist} placeholder="82" type="number"/></div>
+        {/* Primary: weight always visible */}
+        <div style={{marginBottom:8}}>
+          <Lbl>Gewicht (kg) *</Lbl>
+          <Inp value={form.weight} onChange={v=>setF("weight",v)} placeholder="80.5" type="number"/>
         </div>
-        <Btn onClick={save} disabled={!weight} full>Eintrag speichern</Btn>
+        {/* Optional fields – toggle */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+          {BODY_FIELDS.filter(f=>!f.primary).slice(0,showAll?undefined:3).map(f=>(
+            <div key={f.key}>
+              <Lbl>{f.label} ({f.unit})</Lbl>
+              <Inp value={form[f.key]} onChange={v=>setF(f.key,v)} placeholder="0" type="number"/>
+            </div>
+          ))}
+        </div>
+        <button onClick={()=>setShowAll(s=>!s)}
+          style={{background:"none",border:"none",cursor:"pointer",color:T.blue,fontSize:12,marginBottom:10,padding:0}}>
+          {showAll?"▲ Weniger Felder":"▼ Mehr Felder..."}
+        </button>
+        <Btn onClick={save} disabled={!form.weight} full>Eintrag speichern</Btn>
       </Card>
-      <Card style={{marginBottom:14}}>
+
+      {/* Goal weight */}
+      <Card style={{marginBottom:12}}>
         <Lbl>ZIELGEWICHT</Lbl>
         <div style={{display:"flex",gap:8}}>
           <Inp value={goalW} onChange={setGoalW} placeholder="75" type="number" style={{flex:1}}/>
-          <Btn onClick={()=>{ const g=parseFloat(goalW); if(g>0) onUpdateSettings({weightGoal:g}); }} style={{padding:"10px 18px"}}>Setzen</Btn>
+          <Btn onClick={()=>{const g=parseFloat(goalW);if(g>0)onUpdateSettings({weightGoal:g});}} style={{padding:"10px 18px"}}>Setzen</Btn>
         </div>
       </Card>
-      {metrics.length>0 && <>
-        <Lbl>VERLAUF</Lbl>
-        {[...metrics].reverse().slice(0,10).map(m=>(
-          <div key={m.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",background:T.bgCard,borderRadius:10,marginBottom:6,border:`1px solid ${T.border}`}}>
-            <div style={{fontSize:12,color:T.sub}}>{fmtD(m.date)}</div>
-            <div style={{display:"flex",gap:14,alignItems:"center"}}>
-              <span style={{fontSize:15,fontWeight:700,color:T.text}}>{m.weight} kg</span>
-              {m.waist&&<span style={{fontSize:12,color:T.teal}}>{m.waist} cm</span>}
-            </div>
+
+      {/* Latest measurements overview */}
+      {metrics.length>0&&(
+        <Card style={{marginBottom:12}}>
+          <Lbl>AKTUELLE MASSE</Lbl>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+            {BODY_FIELDS.filter(f=>latest[f.key]).map(f=>{
+              const d=diff(f.key);
+              return(
+                <div key={f.key} style={{padding:"8px 10px",background:T.bgAlt,borderRadius:8}}>
+                  <div style={{fontSize:10,color:T.muted,marginBottom:2}}>{f.label}</div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:14,fontWeight:700,color:T.text}}>{latest[f.key]} {f.unit}</span>
+                    {d&&<span style={{fontSize:10,fontWeight:700,color:d.pos?T.orange:T.green}}>{d.pos?"+":""}{d.d}</span>}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        ))}
-      </>}
+        </Card>
+      )}
+
+      {/* History */}
+      {metrics.length>0&&(
+        <Card>
+          <Lbl>VERLAUF</Lbl>
+          {[...metrics].reverse().slice(0,8).map(m=>(
+            <div key={m.id} style={{padding:"8px 0",borderBottom:`1px solid ${T.border}`}}>
+              <div style={{fontSize:11,color:T.sub,marginBottom:4}}>{fmtD(m.date)}</div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                {BODY_FIELDS.filter(f=>m[f.key]).map(f=>(
+                  <span key={f.key} style={{fontSize:12,color:T.text,background:T.bgAlt,padding:"2px 8px",borderRadius:6}}>
+                    {f.label}: <b>{m[f.key]}</b> {f.unit}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </Card>
+      )}
     </div>
   );
 };
 
 // ═══════════════════════════════════════════════════════
-// ACHIEVEMENTS SCREEN
+// BADGE UNLOCK OVERLAY  (Punkt 8)
 // ═══════════════════════════════════════════════════════
-const AchievementsScreen = ({sessions, metrics, streak, cardio}) => {
-  // [FIX 6] metrics in Dependencies
-  const achievements = useMemo(
-    () => calcAchievements(sessions, metrics, streak, cardio),
-    [sessions, metrics, streak, cardio]
+const BadgeUnlockOverlay = ({badges, onClose}) => {
+  const [idx, setIdx] = useState(0);
+  if (!badges||badges.length===0) return null;
+  const b = badges[idx];
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(7,7,15,0.92)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:400,backdropFilter:"blur(10px)"}}>
+      <div style={{background:T.bgCard,borderRadius:24,padding:"32px 24px",maxWidth:320,width:"calc(100% - 48px)",textAlign:"center",border:`2px solid ${T.gold}55`,boxShadow:`0 0 60px ${T.gold}22`}}>
+        <div style={{fontSize:11,color:T.gold,fontWeight:800,letterSpacing:2,marginBottom:16}}>NEUES ACHIEVEMENT</div>
+        <div style={{fontSize:64,marginBottom:12}}>{b.icon}</div>
+        <div style={{fontSize:22,fontWeight:900,color:T.gold,marginBottom:8}}>{b.name}</div>
+        <div style={{fontSize:14,color:T.sub,lineHeight:1.6,marginBottom:24}}>{b.desc}</div>
+
+        {/* Pagination dots */}
+        {badges.length>1&&(
+          <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:16}}>
+            {badges.map((_,i)=>(
+              <div key={i} style={{width:i===idx?16:7,height:7,borderRadius:99,background:i===idx?T.gold:T.border,transition:"all 0.3s",cursor:"pointer"}}
+                onClick={()=>setIdx(i)}/>
+            ))}
+          </div>
+        )}
+
+        {idx<badges.length-1
+          ? <Btn onClick={()=>setIdx(i=>i+1)} full v="gold" style={{marginBottom:8}}>Weiter →</Btn>
+          : <Btn onClick={onClose} full v="gold">🎉 Abschließen</Btn>
+        }
+      </div>
+    </div>
   );
-  const unlocked = achievements.filter(a=>a.unlocked).length;
+};
+
+// ═══════════════════════════════════════════════════════
+// ACHIEVEMENTS SCREEN  (Punkt 7)
+// ═══════════════════════════════════════════════════════
+const AchievementsScreen = ({sessions, metrics, streak, cardio, allExercises=[]}) => {
+  const achievements = useMemo(
+    ()=>calcAchievements(sessions,metrics,streak,cardio,allExercises),
+    [sessions,metrics,streak,cardio,allExercises]
+  );
+  const unlocked = achievements.filter(a=>a.unlocked);
+  const locked   = achievements.filter(a=>!a.unlocked);
+
+  // Group by category
+  const cats=[...new Set(ACHIEVEMENT_DEFS.map(a=>a.cat))];
+
   return (
     <div style={{padding:"0 16px 24px"}}>
       <div style={{padding:"22px 0 14px"}}>
         <div style={{fontSize:24,fontWeight:900,color:T.text}}>Achievements</div>
-        <div style={{fontSize:13,color:T.sub,marginTop:4}}>{unlocked}/{achievements.length} freigeschaltet</div>
+        <div style={{fontSize:13,color:T.sub,marginTop:4}}>{unlocked.length}/{achievements.length} freigeschaltet</div>
       </div>
       <Card style={{marginBottom:14}}>
-        <PBar value={unlocked} max={achievements.length} color={T.gold}/>
-        <div style={{fontSize:11,color:T.muted,marginTop:6}}>{Math.round((unlocked/achievements.length)*100)}% abgeschlossen</div>
+        <PBar value={unlocked.length} max={achievements.length} color={T.gold}/>
+        <div style={{fontSize:11,color:T.muted,marginTop:6}}>{Math.round(unlocked.length/achievements.length*100)}% abgeschlossen</div>
       </Card>
-      {achievements.filter(a=>a.unlocked).length>0 && <>
-        <Lbl color={T.gold}>FREIGESCHALTET ✓</Lbl>
-        {achievements.filter(a=>a.unlocked).map(a=>(
-          <div key={a.id} style={{display:"flex",alignItems:"center",gap:14,padding:"12px 14px",background:T.bgCard,borderRadius:14,marginBottom:8,border:`1px solid ${T.gold}44`}}>
-            <span style={{fontSize:30}}>{a.icon}</span>
-            <div><div style={{fontSize:14,fontWeight:700,color:T.gold}}>{a.name}</div><div style={{fontSize:11,color:T.sub,marginTop:2}}>{a.desc}</div></div>
-            <span style={{marginLeft:"auto",color:T.gold}}>✓</span>
+
+      {cats.map(cat=>{
+        const catAch=achievements.filter(a=>a.cat===cat);
+        const catUnlocked=catAch.filter(a=>a.unlocked);
+        if(catAch.length===0)return null;
+        return(
+          <div key={cat} style={{marginBottom:14}}>
+            <Lbl color={catUnlocked.length===catAch.length?T.gold:T.muted}>
+              {cat.toUpperCase()} {catUnlocked.length}/{catAch.length}
+            </Lbl>
+            {catAch.map(a=>(
+              <div key={a.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:T.bgCard,borderRadius:12,marginBottom:6,border:`1px solid ${a.unlocked?T.gold+"44":T.border}`,opacity:a.unlocked?1:0.5}}>
+                <span style={{fontSize:26,filter:a.unlocked?"none":"grayscale(1)"}}>{a.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13,fontWeight:700,color:a.unlocked?T.gold:T.sub}}>{a.name}</div>
+                  <div style={{fontSize:11,color:T.muted,marginTop:1}}>{a.desc}</div>
+                </div>
+                {a.unlocked?<span style={{color:T.gold,fontSize:14}}>✓</span>:<span style={{color:T.muted,fontSize:12}}>🔒</span>}
+              </div>
+            ))}
           </div>
-        ))}
-        <div style={{height:12}}/>
-      </>}
-      <Lbl>NOCH ZU ERREICHEN</Lbl>
-      {achievements.filter(a=>!a.unlocked).map(a=>(
-        <div key={a.id} style={{display:"flex",alignItems:"center",gap:14,padding:"12px 14px",background:T.bgCard,borderRadius:14,marginBottom:8,border:`1px solid ${T.border}`,opacity:0.55}}>
-          <span style={{fontSize:30,filter:"grayscale(1)"}}>{a.icon}</span>
-          <div><div style={{fontSize:14,fontWeight:700,color:T.sub}}>{a.name}</div><div style={{fontSize:11,color:T.muted,marginTop:2}}>{a.desc}</div></div>
-          <span style={{marginLeft:"auto",color:T.muted}}>🔒</span>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 };
+
 
 // ═══════════════════════════════════════════════════════
 // DASHBOARD
@@ -3182,6 +4380,148 @@ const SettingsScreen = ({
       </Card>
 
       {/* Reset */}
+      {/* ── Progressions- & Deload-Einstellungen ────────── */}
+      <Card style={{marginBottom:12}}>
+        <Lbl color={T.green}>PROGRESSION & DELOAD</Lbl>
+        {(()=>{
+          const ps    = settings.progressionSettings || DEFAULT_SETTINGS.progressionSettings;
+          const upd_  = v => onUpdate({progressionSettings:{...ps,...v}});
+          const deloadOn  = isDeloadActive(settings);
+          const daysLeft  = deloadDaysRemaining(settings);
+          const activeUntilStr = settings.activeDeloadUntil
+            ? new Date(settings.activeDeloadUntil).toLocaleDateString("de-DE",{day:"numeric",month:"short"})
+            : null;
+
+          return(<>
+
+            {/* ── Aktiver Deload-Status ────────────────────── */}
+            {deloadOn ? (
+              <div style={{padding:"12px 14px",background:T.orange+"18",borderRadius:12,
+                border:`1px solid ${T.orange}44`,marginBottom:12}}>
+                <div style={{fontSize:13,fontWeight:800,color:T.orange,marginBottom:4}}>
+                  ⬇ Deload aktiv bis {activeUntilStr}
+                </div>
+                <div style={{fontSize:12,color:T.sub,marginBottom:10}}>
+                  Noch {daysLeft} {daysLeft===1?"Tag":"Tage"} – leicht trainieren und sauber ausführen.
+                </div>
+                <Btn v="ghost" onClick={()=>onUpdate(endDeload())}
+                  style={{fontSize:12,padding:"7px 14px",width:"100%"}}>
+                  Deload jetzt beenden
+                </Btn>
+              </div>
+            ) : (
+              <Btn
+                onClick={()=>onUpdate(startDeload(settings))}
+                v="ghost"
+                full
+                style={{
+                  marginBottom:12,fontSize:12,padding:"9px 14px",
+                  border:`1px solid ${T.orange}55`,color:T.orange,
+                }}
+              >⬇ Deload starten (7 Tage)</Btn>
+            )}
+
+            {/* ── Progression Toggle ───────────────────────── */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <span style={{fontSize:13,color:T.sub}}>Automatische Vorschläge</span>
+              <button onClick={()=>upd_({enabled:!ps.enabled})} style={{
+                background:ps.enabled?T.green:T.bgInput,color:ps.enabled?"#07070F":T.muted,
+                border:`1px solid ${ps.enabled?T.green:T.border}`,
+                borderRadius:20,padding:"5px 14px",fontSize:12,fontWeight:700,cursor:"pointer",
+              }}>{ps.enabled?"AN":"AUS"}</button>
+            </div>
+
+            {ps.enabled&&<>
+              {/* Progressionsmodus */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:12,color:T.sub,marginBottom:4}}>Progressionsmodus</div>
+                <div style={{display:"flex",gap:6}}>
+                  {["conservative","normal","aggressive"].map(m=>(
+                    <button key={m} onClick={()=>upd_({mode:m})} style={{
+                      flex:1,background:ps.mode===m?T.accent:T.bgInput,
+                      color:ps.mode===m?"#07070F":T.sub,
+                      border:`1px solid ${ps.mode===m?T.accent:T.border}`,
+                      borderRadius:8,padding:"6px 4px",fontSize:11,fontWeight:700,cursor:"pointer",
+                    }}>{m==="conservative"?"Konservativ":m==="normal"?"Normal":"Aggressiv"}</button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Ziel-Wdh-Bereich */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:12,color:T.sub,marginBottom:4}}>Ziel-Wdh-Bereich</div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <input type="number" value={ps.defaultRepRange?.min??8}
+                    onChange={e=>{const n=parseInt(e.target.value);if(n>0&&n<99)upd_({defaultRepRange:{...ps.defaultRepRange,min:n}});}}
+                    style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:54,textAlign:"center",boxSizing:"border-box"}}/>
+                  <span style={{color:T.muted,fontSize:12}}>–</span>
+                  <input type="number" value={ps.defaultRepRange?.max??12}
+                    onChange={e=>{const n=parseInt(e.target.value);if(n>0&&n<99)upd_({defaultRepRange:{...ps.defaultRepRange,max:n}});}}
+                    style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:54,textAlign:"center",boxSizing:"border-box"}}/>
+                  <span style={{color:T.muted,fontSize:11}}>Wdh</span>
+                </div>
+              </div>
+
+              {/* Deload Einstellungen */}
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <span style={{fontSize:13,color:T.sub}}>Deload-Vorschläge</span>
+                <button onClick={()=>upd_({deloadEnabled:!ps.deloadEnabled})} style={{
+                  background:ps.deloadEnabled?T.orange:T.bgInput,color:ps.deloadEnabled?"#07070F":T.muted,
+                  border:`1px solid ${ps.deloadEnabled?T.orange:T.border}`,
+                  borderRadius:20,padding:"5px 14px",fontSize:12,fontWeight:700,cursor:"pointer",
+                }}>{ps.deloadEnabled?"AN":"AUS"}</button>
+              </div>
+
+              {ps.deloadEnabled&&<>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:10,color:T.muted,marginBottom:3}}>ALLE (WOCHEN)</div>
+                    <input type="number" value={ps.deloadEveryWeeks??6} min="2" max="16"
+                      onChange={e=>{const n=parseInt(e.target.value);if(n>=2&&n<=16)upd_({deloadEveryWeeks:n});}}
+                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
+                  </div>
+                  <div>
+                    <div style={{fontSize:10,color:T.muted,marginBottom:3}}>GEWICHT -(%)</div>
+                    <input type="number" value={ps.deloadPercent??15} min="5" max="40"
+                      onChange={e=>{const n=parseInt(e.target.value);if(n>=5&&n<=40)upd_({deloadPercent:n});}}
+                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
+                  </div>
+                </div>
+
+                {/* Deload Strategie */}
+                <div style={{marginBottom:8}}>
+                  <div style={{fontSize:10,color:T.muted,marginBottom:4}}>STRATEGIE</div>
+                  <div style={{display:"flex",gap:6}}>
+                    {[
+                      {v:"weight",l:"Gewicht ↓"},
+                      {v:"sets",  l:"Sätze ↓"},
+                      {v:"both",  l:"Beides ↓"},
+                    ].map(s=>(
+                      <button key={s.v} onClick={()=>upd_({deloadStrategy:s.v})} style={{
+                        flex:1,background:(ps.deloadStrategy||"weight")===s.v?T.orange:T.bgInput,
+                        color:(ps.deloadStrategy||"weight")===s.v?"#07070F":T.sub,
+                        border:`1px solid ${(ps.deloadStrategy||"weight")===s.v?T.orange:T.border}`,
+                        borderRadius:8,padding:"6px 4px",fontSize:11,fontWeight:700,cursor:"pointer",
+                      }}>{s.l}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {(ps.deloadStrategy==="sets"||ps.deloadStrategy==="both")&&(
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <div style={{fontSize:12,color:T.sub,flex:1}}>Satzreduktion (%)</div>
+                    <input type="number" value={ps.volumeDeloadPercent??30} min="10" max="60"
+                      onChange={e=>{const n=parseInt(e.target.value);if(n>=10&&n<=60)upd_({volumeDeloadPercent:n});}}
+                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:54,textAlign:"center",boxSizing:"border-box"}}/>
+                    <span style={{fontSize:10,color:T.muted}}>%</span>
+                  </div>
+                )}
+              </>}
+            </>}
+          </>);
+        })()}
+      </Card>
+
       {/* ── Timer-Einstellungen (Punkt 1+2) ──────────────── */}
       <Card style={{marginBottom:12}}>
         <Lbl color={T.blue}>TIMER & SOUND</Lbl>
@@ -3300,10 +4640,37 @@ function App() {
   const allExercises = useMemo(() => [...ALL_EDB_BASE, ...customExercises], [customExercises]);
   const resolveEx = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
 
-  const streak       = useMemo(()=>calcStreak(sessions,cardio),                     [sessions,cardio]);
-  const achievements = useMemo(()=>calcAchievements(sessions,metrics,streak,cardio),[sessions,metrics,streak,cardio]);
+  // Auto-expire deload when activeDeloadUntil is in the past
+  useEffect(() => {
+    if (settings.activeDeloadUntil && new Date(settings.activeDeloadUntil) <= new Date()) {
+      setSettings(prev => ({...prev, activeDeloadUntil: null}));
+    }
+  }, [settings.activeDeloadUntil]); // re-check whenever the value changes
 
-  const saveSession    = useCallback(s =>  { setSessions(p=>[s,...p]); setTab("progress"); }, []);
+  const streak       = useMemo(()=>calcStreak(sessions,cardio),                     [sessions,cardio]);
+  const achievements = useMemo(()=>calcAchievements(sessions,metrics,streak,cardio,allExercises),[sessions,metrics,streak,cardio,allExercises]);
+  // Punkt 8: track which badge ids the user has already seen in overlay
+  const [seenBadgeIds, setSeenBadgeIds] = usePersistedState("seenBadgeIds", []);
+  const [newBadges,    setNewBadges]    = useState([]);
+
+  const saveSession = useCallback(s => {
+    // Badges BEFORE applying new session
+    const prevSessions = sessions; // snapshot of current state (safe here, not inside setter)
+    const newSessions  = [s, ...prevSessions];
+    // Fix 2: compute streak with the new session already included
+    const newStreak = calcStreak(newSessions, cardio);
+    // Fix 1: badge detection OUTSIDE setSessions callback
+    const newly = getNewlyUnlockedBadges(prevSessions, newSessions, metrics, newStreak, cardio, ACHIEVEMENT_DEFS, allExercises)
+      .filter(b => !seenBadgeIds.includes(b.id));
+    // Persist new sessions
+    setSessions(newSessions);
+    // Show newly unlocked badges (safe to call outside setter)
+    if (newly.length > 0) {
+      setNewBadges(newly);
+      setSeenBadgeIds(ids => [...ids, ...newly.map(b => b.id)]);
+    }
+    setTab("progress");
+  }, [sessions, metrics, cardio, seenBadgeIds]);
   const saveMetric     = useCallback(m =>  { setMetrics(p=>[...p,m]); },                      []);
   const saveCardio     = useCallback(c =>  { setCardio(p=>[c,...p]); },                        []);
   const updateSettings = useCallback(u =>  { setSettings(p=>({...p,...u})); },                 []);
@@ -3359,12 +4726,12 @@ function App() {
   const Screen = () => {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
-      case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings}/>;
-      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} onSave={saveSession} preselectedPlanId={preselectedPlanId}/>;
+      case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings} sessions={sessions}/>;
+      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} sessions={sessions} onSave={saveSession} preselectedPlanId={preselectedPlanId}/>;
       case "cardio":       return <CardioScreen cardio={cardio} onSave={saveCardio} settings={settings}/>;
-      case "progress":     return <ProgressScreen sessions={sessions} plans={plans} cardio={cardio} allExercises={allExercises} exerciseOverrides={exerciseOverrides} onDeleteSession={id=>setSessions(p=>p.filter(x=>x.id!==id))}/>;
+      case "progress":     return <ProgressScreen sessions={sessions} plans={plans} cardio={cardio} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} onDeleteSession={id=>setSessions(p=>p.filter(x=>x.id!==id))}/>;
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
-      case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio}/>;
+      case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio} allExercises={allExercises}/>;
       case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
       case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
       default:             return null;
@@ -3383,6 +4750,10 @@ function App() {
       <div style={{paddingBottom:74,minHeight:"calc(100vh - 44px)",overflowY:"auto"}}>
         <Screen/>
       </div>
+      {/* Punkt 8: Badge unlock overlay after training */}
+      {newBadges.length>0&&(
+        <BadgeUnlockOverlay badges={newBadges} onClose={()=>setNewBadges([])}/>
+      )}
       {showMore && <>
         <div style={{position:"fixed",bottom:74,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:390,background:T.bgCard,borderTop:`1px solid ${T.border}`,zIndex:99,borderRadius:"18px 18px 0 0",padding:"12px 16px 8px"}}>
           <div style={{textAlign:"center",marginBottom:10}}>
