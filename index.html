@@ -1953,6 +1953,14 @@ const ExerciseDBScreen = ({
   const [imgLoading,setImgLoading] = useState(false);
   const fileRef = useRef(null);
 
+  // Fix 1: Reset mode/activeId when the exercise no longer exists (avoid setter-during-render)
+  useEffect(() => {
+    if (mode === "detail" && activeId) {
+      const stillExists = (allExercises||[]).some(e => e.id === activeId);
+      if (!stillExists) { setMode("list"); setActiveId(null); }
+    }
+  }, [mode, activeId, allExercises]);
+
   // Resolve an exercise with any overrides applied
   const resolve = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
 
@@ -2055,8 +2063,8 @@ const ExerciseDBScreen = ({
 
   // ── DETAIL VIEW ──────────────────────────────────────
   if (mode==="detail" && activeId) {
-    const base = allExercises.find(e=>e.id===activeId);
-    if (!base) { setMode("list"); return null; }
+    const base = (allExercises||[]).find(e=>e.id===activeId);
+    if (!base) return null; // useEffect above will reset mode
     const ex = resolve(base);
     const hasOverride = !base.custom && exerciseOverrides?.[base.id];
 
@@ -2536,6 +2544,13 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
   const [sel,setSel]       = useState(null);
   const [editing,setEditing] = useState(null);
 
+  // Fix 1: reset to list view if the selected plan no longer exists
+  useEffect(() => {
+    if (view === "detail" && sel && !plans.find(p => p.id === sel)) {
+      setView("list"); setSel(null);
+    }
+  }, [view, sel, plans]);
+
   const activePlans   = plans.filter(p=>!p.archived);
   const archivedPlans = plans.filter(p=>p.archived);
 
@@ -2573,7 +2588,8 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 
   if (view==="detail" && sel) {
     const plan = plans.find(p=>p.id===sel);
-    if (!plan) { setView("list"); return null; }
+    // Fix 1: no setter during render — guard renders nothing; effect below resets
+    if (!plan) return null;
     return (
       <div style={{padding:"0 16px 24px"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,padding:"20px 0 14px"}}>
@@ -2742,9 +2758,9 @@ const WorkoutExerciseCard = ({
 
       {/* ── Header – always visible ─────────────────────────── */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:collapsed?0:6}}>
-        <div style={{flex:1}} onClick={()=>{
+        <div style={{flex:1, cursor:collapsed?"pointer":"default"}} onClick={()=>{
           if(collapsed){setCollapsed(false);setManuallyOpened(true);}
-        }} style={{flex:1,cursor:collapsed?"pointer":"default"}}>
+        }}>
           <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text,display:"flex",gap:6,alignItems:"center"}}>
             {resolved.name||"?"}
             {allDone && <span style={{fontSize:11,color:T.accentDim}}>✓</span>}
@@ -2860,14 +2876,20 @@ const WorkoutExerciseCard = ({
         {/* ── Set rows (Points 2,3,4,5,6,7) ──────────────── */}
         {exSets.map((s,i)=>{
           // Point 4: track extra (user-added) sets by planEx.sets
-          const isExtra = i >= (planEx.sets || 0);
+          // Fix 3: use explicit extra flag; fall back to index for old sessions
+          const isExtra = s.extra === true || i >= (planEx.sets || 0);
           const startTimer = () => {
             const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
             setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
           };
           const handleDone = () => {
-            if (isTimeBased && !s.done) startTimer();
-            else toggle(ikey, i, planEx.rest);
+            if (isTimeBased && !s.done) {
+              // Fix 5: prevent double-start if timer already running for this set
+              if (isThisTimerActive && exTimer?.setIdx === i) return;
+              startTimer();
+            } else {
+              toggle(ikey, i, planEx.rest);
+            }
           };
           return (
             <div key={i} style={{
@@ -2950,17 +2972,30 @@ const WorkoutExerciseCard = ({
               )}
 
               {/* Point 3+5: right done/start button only, slightly larger touch target */}
+              {/* Fix 6: clearer done button with better contrast + active state */}
               <button
                 onClick={handleDone}
+                aria-label={s.done ? "Satz abgeschlossen" : "Satz abschließen"}
+                title={s.done ? "Abgeschlossen" : isTimeBased ? "Timer starten" : "Satz abhaken"}
                 style={{
-                  width:38, height:38, borderRadius:9, border:"none", cursor:"pointer",
-                  background: s.done ? T.accent+"44"
-                    : isTimeBased ? T.blue+"44"
-                    : T.bgAlt,
-                  color: s.done ? T.accent
-                    : isTimeBased ? T.blue
-                    : T.sub,
-                  fontSize:16, fontWeight:700,
+                  width:38, height:38, borderRadius:9, cursor:"pointer",
+                  flexShrink:0,
+                  border: s.done
+                    ? `2px solid ${T.accent}`
+                    : isTimeBased
+                    ? `2px solid ${T.blue}88`
+                    : `2px solid ${T.border}`,
+                  background: s.done
+                    ? T.accent+"33"
+                    : isTimeBased && isThisTimerActive && exTimer?.setIdx===i
+                    ? T.blue+"55"
+                    : isTimeBased
+                    ? T.blue+"22"
+                    : T.bgInput,
+                  color: s.done ? T.accent : isTimeBased ? T.blue : T.sub,
+                  fontSize: s.done ? 16 : 18,
+                  fontWeight:800,
+                  transition:"background 0.15s, border-color 0.15s",
                 }}
               >
                 {s.done ? "✓" : isTimeBased ? "▶" : "○"}
@@ -2971,7 +3006,8 @@ const WorkoutExerciseCard = ({
 
         {/* Point 4+6: + Satz button (left, prominent) + delete extra set button */}
         {(()=>{
-          const extraSets = exSets.filter((_,i) => i >= (planEx.sets||0));
+          // Fix 3: check explicit extra flag with index fallback
+          const extraSets = exSets.filter((s,i) => s.extra === true || i >= (planEx.sets||0));
           const hasExtra  = extraSets.length > 0;
           return (
             <div style={{display:"flex", gap:6, marginTop:4}}>
@@ -2991,12 +3027,20 @@ const WorkoutExerciseCard = ({
                     setSets(prev => {
                       const cur = [...(prev[ikey]||[])];
                       // Find last undone extra set index
+                      // Fix 3: find last undone extra set by explicit flag first
                       let target = -1;
-                      for (let i=cur.length-1; i>=(planEx.sets||0); i--) {
-                        if (!cur[i].done) { target=i; break; }
+                      for (let i=cur.length-1; i>=0; i--) {
+                        if ((cur[i].extra === true || i >= (planEx.sets||0)) && !cur[i].done) {
+                          target = i; break;
+                        }
                       }
-                      if (target === -1) target = cur.length - 1; // fallback: last set
-                      if (target < (planEx.sets||0)) return prev;  // safety: never delete planned
+                      // Fallback: last set that is extra (even if done)
+                      if (target === -1) {
+                        for (let i=cur.length-1; i>=0; i--) {
+                          if (cur[i].extra === true || i >= (planEx.sets||0)) { target=i; break; }
+                        }
+                      }
+                      if (target === -1) return prev; // nothing to delete
                       const next = cur.filter((_,i)=>i!==target);
                       return {...prev, [ikey]: next};
                     });
@@ -3057,6 +3101,15 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const [rest,setRest]     = useState(null);
   // ExerciseTimer state: {ikey, setIdx, targetSecs} or null
   const [exTimer, setExTimer] = useState(null);
+
+  // Fix 1: reset confirm phase if the selected plan/day no longer exists
+  useEffect(() => {
+    if (phase === "confirm") {
+      const cp = activePlans.find(p => p.id === confirmPlanId);
+      const cd = cp?.days.find(d => d.id === confirmDayId);
+      if (!cp || !cd) { setPhase("select"); setConfirmPlanId(null); setConfirmDayId(null); }
+    }
+  }, [phase, confirmPlanId, confirmDayId, activePlans]);
   const [warnEmpty,setWarnEmpty] = useState(false);
   // "confirm" phase: plan+day selected, user sees overview before officially starting
   const [confirmPlanId, setConfirmPlanId] = useState(null);
@@ -3127,7 +3180,20 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     return upd;
   });
   const upd    = (ikey,idx,f,v) => setSets(p=>({...p,[ikey]:(p[ikey]||[]).map((s,i)=>i===idx?{...s,[f]:parseFloat(v)||0}:s)}));
-  const addSet = (ikey,tmpl)    => setSets(p=>({...p,[ikey]:[...(p[ikey]||[]),{setN:(p[ikey]||[]).length+1,reps:tmpl.reps,weight:tmpl.weight,done:false}]}));
+  // Fix 4: new sets carry metadata + extra:true so they are robustly identified
+  const addSet = (ikey, tmpl) => setSets(p => {
+    const cur = p[ikey] || [];
+    const newSet = {
+      setN:      cur.length + 1,
+      reps:      tmpl.reps,
+      weight:    tmpl.weight,
+      done:      false,
+      extra:     true,          // Fix 3: explicit marker
+      planNote:  tmpl.planNote  || null,
+      planExIdx: tmpl.planExIdx ?? null,
+    };
+    return { ...p, [ikey]: [...cur, newSet] };
+  });
 
   const discardDraft = () => {
     clearWorkoutDraft(); t0Ref.current = null;
@@ -3168,7 +3234,8 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   if (phase === "confirm") {
     const cp  = activePlans.find(p=>p.id===confirmPlanId);
     const cd  = cp?.days.find(d=>d.id===confirmDayId);
-    if (!cp || !cd) { setPhase("select"); return null; }
+    // Fix 1: no setter during render — effect below handles the reset
+    if (!cp || !cd) return null;
     const totalSets = cd.exercises.reduce((s,e)=>s+e.sets, 0);
     return (
       <div style={{padding:"0 16px 32px"}}>
