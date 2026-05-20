@@ -528,6 +528,9 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const unitType = exercise?.unitType || "reps";
   // Only for strength (rep-based) exercises
   if (unitType !== "reps") return null;
+  // Skip if the plan position itself is marked as warmup
+  const planNoteLC = (planExercise?.note || "").toLowerCase();
+  if (planNoteLC.includes("eingewöhnung") || planNoteLC.match(/warm.?up|aufwärm/)) return null;
   // Skip bodyweight exercises (increment = 0)
   const increment = getIncrementForExercise(exercise, settings);
   const repRange  = getRepRangeForPlanExercise(planExercise, settings);
@@ -2672,7 +2675,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 // ─────────────────────────────────────────────────────────────────────
 const WorkoutExerciseCard = ({
   planEx, planExIdx, allExercises, exerciseOverrides,
-  sets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
+  sets, setSets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
 }) => {
   const ikey     = instKey(planEx.eid, planExIdx);
   const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
@@ -2696,13 +2699,14 @@ const WorkoutExerciseCard = ({
   }, [allDone]); // eslint-disable-line
   // Is the exercise timer currently running for this card?
   const isThisTimerActive = exTimer?.ikey === ikey;
-  // Progression suggestion (only for strength exercises, computed once)
+  // Progression suggestion — skip if this planEx is a warmup position
   const ps = getProgressionSettings(settings);
+  const isWarmupPosition = !!((planEx.note||"").toLowerCase().match(/eingewöhnung|warm.up|aufwärm/));
   const suggestion = useMemo(() => {
-    if (!ps.showSuggestionsInWorkout || isTimeBased) return null;
+    if (!ps.showSuggestionsInWorkout || isTimeBased || isWarmupPosition) return null;
     return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planEx?.eid, planExIdx, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
+  }, [planEx?.eid, planExIdx, isWarmupPosition, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
 
   // Apply suggestion to all sets of this exercise
   // Apply suggestion: update weight for all undone sets in one batched call.
@@ -3352,6 +3356,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
           allExercises={allExercises}
           exerciseOverrides={exerciseOverrides}
           sets={sets}
+          setSets={setSets}
           toggle={toggle}
           upd={upd}
           addSet={addSet}
