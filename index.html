@@ -1388,51 +1388,65 @@ const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
   const s    = left % 60;
   const nearEnd = left <= tickStart;
 
-  // Punkt 5: compact overlay – top area, not fullscreen
+  // Punkt 1: larger compact overlay – big clock left (~45% width), stacked buttons right
+  const sz   = 104;   // SVG canvas size
+  const rr   = 44;    // ring radius – significantly larger than before
+  const circR= 2 * Math.PI * rr;
+
   return (
     <div style={{
-      position:"fixed", top:80, left:16, right:16,
-      background:T.bgCard, borderRadius:18,
-      border:`2px solid ${nearEnd ? T.orange : T.accent}66`,
-      boxShadow:`0 8px 40px rgba(0,0,0,0.7)`,
-      zIndex:300, padding:"14px 16px 12px",
+      position:"fixed", top:76, left:12, right:12,
+      background:T.bgCard, borderRadius:20,
+      border:`2px solid ${nearEnd ? T.orange : T.accent}77`,
+      boxShadow:"0 10px 48px rgba(0,0,0,0.78)",
+      zIndex:300, padding:"14px 14px 12px",
     }}>
-      <div style={{display:"flex", alignItems:"center", gap:14}}>
-        {/* Circular progress */}
-        <div style={{position:"relative", width:72, height:72, flexShrink:0}}>
-          <svg width="72" height="72" style={{transform:"rotate(-90deg)"}}>
-            <circle cx="36" cy="36" r={r} fill="none" stroke={T.border} strokeWidth="5"/>
-            <circle cx="36" cy="36" r={r} fill="none"
-              stroke={nearEnd ? T.orange : T.accent} strokeWidth="5"
-              strokeDasharray={circ}
-              strokeDashoffset={circ * (1 - Math.max(0, pct) / 100)}
+      <div style={{display:"flex", alignItems:"center", gap:12}}>
+
+        {/* ── Left: large circular timer ── */}
+        <div style={{position:"relative", width:sz, height:sz, flexShrink:0}}>
+          <svg width={sz} height={sz} style={{transform:"rotate(-90deg)"}}>
+            <circle cx={sz/2} cy={sz/2} r={rr} fill="none" stroke={T.border} strokeWidth="7"/>
+            <circle cx={sz/2} cy={sz/2} r={rr} fill="none"
+              stroke={nearEnd ? T.orange : T.accent} strokeWidth="7"
+              strokeDasharray={circR}
+              strokeDashoffset={circR * (1 - Math.max(0, pct) / 100)}
               strokeLinecap="round"
               style={{transition:"stroke-dashoffset 1s linear, stroke 0.4s"}}/>
           </svg>
-          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
-            <div style={{fontSize:20,fontWeight:900,color:nearEnd?T.orange:T.accent,fontVariantNumeric:"tabular-nums",lineHeight:1}}>
+          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",
+            alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+            <div style={{fontSize:28,fontWeight:900,fontVariantNumeric:"tabular-nums",lineHeight:1,
+              color:nearEnd?T.orange:T.accent}}>
               {m>0?`${m}:${s.toString().padStart(2,"0")}`:s}
             </div>
-            <div style={{fontSize:9,color:T.muted}}>PAUSE</div>
+            <div style={{fontSize:10,color:T.muted,marginTop:2,letterSpacing:1}}>PAUSE</div>
           </div>
         </div>
 
-        {/* Right side: adjust + actions */}
-        <div style={{flex:1}}>
-          <div style={{display:"flex",gap:6,marginBottom:8}}>
+        {/* ── Right: adjust + skip + done (stacked) ── */}
+        <div style={{flex:1, display:"flex", flexDirection:"column", gap:6}}>
+          <div style={{display:"flex",gap:5}}>
             {[-15,+15,+30].map(d=>(
               <button key={d} onClick={()=>adjust(d)} style={{
-                flex:1, background:T.bgAlt, color:d<0?T.red:T.green,
-                border:`1px solid ${T.border}`, borderRadius:8,
-                padding:"5px 0", fontWeight:700, fontSize:12, cursor:"pointer",
+                flex:1, background:T.bgAlt,
+                color:d<0?T.red:T.green,
+                border:`1px solid ${d<0?T.red+"55":T.green+"55"}`,
+                borderRadius:8, padding:"7px 0",
+                fontWeight:700, fontSize:12, cursor:"pointer",
               }}>{d>0?"+":""}{d}s</button>
             ))}
           </div>
-          <div style={{display:"flex",gap:6}}>
-            <Btn v="ghost" onClick={onSkip} style={{flex:1,padding:"7px 0",fontSize:12}}>Überspr.</Btn>
-            <Btn onClick={()=>{AudioEngine.done();onDone();}} style={{flex:1,padding:"7px 0",fontSize:12}}>Fertig ✓</Btn>
-          </div>
+          <Btn v="ghost" onClick={onSkip}
+            style={{padding:"7px 0",fontSize:13,width:"100%"}}>
+            Überspringen
+          </Btn>
+          <Btn onClick={()=>{AudioEngine.done();onDone();}}
+            style={{padding:"9px 0",fontSize:14,width:"100%",fontWeight:800}}>
+            Fertig ✓
+          </Btn>
         </div>
+
       </div>
     </div>
   );
@@ -2821,80 +2835,161 @@ const WorkoutExerciseCard = ({
           </div>
         )}
 
-        {/* ── Set rows ──────────────────────────────────────── */}
-        {exSets.map((s,i)=>(
-          <div key={i} style={{
-            display:"grid",
-            gridTemplateColumns: isTimeBased ? "28px 1fr 32px" : "28px 1fr 12px 1fr 1fr 32px",
-            alignItems:"center",gap:4,marginBottom:6,opacity:s.done?0.5:1,
-          }}>
-            {/* Set number / done indicator */}
-            <div style={{width:26,height:26,borderRadius:7,
-              background:s.done?T.accent:isThisTimerActive&&exTimer?.setIdx===i?T.blue+"44":T.bgInput,
-              display:"flex",alignItems:"center",justifyContent:"center",
-              fontSize:11,fontWeight:700,
-              color:s.done?"#07070F":isThisTimerActive&&exTimer?.setIdx===i?T.blue:T.muted,
-              cursor:"pointer"}}
-              onClick={()=>{
-                if(isTimeBased&&!s.done){
-                  // Punkt 7: start exercise timer instead of direct toggle
-                  const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
-                  setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
-                } else {
-                  toggle(ikey,i,planEx.rest);
-                }
+        {/* ── Set rows (Points 2,3,4,5,6,7) ──────────────── */}
+        {exSets.map((s,i)=>{
+          // Point 4: track extra (user-added) sets by planEx.sets
+          const isExtra = i >= (planEx.sets || 0);
+          const startTimer = () => {
+            const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
+            setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
+          };
+          const handleDone = () => {
+            if (isTimeBased && !s.done) startTimer();
+            else toggle(ikey, i, planEx.rest);
+          };
+          return (
+            <div key={i} style={{
+              display:"grid",
+              // Point 2+3: no summary column, no left check – just [num] [fields…] [✓]
+              gridTemplateColumns: isTimeBased ? "30px 1fr 38px" : "30px 1fr 24px 1fr 38px",
+              alignItems:"center", gap:5, marginBottom:7,
+              opacity:s.done ? 0.45 : 1,
+            }}>
+
+              {/* Set number badge – no click handler (Point 3: left check removed) */}
+              <div style={{
+                width:30, height:34, borderRadius:8,
+                background: s.done ? T.accent+"22"
+                  : isThisTimerActive && exTimer?.setIdx===i ? T.blue+"33"
+                  : T.bgInput,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:12, fontWeight:800,
+                color: s.done ? T.accentDim
+                  : isThisTimerActive && exTimer?.setIdx===i ? T.blue
+                  : T.muted,
+                border:`1px solid ${s.done ? T.accent+"44" : T.border}`,
               }}>
-              {s.done?"✓":isThisTimerActive&&exTimer?.setIdx===i?"⏱":i+1}
-            </div>
-
-            {isTimeBased ? (
-              /* Time-based: show target time, no weight field */
-              <div style={{background:T.bgInput,borderRadius:8,padding:"7px 10px",
-                color:T.teal,fontSize:13,fontWeight:700,textAlign:"center"}}>
-                {fmtRepsVal(s.reps, unitType)}
+                {s.done ? "✓" : isThisTimerActive && exTimer?.setIdx===i ? "⏱" : i+1}
               </div>
-            ) : (
-              /* Rep-based: weight × reps */
-              <>
-                <input type="number" value={s.weight} onChange={e=>upd(ikey,i,"weight",e.target.value)}
-                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-                <span style={{textAlign:"center",color:T.muted,fontSize:11}}>×</span>
-                <input type="number" value={s.reps} onChange={e=>upd(ikey,i,"reps",e.target.value)}
-                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 4px",color:T.text,fontSize:15,fontWeight:700,textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
-                {/* Punkt 8: volume display */}
-                <div style={{textAlign:"center",fontSize:11,fontWeight:700,color:T.muted}}>
-                  {s.weight>0
-                    ? <><span style={{color:T.text}}>{s.weight} kg</span>
-                        <span style={{color:T.muted}}> × </span>
-                        <span style={{color:T.text}}>{s.reps} Wdh</span>
-                        <div style={{fontSize:9,color:T.muted,marginTop:1}}>
-                          Vol: {(s.weight*s.reps).toFixed(0)} kg
-                        </div></>
-                    : "—"}
+
+              {isTimeBased ? (
+                /* Point 7: time exercises – editable number input with Sek/Min unit label */
+                <div style={{display:"flex", alignItems:"center", gap:4}}>
+                  <input
+                    type="number"
+                    value={s.reps}
+                    onChange={e => upd(ikey, i, "reps", e.target.value)}
+                    style={{
+                      background:T.bgInput, border:`1px solid ${T.teal}55`,
+                      borderRadius:8, padding:"8px 6px",
+                      color:T.teal, fontSize:15, fontWeight:700,
+                      textAlign:"center", width:"100%", boxSizing:"border-box",
+                    }}
+                  />
+                  <span style={{fontSize:11, color:T.teal, fontWeight:700, whiteSpace:"nowrap"}}>
+                    {unitType==="mins" ? "Min" : "Sek"}
+                  </span>
                 </div>
-              </>
-            )}
+              ) : (
+                /* Point 2: no summary column – just weight × reps */
+                <>
+                  {/* Weight field with "kg" label */}
+                  <div style={{display:"flex", alignItems:"center", gap:3}}>
+                    <input
+                      type="number"
+                      value={s.weight}
+                      onChange={e => upd(ikey, i, "weight", e.target.value)}
+                      style={{
+                        background:T.bgInput, border:`1px solid ${T.border}`,
+                        borderRadius:8, padding:"8px 4px",
+                        color:T.text, fontSize:15, fontWeight:700,
+                        textAlign:"center", width:"100%", boxSizing:"border-box",
+                      }}
+                    />
+                    <span style={{fontSize:10, color:T.muted, whiteSpace:"nowrap"}}>kg</span>
+                  </div>
+                  <span style={{textAlign:"center", color:T.muted, fontSize:12}}>×</span>
+                  {/* Reps field with "Wdh" label */}
+                  <div style={{display:"flex", alignItems:"center", gap:3}}>
+                    <input
+                      type="number"
+                      value={s.reps}
+                      onChange={e => upd(ikey, i, "reps", e.target.value)}
+                      style={{
+                        background:T.bgInput, border:`1px solid ${T.border}`,
+                        borderRadius:8, padding:"8px 4px",
+                        color:T.text, fontSize:15, fontWeight:700,
+                        textAlign:"center", width:"100%", boxSizing:"border-box",
+                      }}
+                    />
+                    <span style={{fontSize:10, color:T.muted, whiteSpace:"nowrap"}}>Wdh</span>
+                  </div>
+                </>
+              )}
 
-            {/* Done / start button */}
-            <button onClick={()=>{
-              if(isTimeBased&&!s.done){
-                const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
-                setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
-              } else {
-                toggle(ikey,i,planEx.rest);
-              }
-            }} style={{width:30,height:30,borderRadius:8,border:"none",cursor:"pointer",
-              background:s.done?T.accent+"33":isTimeBased&&!s.done?T.blue+"33":T.bgAlt,
-              color:s.done?T.accent:isTimeBased&&!s.done?T.blue:T.muted,fontSize:14}}>
-              {s.done?"✓":isTimeBased?"▶":"○"}
-            </button>
-          </div>
-        ))}
+              {/* Point 3+5: right done/start button only, slightly larger touch target */}
+              <button
+                onClick={handleDone}
+                style={{
+                  width:38, height:38, borderRadius:9, border:"none", cursor:"pointer",
+                  background: s.done ? T.accent+"44"
+                    : isTimeBased ? T.blue+"44"
+                    : T.bgAlt,
+                  color: s.done ? T.accent
+                    : isTimeBased ? T.blue
+                    : T.sub,
+                  fontSize:16, fontWeight:700,
+                }}
+              >
+                {s.done ? "✓" : isTimeBased ? "▶" : "○"}
+              </button>
+            </div>
+          );
+        })}
 
-        <button onClick={()=>addSet(ikey,planEx)} style={{
-          background:"none",border:`1px dashed ${T.border}`,borderRadius:8,
-          width:"100%",padding:6,color:T.muted,fontSize:11,cursor:"pointer",marginTop:2,
-        }}>+ Satz</button>
+        {/* Point 4+6: + Satz button (left, prominent) + delete extra set button */}
+        {(()=>{
+          const extraSets = exSets.filter((_,i) => i >= (planEx.sets||0));
+          const hasExtra  = extraSets.length > 0;
+          return (
+            <div style={{display:"flex", gap:6, marginTop:4}}>
+              <button
+                onClick={()=>addSet(ikey, planEx)}
+                style={{
+                  background:T.accent+"22", border:`1px solid ${T.accent}55`,
+                  borderRadius:8, padding:"7px 14px",
+                  color:T.accent, fontSize:12, fontWeight:700,
+                  cursor:"pointer", flexShrink:0,
+                }}
+              >+ Satz</button>
+              {hasExtra && (
+                <button
+                  onClick={()=>{
+                    // Remove last extra (undone preferred, else last)
+                    setSets(prev => {
+                      const cur = [...(prev[ikey]||[])];
+                      // Find last undone extra set index
+                      let target = -1;
+                      for (let i=cur.length-1; i>=(planEx.sets||0); i--) {
+                        if (!cur[i].done) { target=i; break; }
+                      }
+                      if (target === -1) target = cur.length - 1; // fallback: last set
+                      if (target < (planEx.sets||0)) return prev;  // safety: never delete planned
+                      const next = cur.filter((_,i)=>i!==target);
+                      return {...prev, [ikey]: next};
+                    });
+                  }}
+                  style={{
+                    background:T.red+"22", border:`1px solid ${T.red}55`,
+                    borderRadius:8, padding:"7px 10px",
+                    color:T.red, fontSize:12, fontWeight:700,
+                    cursor:"pointer", flexShrink:0,
+                  }}
+                >− Zusatz</button>
+              )}
+            </div>
+          );
+        })()}
 
       </>)}
     </Card>
