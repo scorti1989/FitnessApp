@@ -478,19 +478,36 @@ function deloadDaysRemaining(settings) {
   return Math.max(0, Math.ceil(ms / 86400000));
 }
 
-// Get strength history for one exercise (only sets with weight > 0, not warmup)
-// Returns array of {date, sets:[{weight,reps}]} one entry per session
+// Get strength history for one exercise – EXCLUDES warmup sets.
+// Warmup detection (two independent guards – both must be absent to include a set):
+//   1. planNote contains "eingewöhnung" or "warm" (copied from planEx.note in start())
+//   2. Old sessions without planNote: sets whose weight is clearly the lowest weight
+//      for that exercise in the same session are treated as warmup (heuristic).
 function getExercisePerformanceHistory(eid, sessions) {
   if (!eid || !sessions?.length) return [];
   const history = [];
+
   [...sessions]
     .sort((a,b) => new Date(a.date) - new Date(b.date))
     .forEach(sess => {
-      const workSets = sess.sets.filter(s =>
-        isDone(s) && s.eid === eid &&
-        (s.weight||0) > 0 &&
-        !s.note?.toLowerCase().includes("eingewöhnung")  // skip warmup sets
-      );
+      const allEidSets = sess.sets.filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
+      if (!allEidSets.length) return;
+
+      // Heuristic: if there are multiple distinct weights for this EID in one session,
+      // the lowest-weight group is almost certainly a warmup group.
+      const weights = [...new Set(allEidSets.map(s => s.weight))].sort((a,b)=>a-b);
+      const minWeight = weights[0];
+      const hasMultipleWeights = weights.length > 1;
+
+      const workSets = allEidSets.filter(s => {
+        // Explicit note-based warmup marker (new sessions)
+        const noteLC = (s.planNote || s.note || "").toLowerCase();
+        if (noteLC.includes("eingewöhnung") || noteLC.includes("warm")) return false;
+        // Heuristic: lowest weight in a multi-weight session = warmup group
+        if (hasMultipleWeights && s.weight === minWeight) return false;
+        return true;
+      });
+
       if (workSets.length > 0) {
         history.push({
           date: sess.date,
@@ -498,6 +515,7 @@ function getExercisePerformanceHistory(eid, sessions) {
         });
       }
     });
+
   return history;
 }
 
@@ -3082,6 +3100,9 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       const key = instKey(ex.eid, exIdx);
       init[key] = Array.from({length: ex.sets}, (_, i) => ({
         setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
+        // Copy plan-level note + position so progression logic can exclude warmup sets
+        planNote: ex.note || null,
+        planExIdx: exIdx,
       }));
     });
     setSets(init); setPhase("active");
