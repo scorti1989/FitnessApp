@@ -3101,6 +3101,10 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const [rest,setRest]     = useState(null);
   // ExerciseTimer state: {ikey, setIdx, targetSecs} or null
   const [exTimer, setExTimer] = useState(null);
+  const [warnEmpty,setWarnEmpty] = useState(false);
+  // "confirm" phase: plan+day selected, user sees overview before officially starting
+  const [confirmPlanId, setConfirmPlanId] = useState(null);
+  const [confirmDayId,  setConfirmDayId]  = useState(null);
 
   // Fix 1: reset confirm phase if the selected plan/day no longer exists
   useEffect(() => {
@@ -3110,10 +3114,6 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       if (!cp || !cd) { setPhase("select"); setConfirmPlanId(null); setConfirmDayId(null); }
     }
   }, [phase, confirmPlanId, confirmDayId, activePlans]);
-  const [warnEmpty,setWarnEmpty] = useState(false);
-  // "confirm" phase: plan+day selected, user sees overview before officially starting
-  const [confirmPlanId, setConfirmPlanId] = useState(null);
-  const [confirmDayId,  setConfirmDayId]  = useState(null);
 
   const t0Ref    = useRef(null);
   const [elapsed,setElapsed] = useState(() => hasDraft ? (draft.elapsed||0) : 0);
