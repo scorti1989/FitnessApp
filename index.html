@@ -129,11 +129,25 @@ function isoWeekKey(date) {
 
 const isDone = s => s.done !== false;
 
-// vol() sums weight×reps for strength sets only (weight>0 = rep-based)
-// Time exercises have weight=0 so they contribute 0 naturally, but
-// we explicitly guard to make intent clear.
-const vol = sets => sets
-  .filter(x => isDone(x) && (x.weight||0) > 0)
+// Central warmup detector – used by vol, getPRs, getWeeklySets, history, etc.
+// Returns true when a set (and its exercise) represents a warmup/mobility set
+// that must NOT influence strength stats, PRs or progression calculations.
+function isWarmupSet(set, exercise) {
+  const noteLC = (set?.planNote || set?.note || "").toLowerCase();
+  if (noteLC.includes("eingewöhnung") || noteLC.includes("aufwärm") || noteLC.includes("warm")) return true;
+  if (set?.isWarmup === true) return true;
+  const cat = exercise?.cat || "";
+  if (cat === "Aufwärmen" || cat === "Dehnung") return true;
+  return false;
+}
+
+// vol() sums weight×reps for strength work-sets only (excludes warmup sets)
+const vol = (sets, allExercises) => sets
+  .filter(x => {
+    if (!isDone(x) || (x.weight||0) <= 0) return false;
+    const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
+    return !isWarmupSet(x, ex);
+  })
   .reduce((sum, x) => sum + (x.weight||0) * (x.reps||0), 0);
 
 const calcKcal = (type, durationMin, bodyWeightKg) =>
@@ -165,11 +179,13 @@ function getWeekActivities(sessions, cardio=[]) {
   };
 }
 
-// [FIX 2] getPRs – nur done===true Sätze mit Gewicht > 0
-function getPRs(sessions) {
+// getPRs – excludes warmup sets from personal records
+function getPRs(sessions, allExercises) {
   const p = {};
   sessions.forEach(s => s.sets.forEach(x => {
-    if (isDone(x) && x.weight > 0 && (!p[x.eid] || x.weight > p[x.eid])) p[x.eid] = x.weight;
+    const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
+    if (isDone(x) && x.weight > 0 && !isWarmupSet(x, ex) && (!p[x.eid] || x.weight > p[x.eid]))
+      p[x.eid] = x.weight;
   }));
   return p;
 }
@@ -248,7 +264,7 @@ function getBestSet(sessions, eid) {
   return best;
 }
 
-// Weekly set count per muscle group (last N weeks, default 1)
+// Weekly set count per muscle group (last N weeks) – excludes warmup sets
 function getWeeklySets(sessions, allExercises, weeksBack=1) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - weeksBack*7);
@@ -258,6 +274,7 @@ function getWeeklySets(sessions, allExercises, weeksBack=1) {
     .filter(s => new Date(s.date) >= cutoff)
     .forEach(s => s.sets.filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
+      if (isWarmupSet(x, ex)) return;           // exclude warmup/mobility
       const cat = ex?.cat;
       if (cat && counts[cat]!==undefined) counts[cat]++;
     }));
@@ -500,9 +517,9 @@ function getExercisePerformanceHistory(eid, sessions) {
       const hasMultipleWeights = weights.length > 1;
 
       const workSets = allEidSets.filter(s => {
-        // Explicit note-based warmup marker (new sessions)
-        const noteLC = (s.planNote || s.note || "").toLowerCase();
-        if (noteLC.includes("eingewöhnung") || noteLC.includes("warm")) return false;
+        // Use central isWarmupSet helper (handles note, cat, explicit flag)
+        const ex = { cat: null }; // cat filtered via note/weight heuristic below
+        if (isWarmupSet(s, ex)) return false;
         // Heuristic: lowest weight in a multi-weight session = warmup group
         if (hasMultipleWeights && s.weight === minWeight) return false;
         return true;
@@ -1358,6 +1375,13 @@ const AudioEngine = (() => {
       tone(660, 0.30, 0.55, 0.0);
       tone(880, 0.45, 0.40, 0.08);
     },
+
+    // Drei kurze Pieptöne – alle 30 Sekunden Erinnerung
+    tripleTick: () => {
+      tone(900, 0.09, 0.30, 0.00);
+      tone(900, 0.09, 0.30, 0.15);
+      tone(900, 0.09, 0.30, 0.30);
+    },
   };
 })();
 
@@ -1373,11 +1397,21 @@ const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
   const intervalRef = useRef(null);
   const ticked = useRef(new Set());
 
+  const thirtyBeeps = useRef(new Set()); // track which 30s marks already beeped
+
   useEffect(() => {
     intervalRef.current = setInterval(() => {
       setLeft(prev => {
-        const next = prev - 1;
-        // Ticks in the final tickStart seconds
+        const next   = prev - 1;
+        const elapsed = seconds - next;        // how many seconds have passed
+
+        // Every 30 seconds of running time: triple beep
+        if (elapsed > 0 && elapsed % 30 === 0 && !thirtyBeeps.current.has(elapsed)) {
+          thirtyBeeps.current.add(elapsed);
+          AudioEngine.tripleTick();
+        }
+
+        // Final countdown ticks
         if (next > 0 && next <= tickStart && !ticked.current.has(next)) {
           ticked.current.add(next);
           AudioEngine.tick();
@@ -1485,13 +1519,21 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
   const ticked      = useRef(new Set());
   const donePlayed  = useRef(false);
 
+  const thirtyBeeps = useRef(new Set()); // track 30s marks
+
   useEffect(() => {
     intervalRef.current = setInterval(() => {
       setElapsed(prev => {
-        const next = prev + 1;
+        const next      = prev + 1;
         const remaining = targetSecs - next;
 
-        // Ticks in final tickStart seconds before target
+        // Every 30 seconds of elapsed time: triple beep
+        if (next > 0 && next % 30 === 0 && !thirtyBeeps.current.has(next)) {
+          thirtyBeeps.current.add(next);
+          AudioEngine.tripleTick();
+        }
+
+        // Countdown ticks before target
         if (remaining > 0 && remaining <= tickStart && !ticked.current.has(remaining)) {
           ticked.current.add(remaining);
           AudioEngine.tick();
@@ -3012,7 +3054,12 @@ const WorkoutExerciseCard = ({
           return (
             <div style={{display:"flex", gap:6, marginTop:4}}>
               <button
-                onClick={()=>addSet(ikey, planEx)}
+                onClick={()=>addSet(ikey, {
+                    reps:      planEx.reps,
+                    weight:    planEx.weight,
+                    planNote:  planEx.note  || null,
+                    planExIdx: planExIdx,
+                  })}
                 style={{
                   background:T.accent+"22", border:`1px solid ${T.accent}55`,
                   borderRadius:8, padding:"7px 14px",
@@ -3145,6 +3192,31 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     saveWorkoutDraft({ phase:"active", planId, dayId, sets, note, elapsed });
   }, [phase, sets, note, elapsed, planId, dayId]);
 
+  // ── Helper: get last session's set values for an exercise position ──────────
+  // Returns array of set objects ready to use as starting values, or null.
+  const getLastSessionSetDefaults = (pId, dId, exIdx, eid) => {
+    // Find most recent session with same plan+day
+    const matching = [...sessions]
+      .filter(s => s.planId === pId && s.dayId === dId)
+      .sort((a,b) => new Date(b.date) - new Date(a.date));
+    if (!matching.length) return null;
+    const last = matching[0];
+    // Collect sets for this exercise position (planExIdx match, then eid match as fallback)
+    let exSets = last.sets.filter(s => s.planExIdx === exIdx && s.eid === eid);
+    if (!exSets.length) exSets = last.sets.filter(s => s.eid === eid && !isWarmupSet(s, null));
+    if (!exSets.length) return null;
+    // Return as fresh (undone, non-extra) sets preserving weight/reps per-set
+    return exSets.map((s, i) => ({
+      setN:      i + 1,
+      reps:      s.reps,
+      weight:    s.weight,
+      done:      false,
+      planNote:  s.planNote || null,
+      planExIdx: exIdx,
+      // extra intentionally omitted → previous extra sets become normal base sets
+    }));
+  };
+
   const start = (pId, dId) => {
     t0Ref.current = Date.now();
     setElapsed(0); setWarnEmpty(false);
@@ -3152,15 +3224,22 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     const day = activePlans.find(p=>p.id===pId)?.days.find(d=>d.id===dId);
     if (!day) return;
     const init = {};
-    // Fix 1: key by instance position so duplicate exercises stay separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      init[key] = Array.from({length: ex.sets}, (_, i) => ({
-        setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
-        // Copy plan-level note + position so progression logic can exclude warmup sets
-        planNote: ex.note || null,
-        planExIdx: exIdx,
-      }));
+      // Prefer last session values; fall back to plan defaults
+      const lastDefaults = getLastSessionSetDefaults(pId, dId, exIdx, ex.eid);
+      if (lastDefaults) {
+        init[key] = lastDefaults;
+      } else {
+        init[key] = Array.from({length: ex.sets}, (_, i) => ({
+          setN:      i + 1,
+          reps:      ex.reps,
+          weight:    ex.weight,
+          done:      false,
+          planNote:  ex.note || null,
+          planExIdx: exIdx,
+        }));
+      }
     });
     setSets(init); setPhase("active");
   };
@@ -3209,7 +3288,15 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     // Fix 1: iterate by instance key to keep duplicate exercises separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({eid:ex.eid,...s}));
+      (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({
+        eid:       ex.eid,
+        setN:      s.setN,
+        reps:      s.reps,
+        weight:    s.weight,
+        planNote:  s.planNote  ?? (ex.note || null),
+        planExIdx: s.planExIdx ?? exIdx,
+        ...(s.extra ? {extra:true} : {}),
+      }));
     });
     if (allSets.length === 0) { setWarnEmpty(true); return; }
     setWarnEmpty(false); clearWorkoutDraft();
@@ -3480,8 +3567,8 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
 
   // ── Pre-computed data ─────────────────────────────────
   const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>s.sets.filter(isDone).map(x=>x.eid)))],[sessions]);
-  const prs       = useMemo(()=>getPRs(sessions),[sessions]);
-  const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
+  const prs       = useMemo(()=>getPRs(sessions,allExercises),[sessions,allExercises]);
+  const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets,allExercises),0),[sessions,allExercises]);
   const weekSets  = useMemo(()=>getWeeklySets(sessions,allExercises,1),[sessions,allExercises]);
   const sets4w    = useMemo(()=>getWeeklySets(sessions,allExercises,4),[sessions,allExercises]);
   const lastTrained=useMemo(()=>getLastTrainedDays(sessions,allExercises),[sessions,allExercises]);
