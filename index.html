@@ -54,19 +54,116 @@
   </div>
   <div id="root"></div>
   <script>
-    // Catch any error before React/Babel finish loading
-    window.onerror = function(msg, src, line, col, err) {
-      document.getElementById('boot-screen').style.display = 'none';
+  // ═══════════════════════════════════════════════════════
+  // SERVICE WORKER – caches this HTML + CDN libs after first load
+  // so the app works fully offline (Home Screen, no network, etc.)
+  // ═══════════════════════════════════════════════════════
+  (function() {
+    if (!('serviceWorker' in navigator)) return;
+
+    // The SW is defined inline as a Blob so no separate sw.js file is needed
+    var SW_VERSION = '3'; // bump this string to force cache refresh on update
+    var CDN_URLS = [
+      'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
+    ];
+    var CACHE_NAME = 'fittrack-shell-v' + SW_VERSION;
+    var SW_CODE = `
+const CACHE = '${CACHE_NAME}';
+const CDN   = ${JSON.stringify([
+      'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
+    ])};
+
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE).then(c =>
+      // Cache this page + all CDN libs
+      Promise.all([
+        c.add(new Request(self.location.origin + self.registration.scope.replace(self.location.origin,'') + 'index.html', {cache:'reload'})).catch(()=>{}),
+        ...CDN.map(url => c.add(new Request(url, {mode:'cors', cache:'reload'})).catch(()=>{}))
+      ])
+    ).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', e => {
+  var url = e.request.url;
+  // Only handle GET requests
+  if (e.request.method !== 'GET') return;
+
+  // Navigation requests (HTML page) – serve from cache, fall back to network
+  if (e.request.mode === 'navigate') {
+    e.respondWith(
+      caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('index.html')))
+    );
+    return;
+  }
+
+  // CDN libs – cache-first (they never change at a fixed URL)
+  if (CDN.includes(url)) {
+    e.respondWith(
+      caches.match(e.request).then(r => {
+        if (r) return r;
+        return fetch(e.request).then(res => {
+          if (res && res.ok) {
+            var clone = res.clone();
+            caches.open(CACHE).then(c => c.put(e.request, clone));
+          }
+          return res;
+        });
+      })
+    );
+    return;
+  }
+});
+`;
+
+    var blob = new Blob([SW_CODE], {type: 'application/javascript'});
+    var swUrl = URL.createObjectURL(blob);
+
+    navigator.serviceWorker.register(swUrl, {scope: './'})
+      .then(function(reg) {
+        console.log('[FitTrack] SW registered, scope:', reg.scope);
+      })
+      .catch(function(err) {
+        // SW failed – app still works online, just won't be offline-capable
+        console.warn('[FitTrack] SW registration failed (app still works online):', err.message);
+      });
+  })();
+  </script>
+
+  <script>
+    // ── Global error handler (before React loads) ──────────────────────────
+    function _ftShowError(msg) {
+      var boot = document.getElementById('boot-screen');
+      if (boot) boot.style.display = 'none';
       var el = document.getElementById('parse-error');
+      if (!el) return;
       el.style.display = 'flex';
-      document.getElementById('parse-error-msg').textContent =
-        (err && err.message) || msg || 'Unbekannter Fehler';
-      return true; // prevent default browser error
+      var m = document.getElementById('parse-error-msg');
+      if (m) m.textContent = msg || 'Unbekannter Fehler';
+    }
+    window.onerror = function(msg, src, line, col, err) {
+      console.error('[FitTrack]', msg, 'at', src, line);
+      _ftShowError((err && err.message) || msg || 'Unbekannter Fehler');
+      return true;
     };
     window.onunhandledrejection = function(e) {
-      window.onerror(null, null, null, null, e.reason);
+      _ftShowError(e.reason && e.reason.message ? e.reason.message : String(e.reason));
     };
   </script>
+
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -5431,13 +5528,17 @@ function App() {
   );
 }
 
-    const _reactRoot = ReactDOM.createRoot(document.getElementById('root'));
-    _reactRoot.render(<ErrorBoundary><App/></ErrorBoundary>);
-    // Boot screen is now hidden from inside App's first useEffect (see App component)
-    // Fallback: hide after 3s in case React never mounts (e.g. parse error caught by onerror)
-    setTimeout(() => {
-      const _boot = document.getElementById('boot-screen');
-      if (_boot) { _boot.style.opacity = '0'; setTimeout(() => _boot.remove(), 450); }
-    }, 3000);</script>
+    // ── Mount React ────────────────────────────────────────────────────────
+    try {
+      const container = document.getElementById('root');
+      const root = ReactDOM.createRoot(container);
+      root.render(<ErrorBoundary><App/></ErrorBoundary>);
+      // Boot screen is hidden inside App's first useEffect (see App component above).
+      // Safety fallback: if the useEffect never fires (catastrophic crash caught by
+      // ErrorBoundary), the ErrorBoundary render itself is visible – no blank screen.
+    } catch(e) {
+      console.error('[FitTrack] Fatal mount error:', e);
+      _ftShowError(e && e.message ? e.message : 'App konnte nicht gestartet werden');
+    }</script>
 </body>
 </html>
