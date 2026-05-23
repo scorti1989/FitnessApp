@@ -1287,6 +1287,106 @@ function sanitizeBackup(raw) {
   };
 }
 
+// ═══════════════════════════════════════════════════════
+// ATOMIC BACKUP PERSISTENCE
+// ═══════════════════════════════════════════════════════
+
+/**
+ * Validates all backup fields, checks combined localStorage size,
+ * then writes them atomically.  Returns { ok: true } on success or
+ * { ok: false, error: string } on any failure – NEVER triggers a reload.
+ *
+ * Large base64 images in exerciseOverrides / customExercises are
+ * stripped automatically when the total payload would exceed the quota
+ * budget, so the import still succeeds without the images.
+ */
+function persistBackupAtomically(imported) {
+  // ── 1. Prepare serialized blobs ──────────────────────────────────
+  const KEYS = [
+    ["settings",          imported.settings],
+    ["sessions",          imported.sessions],
+    ["cardio",            imported.cardio],
+    ["plans",             imported.plans],
+    ["metrics",           imported.metrics],
+    ["customExercises",   imported.customExercises],
+    ["exerciseOverrides", imported.exerciseOverrides],
+  ];
+
+  const blobs = {};
+  for (const [k, v] of KEYS) {
+    try {
+      blobs[k] = JSON.stringify(v);
+    } catch (e) {
+      return { ok: false, error: `Fehler beim Serialisieren von "${k}": ${e.message}` };
+    }
+  }
+
+  // ── 2. Check total size ──────────────────────────────────────────
+  const QUOTA_BUDGET = 4.5 * 1024 * 1024; // 4.5 MB conservative limit
+  let totalBytes = Object.values(blobs).reduce((s, v) => s + v.length * 2, 0); // UTF-16
+
+  // ── 3. Strip images if over budget ──────────────────────────────
+  if (totalBytes > QUOTA_BUDGET) {
+    console.warn("FitTrack: Backup exceeds quota budget – stripping images from overrides/customExercises");
+
+    // Strip images from exerciseOverrides
+    const strippedOverrides = {};
+    for (const [k, v] of Object.entries(imported.exerciseOverrides || {})) {
+      const { image: _img, ...rest } = (v && typeof v === "object") ? v : {};
+      strippedOverrides[k] = rest;
+    }
+    blobs["exerciseOverrides"] = JSON.stringify(strippedOverrides);
+
+    // Strip images from customExercises
+    const strippedCustom = (imported.customExercises || []).map(cx => {
+      const { image: _img, ...rest } = cx;
+      return rest;
+    });
+    blobs["customExercises"] = JSON.stringify(strippedCustom);
+
+    totalBytes = Object.values(blobs).reduce((s, v) => s + v.length * 2, 0);
+
+    if (totalBytes > QUOTA_BUDGET) {
+      return {
+        ok: false,
+        error: `Backup zu groß für den Browser-Speicher (${(totalBytes / 1024).toFixed(0)} KB). Bitte Bilder aus dem Backup entfernen.`,
+      };
+    }
+  }
+
+  // ── 4. Write all keys – abort on first failure ───────────────────
+  const PREFIX = "ft5_";
+  const written = [];
+  for (const [k, blob] of Object.entries(blobs)) {
+    try {
+      localStorage.setItem(PREFIX + k, blob);
+      written.push(k);
+    } catch (e) {
+      const isQuota = e?.name === "QuotaExceededError" || e?.name === "NS_ERROR_DOM_QUOTA_REACHED";
+      // Roll back already-written keys so old data is preserved
+      for (const wk of written) {
+        try { localStorage.removeItem(PREFIX + wk); } catch (_) {}
+      }
+      if (isQuota) {
+        return {
+          ok: false,
+          error: `Speicher voll beim Schreiben von "${k}". Import abgebrochen – alte Daten erhalten. Bitte Bilder aus dem Backup entfernen.`,
+        };
+      }
+      return { ok: false, error: `Unbekannter Fehler beim Speichern von "${k}": ${e.message}` };
+    }
+  }
+
+  // ── 5. Mark onboarded ────────────────────────────────────────────
+  try {
+    const settingsObj = JSON.parse(blobs["settings"]);
+    settingsObj.onboarded = true;
+    localStorage.setItem(PREFIX + "settings", JSON.stringify(settingsObj));
+  } catch (_) { /* non-fatal – onboarded was already set by sanitizeSettings */ }
+
+  return { ok: true };
+}
+
 const LS_PREFIX = "ft5_";
 
 function lsGet(key, fallback) {
@@ -1783,7 +1883,7 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
 // ═══════════════════════════════════════════════════════
 // ONBOARDING
 // ═══════════════════════════════════════════════════════
-const OnboardingScreen = ({onDone, onImport}) => {
+const OnboardingScreen = ({onDone, onImport, importError}) => {
   const [step,setStep]   = useState(0);
   const [name,setName]   = useState("");
   const [goal,setGoal]   = useState("");
@@ -1804,9 +1904,17 @@ const OnboardingScreen = ({onDone, onImport}) => {
       try {
         const raw = JSON.parse(ev.target.result);
         const imported = sanitizeBackup(raw); // central validation + sanitization
+        // importAll writes atomically then reloads on success.
+        // On failure it sets app-level importError and does NOT reload.
+        // We listen for that by checking if reload happens; if not, show local error.
+        const _sessionCount = imported.sessions.length;
+        const _planCount    = imported.plans.length;
         onImport(imported);
-        setImportState("ok");
-        setImportMsg(`${imported.sessions.length} Trainings, ${imported.plans.length} Pläne wiederhergestellt.`);
+        // If we reach this line the page did NOT reload → importAll returned an error.
+        // The app-level importError state carries the real message.
+        // Surface a generic fallback here since we can't read that state directly.
+        setImportState("error");
+        setImportMsg("Import fehlgeschlagen – bitte prüfe den Fehlermeldungsbereich.");
       } catch(err) {
         setImportState("error");
         setImportMsg(err.message || "Ungültige Datei");
@@ -1884,7 +1992,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
                   marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
                   background:T.red+"18",color:T.red,border:`1px solid ${T.red}44`,
                 }}>
-                  ✗ {importMsg}
+                  ✗ {importError || importMsg}
                 </div>
               )}
             </div>
@@ -4580,13 +4688,13 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
               <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:3}}>
-                {plans.find(p=>p.id===lastSession.planId)?.days.find(d=>d.id===lastSession.dayId)?.name||"Training"}
+                {plans.find(p=>p.id===lastSession?.planId)?.days?.find(d=>d.id===lastSession?.dayId)?.name||"Training"}
               </div>
               <div style={{fontSize:12,color:T.sub}}>
-                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets,allExercises)/100)/10).toFixed(1)}t
+                {Array.isArray(lastSession?.sets) ? lastSession.sets.filter(isDone).length : 0} Sätze · {lastSession?.duration||0} min · {(Math.round(vol(Array.isArray(lastSession?.sets)?lastSession.sets:[],allExercises)/100)/10).toFixed(1)}t
               </div>
             </div>
-            <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastSession.date)}</div>
+            <div style={{fontSize:11,color:T.muted}}>{lastSession?.date ? fmtDShort(lastSession.date) : ""}</div>
           </div>
         </Card>
       )}
@@ -4596,15 +4704,15 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
           <Lbl>LETZTE AKTIVITÄT</Lbl>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div style={{display:"flex",gap:10,alignItems:"center"}}>
-              <span style={{fontSize:20}}>{CARDIO_ICONS[lastCardio.type]||"🏃"}</span>
+              <span style={{fontSize:20}}>{CARDIO_ICONS[lastCardio?.type]||"🏃"}</span>
               <div>
-                <div style={{fontSize:14,fontWeight:700,color:T.text}}>{lastCardio.type}</div>
+                <div style={{fontSize:14,fontWeight:700,color:T.text}}>{lastCardio?.type||""}</div>
                 <div style={{fontSize:12,color:T.sub}}>
-                  {lastCardio.duration} min{lastCardio.distance?` · ${lastCardio.distance} km`:""}
+                  {lastCardio?.duration||0} min{lastCardio?.distance?` · ${lastCardio.distance} km`:""}
                 </div>
               </div>
             </div>
-            <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastCardio.date)}</div>
+            <div style={{fontSize:11,color:T.muted}}>{lastCardio?.date ? fmtDShort(lastCardio.date) : ""}</div>
           </div>
         </Card>
       )}
@@ -4633,7 +4741,7 @@ const SettingsScreen = ({
   settings, onUpdate,
   sessions, metrics, plans, cardio,
   customExercises, exerciseOverrides, allExercises,
-  onReset, onImport,
+  onReset, onImport, importError,
 }) => {
   const [weekGoal,setWeekGoal] = useState(String(settings.weeklyGoal||3));
   const [confirmReset,setConfirmReset] = useState(false);
@@ -4679,9 +4787,12 @@ const SettingsScreen = ({
       try {
         const raw = JSON.parse(ev.target.result);
         const imported = sanitizeBackup(raw); // central validation + sanitization
+        // importAll handles atomicWrite + reload on success, or sets importError on failure
+        setImportStatus("loading");
         onImport(imported);
-        setImportStatus("ok");
-        setTimeout(()=>setImportStatus(""), 3000);
+        // If we reach here without reload, importAll failed – importError state carries the message
+        // Show a short "processing" note; the importError prop will render the real error
+        setTimeout(() => setImportStatus(null), 200);
       } catch(err) {
         setImportStatus("error:" + (err.message || "Ungültige Datei"));
       }
@@ -4783,17 +4894,25 @@ const SettingsScreen = ({
           style={{display:"none"}}
         />
 
-        {/* Status feedback */}
-        {importStatus && (
+        {/* Status feedback – local parse errors */}
+        {importStatus && importStatus !== "loading" && (
           <div style={{
             padding:"10px 12px", borderRadius:10, fontSize:13, fontWeight:600,
-            background: importStatus==="ok" ? T.green+"22" : T.red+"22",
-            color:      importStatus==="ok" ? T.green       : T.red,
-            border:`1px solid ${importStatus==="ok" ? T.green+"44" : T.red+"44"}`,
+            background: T.red+"22", color: T.red,
+            border:`1px solid ${T.red+"44"}`,
           }}>
-            {importStatus==="ok"
-              ? "✓ Backup erfolgreich importiert – alle Daten wiederhergestellt"
-              : importStatus}
+            {importStatus}
+          </div>
+        )}
+        {/* Global import error from importAll (quota, serialisation, etc.) */}
+        {importError && (
+          <div style={{
+            padding:"10px 12px", borderRadius:10, fontSize:13, fontWeight:600,
+            background: T.red+"22", color: T.red,
+            border:`1px solid ${T.red+"44"}`,
+            marginTop: importStatus ? 6 : 0,
+          }}>
+            ❌ {importError}
           </div>
         )}
 
@@ -5130,6 +5249,7 @@ function App() {
   const [tab,      setTab]      = useState("dashboard");
   const [showMore, setShowMore] = useState(false);
   const [preselectedPlanId, setPreselectedPlanId] = useState(null);
+  const [importError, setImportError] = useState(null); // null | string
 
   // Full exercise database = base + extra + user-created
   // allExercises are the raw entries; resolved = {...ex, ...overrides[ex.id]}
@@ -5176,20 +5296,35 @@ function App() {
     setSettings({...DEFAULT_SETTINGS,onboarded:false});
   }, []);
 
-  // Fix 4: Import handler – fully replaces all state from backup
-  const importAll = useCallback(({settings:s, sessions:se, cardio:ca, plans:pl, metrics:me, customExercises:cx, exerciseOverrides:eo}) => {
-    // sanitizeBackup already ran – these values are clean.
-    // Re-sanitize defensively in case importAll is called from another path.
-    setSettings(sanitizeSettings(s));
-    setSessions(sanitizeSessions(se));
-    setCardio(sanitizeCardio(ca));
-    setPlans(sanitizePlans(pl, MY_PLANS));
-    setMetrics(sanitizeMetrics(me));
-    setCustomExercises(sanitizeCustomExercises(cx));
-    setExerciseOverrides(sanitizeExerciseOverrides(eo));
-    // Reload so the app starts fresh from localStorage – avoids blank screen
-    // from stale React state after a large import (especially base64 image data).
-    setTimeout(() => window.location.reload(), 80);
+  const importAll = useCallback((rawImported) => {
+    setImportError(null);
+
+    // 1. Re-sanitize defensively regardless of caller
+    let imported;
+    try {
+      imported = {
+        settings:          sanitizeSettings(rawImported.settings),
+        sessions:          sanitizeSessions(rawImported.sessions),
+        cardio:            sanitizeCardio(rawImported.cardio),
+        plans:             sanitizePlans(rawImported.plans, MY_PLANS),
+        metrics:           sanitizeMetrics(rawImported.metrics),
+        customExercises:   sanitizeCustomExercises(rawImported.customExercises),
+        exerciseOverrides: sanitizeExerciseOverrides(rawImported.exerciseOverrides),
+      };
+    } catch (e) {
+      setImportError("Backup-Validierung fehlgeschlagen: " + (e.message || "Unbekannter Fehler"));
+      return;
+    }
+
+    // 2. Write atomically – no reload on quota/serialisation errors
+    const result = persistBackupAtomically(imported);
+    if (!result.ok) {
+      setImportError(result.error);
+      return;
+    }
+
+    // 3. Only reload on full success – app re-reads clean state from localStorage
+    window.location.reload();
   }, []);
   const finishOnboarding = useCallback(({name,goal,weeklyGoal,weight}) => {
     setSettings(p=>({...p,name,fitnessGoal:goal,weeklyGoal,onboarded:true,bodyWeight:weight||null}));
@@ -5201,7 +5336,7 @@ function App() {
     setTab("workout");
   }, []);
 
-  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding} onImport={importAll}/>;
+  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding} onImport={importAll} importError={importError}/>;
 
   const TABS = [
     {id:"dashboard", icon:"⌂",  label:"Home"},
@@ -5234,7 +5369,7 @@ function App() {
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
       case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio} allExercises={allExercises}/>;
       case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
-      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} allExercises={allExercises} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
+      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} allExercises={allExercises} onUpdate={updateSettings} onReset={resetAll} onImport={importAll} importError={importError}/>;
       default:             return null;
     }
   };
