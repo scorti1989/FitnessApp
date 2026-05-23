@@ -127,7 +127,7 @@ function isoWeekKey(date) {
   return `${year}-W${String(weekNum).padStart(2,"0")}`;
 }
 
-const isDone = s => s.done !== false;
+const isDone = s => s != null && s.done !== false;
 
 // Central warmup detector – used by vol, getPRs, getWeeklySets, history, etc.
 // Returns true when a set (and its exercise) represents a warmup/mobility set
@@ -142,7 +142,7 @@ function isWarmupSet(set, exercise) {
 }
 
 // vol() sums weight×reps for strength work-sets only (excludes warmup sets)
-const vol = (sets, allExercises) => sets
+const vol = (sets, allExercises) => (Array.isArray(sets) ? sets : [])
   .filter(x => {
     if (!isDone(x) || (x.weight||0) <= 0) return false;
     const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
@@ -154,7 +154,9 @@ const calcKcal = (type, durationMin, bodyWeightKg) =>
   Math.round((CARDIO_MET[type]||5) * ((bodyWeightKg||75)/60) * (durationMin/60) * 60);
 
 function calcStreak(sessions, cardio=[]) {
-  const allDates = [...sessions.map(s=>s.date), ...cardio.map(c=>c.date)];
+  const _sess = Array.isArray(sessions) ? sessions : [];
+  const _card = Array.isArray(cardio)   ? cardio   : [];
+  const allDates = [..._sess.map(s=>s.date), ..._card.map(c=>c.date)];
   if (!allDates.length) return 0;
   const days = [...new Set(allDates.map(d=>dayKey(d)))].sort((a,b)=>new Date(b)-new Date(a));
   let streak=0, cur=new Date(); cur.setHours(0,0,0,0);
@@ -167,6 +169,7 @@ function calcStreak(sessions, cardio=[]) {
 
 // [FIX 3] Wochenstart Montag (DE/ISO)
 function getWeekActivities(sessions, cardio=[]) {
+  if (!Array.isArray(sessions)) return {sessions:[], cardio:[]};
   const now = new Date();
   const dow = now.getDay(); // 0=So
   const daysFromMon = dow === 0 ? 6 : dow - 1;
@@ -182,6 +185,7 @@ function getWeekActivities(sessions, cardio=[]) {
 // getPRs – excludes warmup sets from personal records
 function getPRs(sessions, allExercises) {
   const p = {};
+  if (!Array.isArray(sessions)) return p;
   sessions.forEach(s => s.sets.forEach(x => {
     const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
     if (isDone(x) && x.weight > 0 && !isWarmupSet(x, ex) && (!p[x.eid] || x.weight > p[x.eid]))
@@ -273,6 +277,7 @@ function getBestSet(sessions, eid, allExercises) {
 
 // Weekly set count per muscle group (last N weeks) – excludes warmup sets
 function getWeeklySets(sessions, allExercises, weeksBack=1) {
+  if (!Array.isArray(sessions)) return {};
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - weeksBack*7);
   const counts = {};
@@ -335,6 +340,7 @@ function getRecoveryStatus(daysSince) {
 
 // Weekly summary: volume, sessions, top muscle, records, cardio time
 function buildWeeklySummary(sessions, cardio, allExercises) {
+  if (!Array.isArray(sessions)) return {weekVol:0,weekTime:0,cardioMin:0,topMuscle:null,neglected:[],mobilityMins:0};
   const { sessions:ws, cardio:wc } = getWeekActivities(sessions, cardio);
   const weekVol   = ws.reduce((s,x)=>s+vol(x.sets,allExercises),0);
   const weekTime  = ws.reduce((s,x)=>s+(x.duration||0),0);
@@ -899,6 +905,7 @@ const ACHIEVEMENT_DEFS = [
 ];
 
 function calcAchievements(sessions, metrics, streak, cardio, allExercises=[]) {
+  if (!Array.isArray(sessions)) return ACHIEVEMENT_DEFS.map(a=>({...a,unlocked:false}));
   return ACHIEVEMENT_DEFS.map(a => ({
     ...a,
     unlocked: a.check(sessions, metrics, streak, cardio, allExercises),
@@ -1143,6 +1150,102 @@ function compressImage(dataUrl, maxPx=400, quality=0.72) {
 // ═══════════════════════════════════════════════════════
 // PERSISTENCE (Fix 4+8)
 // ═══════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════
+// BACKUP SANITIZERS – called on import AND lsGet
+// ═══════════════════════════════════════════════════════
+
+function sanitizeSettings(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return mergeWithDefaults({});
+  return mergeWithDefaults({...raw, onboarded: true});
+}
+
+function sanitizeSessions(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(s =>
+    s && typeof s === "object" &&
+    typeof s.id   === "string" && s.id &&
+    typeof s.date === "string" && s.date &&
+    Array.isArray(s.sets)
+  ).map(s => ({
+    ...s,
+    sets: s.sets.filter(x => x && typeof x === "object" &&
+                              typeof x.eid === "string" && x.eid),
+  }));
+}
+
+function sanitizePlans(raw, fallback) {
+  if (!Array.isArray(raw)) return fallback || [];
+  const valid = raw.filter(p =>
+    p && typeof p === "object" &&
+    typeof p.id   === "string" && p.id &&
+    typeof p.name === "string" && p.name &&
+    Array.isArray(p.days)
+  ).map(p => ({
+    ...p,
+    days: (p.days||[]).filter(d =>
+      d && typeof d === "object" && Array.isArray(d.exercises)
+    ).map(d => ({
+      ...d,
+      exercises: (d.exercises||[]).filter(e =>
+        e && typeof e === "object" && typeof e.eid === "string" && e.eid
+      ),
+    })),
+  }));
+  return valid.length ? valid : (fallback || []);
+}
+
+function sanitizeCardio(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(c =>
+    c && typeof c === "object" &&
+    typeof c.id   === "string" && c.id &&
+    typeof c.date === "string" && c.date
+  );
+}
+
+function sanitizeMetrics(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(m =>
+    m && typeof m === "object" &&
+    typeof m.id   === "string" && m.id &&
+    typeof m.date === "string" && m.date
+  );
+}
+
+function sanitizeCustomExercises(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(cx =>
+    cx && typeof cx === "object" &&
+    typeof cx.id   === "string" && cx.id &&
+    typeof cx.name === "string" && cx.name
+  );
+}
+
+function sanitizeExerciseOverrides(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = {};
+  Object.entries(raw).forEach(([k,v]) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) out[k] = v;
+  });
+  return out;
+}
+
+// Central entry point used by BOTH import handlers
+function sanitizeBackup(raw) {
+  if (!raw || typeof raw !== "object") throw new Error("Kein gültiges JSON-Objekt");
+  if (!raw._fittrack_version)          throw new Error("Keine FitTrack-Backup-Datei");
+  return {
+    settings:          sanitizeSettings(raw.settings),
+    sessions:          sanitizeSessions(raw.sessions),
+    plans:             sanitizePlans(raw.plans, MY_PLANS),
+    cardio:            sanitizeCardio(raw.cardio),
+    metrics:           sanitizeMetrics(raw.metrics),
+    customExercises:   sanitizeCustomExercises(raw.customExercises),
+    exerciseOverrides: sanitizeExerciseOverrides(raw.exerciseOverrides),
+  };
+}
+
 const LS_PREFIX = "ft5_";
 
 function lsGet(key, fallback) {
@@ -1151,24 +1254,51 @@ function lsGet(key, fallback) {
     if (v == null) return fallback;
     const parsed = JSON.parse(v);
     if (parsed == null) return fallback;
-    // Fix 1: deep-merge settings so new fields are always present
-    if (key === "settings") {
-      if (typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
-      return mergeWithDefaults(parsed);
-    }
+    // Per-key sanitization so corrupt localStorage never crashes the app
+    if (key === "settings")          return sanitizeSettings(parsed);
+    if (key === "sessions")          return sanitizeSessions(parsed);
+    if (key === "plans")             return sanitizePlans(parsed, fallback);
+    if (key === "cardio")            return sanitizeCardio(parsed);
+    if (key === "metrics")           return sanitizeMetrics(parsed);
+    if (key === "customExercises")   return sanitizeCustomExercises(parsed);
+    if (key === "exerciseOverrides") return sanitizeExerciseOverrides(parsed);
     return parsed;
-  } catch {
+  } catch(e) {
+    console.warn("FitTrack: lsGet failed for", key, e?.message);
     return fallback;
   }
 }
+
+// Storage-quota notification state (module-level, shown once per session)
+let _quotaWarningShown = false;
 
 function lsSet(key, value) {
   try {
     localStorage.setItem(LS_PREFIX + key, JSON.stringify(value));
     return true;
   } catch (e) {
-    // QuotaExceededError or similar – show a brief console warning
-    console.warn("FitTrack: localStorage write failed for key:", key, e?.name);
+    const isQuota = e?.name === "QuotaExceededError" ||
+                    e?.name === "NS_ERROR_DOM_QUOTA_REACHED";
+    console.warn("FitTrack: localStorage write failed:", key, e?.name);
+    if (isQuota && !_quotaWarningShown) {
+      _quotaWarningShown = true;
+      // Show non-blocking toast if the DOM is ready
+      setTimeout(() => {
+        const d = document.createElement("div");
+        d.textContent = "⚠️ Speicher voll – Bilder im Backup reduzieren";
+        Object.assign(d.style, {
+          position:"fixed", bottom:"80px", left:"50%",
+          transform:"translateX(-50%)",
+          background:"#FF6B35", color:"#fff",
+          padding:"10px 20px", borderRadius:"10px",
+          fontSize:"13px", fontWeight:"700",
+          zIndex:"9999", boxShadow:"0 4px 20px rgba(0,0,0,0.5)",
+          maxWidth:"300px", textAlign:"center",
+        });
+        document.body.appendChild(d);
+        setTimeout(() => d.remove(), 5000);
+      }, 100);
+    }
     return false;
   }
 }
@@ -1632,25 +1762,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
     reader.onload = ev => {
       try {
         const raw = JSON.parse(ev.target.result);
-        if (typeof raw !== "object" || !raw)        throw new Error("Kein gültiges JSON");
-        if (!raw._fittrack_version)                  throw new Error("Keine FitTrack-Backup-Datei");
-
-        const imported = {
-          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
-          sessions:          Array.isArray(raw.sessions)          ? raw.sessions          : [],
-          cardio:            Array.isArray(raw.cardio)            ? raw.cardio            : [],
-          plans:             Array.isArray(raw.plans)             ? raw.plans             : [],
-          metrics:           Array.isArray(raw.metrics)           ? raw.metrics           : [],
-          customExercises:   Array.isArray(raw.customExercises)   ? raw.customExercises   : [],
-          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides)
-                               ? raw.exerciseOverrides : {},
-        };
-        imported.sessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
-        imported.plans    = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
-        // Mark as onboarded so the app opens normally after import
-        // Punkt 10: deep-merge timerSettings + restRules on import
-        imported.settings = mergeWithDefaults({...imported.settings, onboarded: true});
-
+        const imported = sanitizeBackup(raw); // central validation + sanitization
         onImport(imported);
         setImportState("ok");
         setImportMsg(`${imported.sessions.length} Trainings, ${imported.plans.length} Pläne wiederhergestellt.`);
@@ -4520,49 +4632,20 @@ const SettingsScreen = ({
   const handleImportFile = e => {
     const file = e.target.files?.[0];
     if (!file) return;
-    e.target.value = ""; // reset so same file can be re-selected
+    e.target.value = "";
     const reader = new FileReader();
     reader.onload = ev => {
       try {
         const raw = JSON.parse(ev.target.result);
-
-        // Validation
-        if (typeof raw !== "object" || !raw) throw new Error("Kein gültiges JSON-Objekt");
-        if (!raw._fittrack_version) throw new Error("Keine FitTrack-Backup-Datei");
-
-        // Normalise – older exports may miss some fields
-        const imported = {
-          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
-          sessions:          Array.isArray(raw.sessions)   ? raw.sessions   : [],
-          cardio:            Array.isArray(raw.cardio)     ? raw.cardio     : [],
-          plans:             Array.isArray(raw.plans)      ? raw.plans      : [],
-          metrics:           Array.isArray(raw.metrics)    ? raw.metrics    : [],
-          customExercises:   Array.isArray(raw.customExercises) ? raw.customExercises : [],
-          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides) ? raw.exerciseOverrides : {},
-        };
-
-        // Sanity: sessions need id + date + sets
-        const validSessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
-        if (imported.sessions.length !== validSessions.length) {
-          console.warn(`FitTrack import: ${imported.sessions.length - validSessions.length} ungültige Sessions übersprungen`);
-        }
-        imported.sessions = validSessions;
-
-        // Sanity: plans need id + name + days
-        imported.plans = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
-
-        onImport({...imported, settings: mergeWithDefaults({...imported.settings, onboarded:true})});
+        const imported = sanitizeBackup(raw); // central validation + sanitization
+        onImport(imported);
         setImportStatus("ok");
-        setTimeout(()=>setImportStatus(null), 4000);
+        setTimeout(()=>setImportStatus(""), 3000);
       } catch(err) {
-        setImportStatus(`Fehler: ${err.message || "Ungültige Datei"}`);
-        setTimeout(()=>setImportStatus(null), 6000);
+        setImportStatus("error:" + (err.message || "Ungültige Datei"));
       }
     };
-    reader.onerror = () => {
-      setImportStatus("Datei konnte nicht gelesen werden");
-      setTimeout(()=>setImportStatus(null), 6000);
-    };
+    reader.onerror = () => setImportStatus("error:Datei konnte nicht gelesen werden");
     reader.readAsText(file);
   };
 
@@ -4936,33 +5019,55 @@ class ErrorBoundary extends React.Component {
   }
   render() {
     if (this.state.error) {
-      const T = THEME;
+      // Use hardcoded safe colors – T / THEME may not be in scope or may be the crash source
+      const bg="#07070F", text="#E8E8F0", red="#FF4444", muted="#666680",
+            accent="#C8FF00", card="#0F0F1C";
+      const btnStyle = (col) => ({
+        background:col, color:"#07070F", border:"none", borderRadius:10,
+        padding:"11px 20px", fontWeight:800, fontSize:13, cursor:"pointer",
+        width:"100%", marginBottom:8,
+      });
       return (
-        <div style={{padding:32,fontFamily:"sans-serif",background:T.bg,color:T.text,
-          minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",
-          justifyContent:"flex-start",paddingTop:60}}>
-          <div style={{fontSize:40,marginBottom:16}}>⚠️</div>
-          <div style={{fontSize:18,fontWeight:800,color:T.red,marginBottom:8}}>
+        <div style={{padding:32, fontFamily:"-apple-system,sans-serif",
+          background:bg, color:text, minHeight:"100vh",
+          display:"flex", flexDirection:"column", alignItems:"center",
+          justifyContent:"flex-start", paddingTop:60}}>
+          <div style={{fontSize:40, marginBottom:16}}>⚠️</div>
+          <div style={{fontSize:18, fontWeight:800, color:red, marginBottom:8}}>
             Fehler beim Laden
           </div>
-          <div style={{fontSize:13,color:T.sub,marginBottom:24,textAlign:"center",
-            maxWidth:300,lineHeight:1.6}}>
+          <div style={{fontSize:13, color:muted, marginBottom:4,
+            textAlign:"center", maxWidth:300, lineHeight:1.6}}>
             {this.state.error?.message || "Unbekannter Fehler"}
           </div>
-          <button
-            onClick={()=>{
-              // Clear only app keys so a corrupt import can be recovered
+          <details style={{marginBottom:24, maxWidth:300, width:"100%"}}>
+            <summary style={{fontSize:11, color:muted, cursor:"pointer", textAlign:"center"}}>
+              Details
+            </summary>
+            <pre style={{fontSize:10, color:muted, overflowX:"auto", whiteSpace:"pre-wrap",
+              background:card, padding:8, borderRadius:8, marginTop:6}}>
+              {this.state.error?.stack || ""}
+            </pre>
+          </details>
+          {/* Option 1: delete only import/exercise-overrides data (large blobs) */}
+          <button onClick={()=>{
+              ["exerciseOverrides","customExercises"].forEach(k =>
+                localStorage.removeItem("ft5_"+k));
+              window.location.reload();
+            }} style={btnStyle("#FF6B35")}>
+            Nur Importdaten löschen
+          </button>
+          {/* Option 2: full reset */}
+          <button onClick={()=>{
               Object.keys(localStorage)
                 .filter(k=>k.startsWith("ft5_"))
                 .forEach(k=>localStorage.removeItem(k));
               window.location.reload();
-            }}
-            style={{background:T.accent,color:"#07070F",border:"none",borderRadius:10,
-              padding:"12px 24px",fontWeight:800,fontSize:14,cursor:"pointer"}}>
-            App zurücksetzen
+            }} style={btnStyle(accent)}>
+            App komplett zurücksetzen
           </button>
-          <div style={{fontSize:11,color:T.muted,marginTop:12}}>
-            Deine Daten werden entfernt und die App neu gestartet.
+          <div style={{fontSize:11, color:muted, marginTop:4, textAlign:"center"}}>
+            Beim kompletten Zurücksetzen gehen alle Trainingsdaten verloren.
           </div>
         </div>
       );
@@ -5032,16 +5137,17 @@ function App() {
 
   // Fix 4: Import handler – fully replaces all state from backup
   const importAll = useCallback(({settings:s, sessions:se, cardio:ca, plans:pl, metrics:me, customExercises:cx, exerciseOverrides:eo}) => {
-    // Always deep-merge settings so new fields are present even in older backups.
-    // Guard every field: only set if the value is the right type to prevent
-    // a corrupt import from breaking the app state.
-    if (s && typeof s === "object")   setSettings(mergeWithDefaults({...s, onboarded:true}));
-    if (Array.isArray(se))            setSessions(se);
-    if (Array.isArray(ca))            setCardio(ca);
-    if (Array.isArray(pl))            setPlans(pl);
-    if (Array.isArray(me))            setMetrics(me);
-    if (Array.isArray(cx))            setCustomExercises(cx);
-    if (eo && typeof eo === "object") setExerciseOverrides(eo);
+    // sanitizeBackup already ran – these values are clean.
+    // Re-sanitize defensively in case importAll is called from another path.
+    setSettings(sanitizeSettings(s));
+    setSessions(sanitizeSessions(se));
+    setCardio(sanitizeCardio(ca));
+    setPlans(sanitizePlans(pl, MY_PLANS));
+    setMetrics(sanitizeMetrics(me));
+    setCustomExercises(sanitizeCustomExercises(cx));
+    setExerciseOverrides(sanitizeExerciseOverrides(eo));
+    // Always land on dashboard after successful import
+    setTab("dashboard");
   }, []);
   const finishOnboarding = useCallback(({name,goal,weeklyGoal,weight}) => {
     setSettings(p=>({...p,name,fitnessGoal:goal,weeklyGoal,onboarded:true,bodyWeight:weight||null}));
