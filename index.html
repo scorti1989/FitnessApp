@@ -4547,7 +4547,7 @@ const SettingsScreen = ({
         // Sanity: plans need id + name + days
         imported.plans = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
 
-        onImport({...imported, settings:{...DEFAULT_SETTINGS, ...imported.settings, onboarded:true}});
+        onImport({...imported, settings: mergeWithDefaults({...imported.settings, onboarded:true})});
         setImportStatus("ok");
         setTimeout(()=>setImportStatus(null), 4000);
       } catch(err) {
@@ -4978,7 +4978,9 @@ function App() {
 
   // Fix 4: Import handler – fully replaces all state from backup
   const importAll = useCallback(({settings:s, sessions:se, cardio:ca, plans:pl, metrics:me, customExercises:cx, exerciseOverrides:eo}) => {
-    if (s)  setSettings(s);
+    // Always deep-merge settings so new fields (progressionSettings, timerSettings etc.)
+    // are present even when importing an older backup that lacks them.
+    if (s)  setSettings(mergeWithDefaults({...s, onboarded:true}));
     if (se) setSessions(se);
     if (ca) setCardio(ca);
     if (pl) setPlans(pl);
