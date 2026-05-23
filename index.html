@@ -25,7 +25,48 @@
   </style>
 </head>
 <body>
+  <!-- Loading screen shown BEFORE Babel parses the JSX (can take 2-4s on mobile) -->
+  <div id="boot-screen" style="
+    position:fixed;inset:0;background:#07070F;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    font-family:-apple-system,Helvetica Neue,sans-serif;z-index:99999;
+    transition:opacity 0.4s;">
+    <div style="font-size:48px;margin-bottom:16px;">🏋</div>
+    <div style="color:#C8FF00;font-size:22px;font-weight:900;letter-spacing:2px;margin-bottom:8px;">FITTRACK</div>
+    <div style="color:#444466;font-size:13px;">Lädt…</div>
+  </div>
+  <!-- Error screen for Babel parse failures (shown before React mounts) -->
+  <div id="parse-error" style="
+    display:none;position:fixed;inset:0;background:#07070F;
+    padding:40px 24px;font-family:-apple-system,sans-serif;color:#E8E8F0;
+    flex-direction:column;align-items:center;justify-content:flex-start;padding-top:80px;">
+    <div style="font-size:40px;margin-bottom:16px;">⚠️</div>
+    <div style="color:#FF4444;font-size:18px;font-weight:800;margin-bottom:12px;">App konnte nicht starten</div>
+    <div id="parse-error-msg" style="color:#666680;font-size:13px;text-align:center;max-width:300px;line-height:1.6;margin-bottom:24px;"></div>
+    <button onclick="(function(){Object.keys(localStorage).filter(k=>k.startsWith('ft5_')).forEach(k=>localStorage.removeItem(k));location.reload();})()"
+      style="background:#C8FF00;color:#07070F;border:none;border-radius:10px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;margin-bottom:8px;width:100%;max-width:280px;">
+      App-Daten löschen und neu starten
+    </button>
+    <button onclick="(function(){['ft5_exerciseOverrides','ft5_customExercises'].forEach(k=>localStorage.removeItem(k));location.reload();})()"
+      style="background:#FF6B35;color:#fff;border:none;border-radius:10px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;width:100%;max-width:280px;">
+      Nur Importdaten löschen
+    </button>
+  </div>
   <div id="root"></div>
+  <script>
+    // Catch any error before React/Babel finish loading
+    window.onerror = function(msg, src, line, col, err) {
+      document.getElementById('boot-screen').style.display = 'none';
+      var el = document.getElementById('parse-error');
+      el.style.display = 'flex';
+      document.getElementById('parse-error-msg').textContent =
+        (err && err.message) || msg || 'Unbekannter Fehler';
+      return true; // prevent default browser error
+    };
+    window.onunhandledrejection = function(e) {
+      window.onerror(null, null, null, null, e.reason);
+    };
+  </script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -5146,8 +5187,9 @@ function App() {
     setMetrics(sanitizeMetrics(me));
     setCustomExercises(sanitizeCustomExercises(cx));
     setExerciseOverrides(sanitizeExerciseOverrides(eo));
-    // Always land on dashboard after successful import
-    setTab("dashboard");
+    // Reload so the app starts fresh from localStorage – avoids blank screen
+    // from stale React state after a large import (especially base64 image data).
+    setTimeout(() => window.location.reload(), 80);
   }, []);
   const finishOnboarding = useCallback(({name,goal,weeklyGoal,weight}) => {
     setSettings(p=>({...p,name,fitnessGoal:goal,weeklyGoal,onboarded:true,bodyWeight:weight||null}));
@@ -5244,6 +5286,9 @@ function App() {
 }
 
     const root = ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
-  </script>
+  
+    // Hide boot screen once React mounts
+    const _boot=document.getElementById('boot-screen');
+    if(_boot){_boot.style.opacity='0';setTimeout(()=>_boot.remove(),450);}</script>
 </body>
 </html>
