@@ -191,6 +191,9 @@ const vol = (sets, allExercises) => (Array.isArray(sets) ? sets : [])
   })
   .reduce((sum, x) => sum + (x.weight||0) * (x.reps||0), 0);
 
+// Safe sets accessor – always returns an array even if session.sets is missing/corrupt
+const getSets = (session) => Array.isArray(session?.sets) ? session.sets : [];
+
 const calcKcal = (type, durationMin, bodyWeightKg) =>
   Math.round((CARDIO_MET[type]||5) * ((bodyWeightKg||75)/60) * (durationMin/60) * 60);
 
@@ -227,7 +230,7 @@ function getWeekActivities(sessions, cardio=[]) {
 function getPRs(sessions, allExercises) {
   const p = {};
   if (!Array.isArray(sessions)) return p;
-  sessions.forEach(s => s.sets.forEach(x => {
+  sessions.forEach(s => (Array.isArray(s.sets) ? s.sets : []).forEach(x => {
     const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
     if (isDone(x) && x.weight > 0 && !isWarmupSet(x, ex) && (!p[x.eid] || x.weight > p[x.eid]))
       p[x.eid] = x.weight;
@@ -265,7 +268,7 @@ function getExHistory(sessions, eid, allExercises) {
   const rows = [];
   const exercise = allExercises ? (allExercises||[]).find(e => e.id === eid) : null;
   sessions.forEach(s => {
-    s.sets.filter(x =>
+    getSets(s).filter(x =>
       isDone(x) && x.eid===eid && x.weight>0 && !isWarmupSet(x, exercise)
     ).forEach(x => {
       rows.push({ date:s.date, weight:x.weight, reps:x.reps,
@@ -279,7 +282,7 @@ function getExHistory(sessions, eid, allExercises) {
 function getTimeExHistory(sessions, eid) {
   const rows = [];
   sessions.forEach(s => {
-    s.sets.filter(x => isDone(x) && x.eid===eid && x.reps>0 && (!x.weight||x.weight===0)).forEach(x => {
+    getSets(s).filter(x => isDone(x) && x.eid===eid && x.reps>0 && (!x.weight||x.weight===0)).forEach(x => {
       rows.push({ date:s.date, reps:x.reps });
     });
   });
@@ -306,7 +309,7 @@ function pctChange(arr) {
 // Best set for an exercise
 function getBestSet(sessions, eid, allExercises) {
   let best = null;
-  sessions.forEach(s => s.sets.filter(x => {
+  sessions.forEach(s => getSets(s).filter(x => {
     if (!isDone(x) || x.eid !== eid || (x.weight||0) <= 0) return false;
     const ex = (allExercises||[]).find(e=>e.id===x.eid);
     return !isWarmupSet(x, ex);
@@ -325,7 +328,7 @@ function getWeeklySets(sessions, allExercises, weeksBack=1) {
   Object.keys(MUSCLE_GROUPS).forEach(k => { counts[k]=0; });
   sessions
     .filter(s => new Date(s.date) >= cutoff)
-    .forEach(s => s.sets.filter(isDone).forEach(x => {
+    .forEach(s => getSets(s).filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
       if (isWarmupSet(x, ex)) return;           // exclude warmup/mobility
       const cat = ex?.cat;
@@ -358,7 +361,7 @@ function getLastTrainedDays(sessions, allExercises) {
   const last = {};
   [...sessions]
     .sort((a,b)=>new Date(b.date)-new Date(a.date))
-    .forEach(s => s.sets.filter(isDone).forEach(x => {
+    .forEach(s => getSets(s).filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
       if (isWarmupSet(x, ex)) return;   // Bug 2: exclude warmup from recovery tracking
       const cat = ex?.cat;
@@ -394,7 +397,7 @@ function buildWeeklySummary(sessions, cardio, allExercises) {
     .filter(([k,v])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&MUSCLE_GROUPS[k].targetSets>0&&v===0)
     .map(([k])=>k);
   const mobilityMins = ws.reduce((s,sess)=>{
-    return s + sess.sets.filter(isDone).reduce((a,x)=>{
+    return s + (Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).reduce((a,x)=>{
       const ex=(allExercises||[]).find(e=>e.id===x.eid);
       if(ex?.cat==="Dehnung"||ex?.cat==="Aufwärmen") return a+(x.reps||0);
       return a;
@@ -564,7 +567,7 @@ function getExercisePerformanceHistory(eid, sessions, allExercises) {
   [...sessions]
     .sort((a,b) => new Date(a.date) - new Date(b.date))
     .forEach(sess => {
-      const allEidSets = sess.sets.filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
+      const allEidSets = getSets(sess).filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
       if (!allEidSets.length) return;
 
       // Use isWarmupSet with resolved exercise for full warmup detection (note + cat)
@@ -723,7 +726,7 @@ function detectExerciseStagnation(eid, sessions, settings, allExercises) {
   const weights = last3.map(h => h.sets[0]?.weight || 0);
   const noProgress = weights[2] <= weights[0]; // not higher than 3 sessions ago
   // Check if min reps declined
-  const minReps = last3.map(h => Math.min(...h.sets.map(s=>s.reps||0)));
+  const minReps = last3.map(h => Math.min(...getSets(h).map(s=>s.reps||0)));
   const repsDeclined = minReps[2] < minReps[0];
   return {
     stagnating: noProgress && repsDeclined,
@@ -858,11 +861,11 @@ const ACHIEVEMENT_DEFS = [
 
   // ── Sätze ────────────────────────────────────────────
   { id:"sets_50",   icon:"📋", name:"Satzsammler",    cat:"Volumen",
-    desc:"50 abgeschlossene Sätze",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=50 },
+    desc:"50 abgeschlossene Sätze",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=50 },
   { id:"sets_250",  icon:"📋", name:"Fleißige Hände", cat:"Volumen",
-    desc:"250 abgeschlossene Sätze",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=250 },
+    desc:"250 abgeschlossene Sätze",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=250 },
   { id:"sets_1000", icon:"📋", name:"Tausend Sätze",  cat:"Volumen",
-    desc:"1000 abgeschlossene Sätze",   check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=1000 },
+    desc:"1000 abgeschlossene Sätze",   check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=1000 },
 
   // ── Trainingszeit ────────────────────────────────────
   { id:"time_5h",  icon:"⏱", name:"5 Stunden Eisen",   cat:"Zeit",
@@ -878,9 +881,9 @@ const ACHIEVEMENT_DEFS = [
   { id:"pr_collector",icon:"🏅", name:"PR-Sammler",     cat:"Kraft",
     desc:"10 persönliche Rekorde",      check:(s,_,__,___,ae)=>Object.keys(getPRs(s,ae)).length>=10 },
   { id:"heavy_lifter",icon:"💎", name:"Schwerer Junge",  cat:"Kraft",
-    desc:"50 kg+ auf einer Übung",      check:(s,_,__,___,ae)=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=50  &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
+    desc:"50 kg+ auf einer Übung",      check:(s,_,__,___,ae)=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).some(y=>isDone(y)&&y.weight>=50  &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
   { id:"century_club",icon:"💯", name:"Century Club",    cat:"Kraft",
-    desc:"100 kg+ auf einer Übung",     check:(s,_,__,___,ae)=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=100 &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
+    desc:"100 kg+ auf einer Übung",     check:(s,_,__,___,ae)=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).some(y=>isDone(y)&&y.weight>=100 &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
 
   // ── Cardio ────────────────────────────────────────────
   { id:"cardio_5",   icon:"🏃", name:"Läufer",           cat:"Cardio",
@@ -901,15 +904,15 @@ const ACHIEVEMENT_DEFS = [
   // ── Mobility / Zeitübungen ───────────────────────────
   { id:"plank_master",icon:"🧘", name:"Plank-Meister",   cat:"Mobility",
     desc:"Plank 3× in einer Einheit",
-    check:s=>s.some(x=>x.sets.filter(y=>isDone(y)&&y.eid==="e23").length>=3) },
+    check:s=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&y.eid==="e23").length>=3) },
   { id:"plank_5min",  icon:"🧘", name:"5-Minuten-Plank", cat:"Mobility",
     desc:"Plank ≥ 300 Sek in einer Einheit",
-    check:s=>s.some(x=>x.sets.filter(isDone).some(y=>y.eid==="e23"&&(y.reps||0)>=300)) },
+    check:s=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).filter(isDone).some(y=>y.eid==="e23"&&(y.reps||0)>=300)) },
   { id:"mobility_fan",icon:"🌿", name:"Mobility Master", cat:"Mobility",
     desc:"10 Dehneinheiten abgeschlossen",
     check:s=>{
       let count=0;
-      s.forEach(sess=>sess.sets.filter(isDone).forEach(x=>{if(x.eid&&x.eid.startsWith("s"))count++;}));
+      s.forEach(sess=>(Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).forEach(x=>{if(x.eid&&x.eid.startsWith("s"))count++;}));
       return count>=10;
     },
   },
@@ -924,7 +927,7 @@ const ACHIEVEMENT_DEFS = [
     check:(s,_,__,___,allExercises)=>s.some(sess=>{
       // Only count exercises in category "Beine"
       const legEids = new Set(
-        sess.sets
+        (Array.isArray(sess.sets)?sess.sets:[])
           .filter(isDone)
           .map(x=>x.eid)
           .filter(id => {
@@ -3469,18 +3472,18 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     // but a user who changed a warmup weight deserves to see that change next session.
     //
     // Primary: exact planExIdx + eid match (preserves set-type separation)
-    let exSets = last.sets.filter(s =>
+    let exSets = getSets(last).filter(s =>
       s.planExIdx === exIdx && s.eid === eid
     );
     // Fallback for old sessions without planExIdx: match eid only, same planExIdx or unknown
     if (!exSets.length) {
-      exSets = last.sets.filter(s =>
+      exSets = getSets(last).filter(s =>
         s.eid === eid && (s.planExIdx == null || s.planExIdx === exIdx)
       );
     }
     // Last resort: any set with matching eid (handles very old data)
     if (!exSets.length) {
-      exSets = last.sets.filter(s => s.eid === eid);
+      exSets = getSets(last).filter(s => s.eid === eid);
     }
     if (!exSets.length) return null;
 
@@ -3852,7 +3855,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const [detailSess,setDetailSess] = useState(null);
 
   // ── Pre-computed data ─────────────────────────────────
-  const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>s.sets.filter(isDone).map(x=>x.eid)))],[sessions]);
+  const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>getSets(s).filter(isDone).map(x=>x.eid)))],[sessions]);
   const prs       = useMemo(()=>getPRs(sessions,allExercises),[sessions,allExercises]);
   const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets,allExercises),0),[sessions,allExercises]);
   const weekSets  = useMemo(()=>getWeeklySets(sessions,allExercises,1),[sessions,allExercises]);
@@ -3866,7 +3869,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
     if(!sessions||sessions.length<2) return [];
     const ps = getProgressionSettings(settings);
     const strengthEids=[...new Set(
-      sessions.flatMap(s=>s.sets.filter(x=>isDone(x)&&(x.weight||0)>0).map(x=>x.eid))
+      sessions.flatMap(s=>getSets(s).filter(x=>isDone(x)&&(x.weight||0)>0).map(x=>x.eid))
     )];
     return strengthEids.slice(0,12).map(eid=>{
       const ex=(allExercises||[]).find(e=>e.id===eid);
@@ -3914,7 +3917,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   // Session detail overlay
   if (detailSess) {
     const byEx = {};
-    detailSess.sets.filter(isDone).forEach(s=>{if(!byEx[s.eid])byEx[s.eid]=[];byEx[s.eid].push(s);});
+    getSets(detailSess).filter(isDone).forEach(s=>{if(!byEx[s.eid])byEx[s.eid]=[];byEx[s.eid].push(s);});
     return (
       <div style={{position:"fixed",inset:0,background:T.bg,zIndex:200,overflowY:"auto"}}>
         <div style={{padding:"16px 16px 0",display:"flex",gap:10,alignItems:"center"}}>
@@ -3929,7 +3932,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
             {detailSess.source&&<Badge color={T.orange} style={{marginBottom:8}}>{detailSess.source} Import</Badge>}
             <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{fmtD(detailSess.date)}</div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:detailSess.sets.filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(detailSess.sets,allExercises)/100)/10).toFixed(1)}t`}].map(s=>(
+              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:getSets(detailSess).filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(getSets(detailSess),allExercises)/100)/10).toFixed(1)}t`}].map(s=>(
                 <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
                   <div style={{fontSize:18,fontWeight:900,color:T.text}}>{s.v}</div>
                   <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
@@ -4297,7 +4300,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
           <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16,fontSize:14}}>Noch keine Trainings.</div>
         )}
         {sessions.map(sess=>{
-          const v=vol(sess.sets,allExercises);
+          const v=vol(getSets(sess),allExercises);
           const dn=plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
           return(
             <Card key={sess.id} style={{marginBottom:8,padding:0,overflow:"hidden"}}>
@@ -4310,7 +4313,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
                         {sess.source&&<Badge color={T.orange}>{sess.source}</Badge>}
                       </div>
                       <div style={{fontSize:12,color:T.sub}}>{fmtD(sess.date)}</div>
-                      <div style={{fontSize:11,color:T.muted,marginTop:3}}>{sess.sets.filter(isDone).length} Sätze · {sess.duration} min</div>
+                      <div style={{fontSize:11,color:T.muted,marginTop:3}}>{(Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).length} Sätze · {sess.duration} min</div>
                     </div>
                     <div style={{textAlign:"right",marginLeft:12}}>
                       <div style={{fontSize:15,fontWeight:800,color:T.accent}}>{Math.round(v).toLocaleString()} kg</div>
