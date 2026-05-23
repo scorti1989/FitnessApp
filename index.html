@@ -4491,7 +4491,7 @@ const AchievementsScreen = ({sessions, metrics, streak, cardio, allExercises=[]}
 // ═══════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════
-const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, onStartWorkout, onGoTo}) => {
+const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, allExercises, onStartWorkout, onGoTo}) => {
   const latest   = metrics[metrics.length-1];
   const {sessions:weekS, cardio:weekC} = useMemo(()=>getWeekActivities(sessions,cardio),[sessions,cardio]);
   const weekGoal = settings.weeklyGoal||3;
