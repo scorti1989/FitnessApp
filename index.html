@@ -216,10 +216,13 @@ function calc1RM(weight, reps) {
 }
 
 // Get all strength (weight>0, non-time) history for one exercise
-function getExHistory(sessions, eid) {
+function getExHistory(sessions, eid, allExercises) {
   const rows = [];
+  const exercise = allExercises ? (allExercises||[]).find(e => e.id === eid) : null;
   sessions.forEach(s => {
-    s.sets.filter(x => isDone(x) && x.eid===eid && x.weight>0).forEach(x => {
+    s.sets.filter(x =>
+      isDone(x) && x.eid===eid && x.weight>0 && !isWarmupSet(x, exercise)
+    ).forEach(x => {
       rows.push({ date:s.date, weight:x.weight, reps:x.reps,
                   vol:x.weight*x.reps, rm1:calc1RM(x.weight,x.reps) });
     });
@@ -256,9 +259,13 @@ function pctChange(arr) {
 }
 
 // Best set for an exercise
-function getBestSet(sessions, eid) {
+function getBestSet(sessions, eid, allExercises) {
   let best = null;
-  sessions.forEach(s => s.sets.filter(x=>isDone(x)&&x.eid===eid&&x.weight>0).forEach(x => {
+  sessions.forEach(s => s.sets.filter(x => {
+    if (!isDone(x) || x.eid !== eid || (x.weight||0) <= 0) return false;
+    const ex = (allExercises||[]).find(e=>e.id===x.eid);
+    return !isWarmupSet(x, ex);
+  }).forEach(x => {
     if (!best || x.weight > best.weight) best = {...x, date:s.date};
   }));
   return best;
@@ -307,6 +314,7 @@ function getLastTrainedDays(sessions, allExercises) {
     .sort((a,b)=>new Date(b.date)-new Date(a.date))
     .forEach(s => s.sets.filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
+      if (isWarmupSet(x, ex)) return;   // Bug 2: exclude warmup from recovery tracking
       const cat = ex?.cat;
       if (cat && last[cat]===undefined) {
         const d = Math.floor((Date.now()-new Date(s.date))/86400000);
@@ -328,7 +336,7 @@ function getRecoveryStatus(daysSince) {
 // Weekly summary: volume, sessions, top muscle, records, cardio time
 function buildWeeklySummary(sessions, cardio, allExercises) {
   const { sessions:ws, cardio:wc } = getWeekActivities(sessions, cardio);
-  const weekVol   = ws.reduce((s,x)=>s+vol(x.sets),0);
+  const weekVol   = ws.reduce((s,x)=>s+vol(x.sets,allExercises),0);
   const weekTime  = ws.reduce((s,x)=>s+(x.duration||0),0);
   const cardioMin = wc.reduce((s,c)=>s+(c.duration||0),0);
   const setCounts = getWeeklySets(sessions, allExercises, 1);
@@ -500,9 +508,11 @@ function deloadDaysRemaining(settings) {
 //   1. planNote contains "eingewöhnung" or "warm" (copied from planEx.note in start())
 //   2. Old sessions without planNote: sets whose weight is clearly the lowest weight
 //      for that exercise in the same session are treated as warmup (heuristic).
-function getExercisePerformanceHistory(eid, sessions) {
+function getExercisePerformanceHistory(eid, sessions, allExercises) {
   if (!eid || !sessions?.length) return [];
   const history = [];
+  // Resolve the exercise object once for cat-based warmup detection
+  const exercise = allExercises ? (allExercises||[]).find(e => e.id === eid) : null;
 
   [...sessions]
     .sort((a,b) => new Date(a.date) - new Date(b.date))
@@ -510,20 +520,8 @@ function getExercisePerformanceHistory(eid, sessions) {
       const allEidSets = sess.sets.filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
       if (!allEidSets.length) return;
 
-      // Heuristic: if there are multiple distinct weights for this EID in one session,
-      // the lowest-weight group is almost certainly a warmup group.
-      const weights = [...new Set(allEidSets.map(s => s.weight))].sort((a,b)=>a-b);
-      const minWeight = weights[0];
-      const hasMultipleWeights = weights.length > 1;
-
-      const workSets = allEidSets.filter(s => {
-        // Use central isWarmupSet helper (handles note, cat, explicit flag)
-        const ex = { cat: null }; // cat filtered via note/weight heuristic below
-        if (isWarmupSet(s, ex)) return false;
-        // Heuristic: lowest weight in a multi-weight session = warmup group
-        if (hasMultipleWeights && s.weight === minWeight) return false;
-        return true;
-      });
+      // Use isWarmupSet with resolved exercise for full warmup detection (note + cat)
+      const workSets = allEidSets.filter(s => !isWarmupSet(s, exercise));
 
       if (workSets.length > 0) {
         history.push({
@@ -538,7 +536,7 @@ function getExercisePerformanceHistory(eid, sessions) {
 
 // Core algorithm: calculate progression suggestion for one exercise
 // Returns: { action, suggestedWeight, suggestedReps, reason, isDeload, confidence }
-function calculateProgressionSuggestion(planExercise, exercise, sessions, settings) {
+function calculateProgressionSuggestion(planExercise, exercise, sessions, settings, allExercises) {
   const ps = getProgressionSettings(settings);
   if (!ps.enabled) return null;
 
@@ -554,14 +552,14 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const eid       = planExercise?.eid;
   if (!eid) return null;
 
-  const history = getExercisePerformanceHistory(eid, sessions);
+  const history = getExercisePerformanceHistory(eid, sessions, allExercises);
   if (history.length < (ps.minSessionsBeforeSuggestion || 2)) return null;
 
   // Check if deload is active
   if (isDeloadActive(settings) && ps.deloadEnabled) {
     const strategy   = ps.deloadStrategy || "weight";
     // Use last known weight from history if planExercise.weight is 0
-    const history_   = getExercisePerformanceHistory(eid, sessions);
+    const history_   = getExercisePerformanceHistory(eid, sessions, allExercises);
     const baseWeight = (planExercise?.weight || 0) > 0
       ? planExercise.weight
       : (history_.length > 0 ? (history_[history_.length-1].sets[0]?.weight || 0) : 0);
@@ -596,7 +594,7 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const avgReps    = lastSets.reduce((a,s)=>a+s.reps,0) / lastSets.length;
 
   // Check stagnation (last 2–3 sessions same or declining weight)
-  const stagnation = detectExerciseStagnation(eid, sessions, settings);
+  const stagnation = detectExerciseStagnation(eid, sessions, settings, allExercises);
 
   // ── DELOAD recommendation based on stagnation ──────────────
   if (stagnation?.stagnating && ps.deloadEnabled && ps.autoDeloadOnStagnation) {
@@ -670,8 +668,8 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
 }
 
 // Detect stagnation for one exercise over last N sessions
-function detectExerciseStagnation(eid, sessions, settings) {
-  const history = getExercisePerformanceHistory(eid, sessions);
+function detectExerciseStagnation(eid, sessions, settings, allExercises) {
+  const history = getExercisePerformanceHistory(eid, sessions, allExercises);
   if (history.length < 3) return { stagnating: false };
   const last3 = history.slice(-3);
   // Check if weight stayed the same or declined across last 3 sessions
@@ -803,21 +801,21 @@ const ACHIEVEMENT_DEFS = [
 
   // ── Volumen ─────────────────────────────────────────
   { id:"volume_1t",   icon:"🏗", name:"Eine Tonne",       cat:"Volumen",
-    desc:"1 Tonne Gesamtvolumen",       check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=1000 },
+    desc:"1 Tonne Gesamtvolumen",       check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=1000 },
   { id:"volume_5t",   icon:"🏗", name:"Fünf Tonnen",      cat:"Volumen",
-    desc:"5 Tonnen Gesamtvolumen",      check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=5000 },
+    desc:"5 Tonnen Gesamtvolumen",      check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=5000 },
   { id:"volume_50t",  icon:"🏋", name:"Fifty Tonnen",     cat:"Volumen",
-    desc:"50 Tonnen Gesamtvolumen",     check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=50000 },
+    desc:"50 Tonnen Gesamtvolumen",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=50000 },
   { id:"volume_100t", icon:"🚀", name:"Century Lifter",   cat:"Volumen",
-    desc:"100 Tonnen Gesamtvolumen",    check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=100000 },
+    desc:"100 Tonnen Gesamtvolumen",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=100000 },
 
   // ── Sätze ────────────────────────────────────────────
   { id:"sets_50",   icon:"📋", name:"Satzsammler",    cat:"Volumen",
-    desc:"50 abgeschlossene Sätze",     check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=50 },
+    desc:"50 abgeschlossene Sätze",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=50 },
   { id:"sets_250",  icon:"📋", name:"Fleißige Hände", cat:"Volumen",
-    desc:"250 abgeschlossene Sätze",    check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=250 },
+    desc:"250 abgeschlossene Sätze",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=250 },
   { id:"sets_1000", icon:"📋", name:"Tausend Sätze",  cat:"Volumen",
-    desc:"1000 abgeschlossene Sätze",   check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=1000 },
+    desc:"1000 abgeschlossene Sätze",   check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+x.sets.filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=1000 },
 
   // ── Trainingszeit ────────────────────────────────────
   { id:"time_5h",  icon:"⏱", name:"5 Stunden Eisen",   cat:"Zeit",
@@ -829,13 +827,13 @@ const ACHIEVEMENT_DEFS = [
 
   // ── Kraft / PRs ──────────────────────────────────────
   { id:"pr_hunter",   icon:"🎯", name:"PR-Jäger",       cat:"Kraft",
-    desc:"5 persönliche Rekorde",       check:s=>Object.keys(getPRs(s)).length>=5 },
+    desc:"5 persönliche Rekorde",       check:(s,_,__,___,ae)=>Object.keys(getPRs(s,ae)).length>=5 },
   { id:"pr_collector",icon:"🏅", name:"PR-Sammler",     cat:"Kraft",
-    desc:"10 persönliche Rekorde",      check:s=>Object.keys(getPRs(s)).length>=10 },
+    desc:"10 persönliche Rekorde",      check:(s,_,__,___,ae)=>Object.keys(getPRs(s,ae)).length>=10 },
   { id:"heavy_lifter",icon:"💎", name:"Schwerer Junge",  cat:"Kraft",
-    desc:"50 kg+ auf einer Übung",      check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=50)) },
+    desc:"50 kg+ auf einer Übung",      check:(s,_,__,___,ae)=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=50  &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
   { id:"century_club",icon:"💯", name:"Century Club",    cat:"Kraft",
-    desc:"100 kg+ auf einer Übung",     check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=100)) },
+    desc:"100 kg+ auf einer Übung",     check:(s,_,__,___,ae)=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=100 &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
 
   // ── Cardio ────────────────────────────────────────────
   { id:"cardio_5",   icon:"🏃", name:"Läufer",           cat:"Cardio",
@@ -2414,7 +2412,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
       ...day,
       exercises:day.exercises.map(ex=>{
         const exercise=(allExercises||[]).find(e=>e.id===ex.eid);
-        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings);
+        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings, allExercises);
         if(!suggestion||suggestion.suggestedWeight<=0) return ex;
         return {...ex, weight:suggestion.suggestedWeight};
       }),
@@ -2759,10 +2757,10 @@ const WorkoutExerciseCard = ({
   const isThisTimerActive = exTimer?.ikey === ikey;
   // Progression suggestion — skip if this planEx is a warmup position
   const ps = getProgressionSettings(settings);
-  const isWarmupPosition = !!((planEx.note||"").toLowerCase().match(/eingewöhnung|warm.up|aufwärm/));
+  const isWarmupPosition = !!((planEx.note||"").toLowerCase().match(/eingewöhnung|warm[\s-]?up|aufwärm|warmup/));
   const suggestion = useMemo(() => {
     if (!ps.showSuggestionsInWorkout || isTimeBased || isWarmupPosition) return null;
-    return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings);
+    return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings, allExercises);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planEx?.eid, planExIdx, isWarmupPosition, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
 
@@ -2918,8 +2916,9 @@ const WorkoutExerciseCard = ({
         {/* ── Set rows (Points 2,3,4,5,6,7) ──────────────── */}
         {exSets.map((s,i)=>{
           // Point 4: track extra (user-added) sets by planEx.sets
-          // Fix 3: use explicit extra flag; fall back to index for old sessions
-          const isExtra = s.extra === true || i >= (planEx.sets || 0);
+          // Bug 1 fix: extra sets identified ONLY by explicit flag, never by index
+          // (index-based fallback caused prev-session extra sets to stay "extra" after carryover)
+          const isExtra = s.extra === true;
           const startTimer = () => {
             const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
             setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
@@ -3048,8 +3047,8 @@ const WorkoutExerciseCard = ({
 
         {/* Point 4+6: + Satz button (left, prominent) + delete extra set button */}
         {(()=>{
-          // Fix 3: check explicit extra flag with index fallback
-          const extraSets = exSets.filter((s,i) => s.extra === true || i >= (planEx.sets||0));
+          // Bug 1 fix: only sets explicitly marked extra:true are deletable extras
+          const extraSets = exSets.filter(s => s.extra === true);
           const hasExtra  = extraSets.length > 0;
           return (
             <div style={{display:"flex", gap:6, marginTop:4}}>
@@ -3074,17 +3073,15 @@ const WorkoutExerciseCard = ({
                     setSets(prev => {
                       const cur = [...(prev[ikey]||[])];
                       // Find last undone extra set index
-                      // Fix 3: find last undone extra set by explicit flag first
+                      // Bug 1 fix: only delete sets explicitly marked extra:true
                       let target = -1;
                       for (let i=cur.length-1; i>=0; i--) {
-                        if ((cur[i].extra === true || i >= (planEx.sets||0)) && !cur[i].done) {
-                          target = i; break;
-                        }
+                        if (cur[i].extra === true && !cur[i].done) { target=i; break; }
                       }
-                      // Fallback: last set that is extra (even if done)
+                      // Fallback: last extra set even if done
                       if (target === -1) {
                         for (let i=cur.length-1; i>=0; i--) {
-                          if (cur[i].extra === true || i >= (planEx.sets||0)) { target=i; break; }
+                          if (cur[i].extra === true) { target=i; break; }
                         }
                       }
                       if (target === -1) return prev; // nothing to delete
@@ -3201,18 +3198,37 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       .sort((a,b) => new Date(b.date) - new Date(a.date));
     if (!matching.length) return null;
     const last = matching[0];
-    // Collect sets for this exercise position (planExIdx match, then eid match as fallback)
-    let exSets = last.sets.filter(s => s.planExIdx === exIdx && s.eid === eid);
-    if (!exSets.length) exSets = last.sets.filter(s => s.eid === eid && !isWarmupSet(s, null));
+
+    // Carryover rule: include ALL sets for this exact position (warmup and worksets alike).
+    // Warmup-sets ARE excluded from vol/PR/badge stats (isWarmupSet guards there),
+    // but a user who changed a warmup weight deserves to see that change next session.
+    //
+    // Primary: exact planExIdx + eid match (preserves set-type separation)
+    let exSets = last.sets.filter(s =>
+      s.planExIdx === exIdx && s.eid === eid
+    );
+    // Fallback for old sessions without planExIdx: match eid only, same planExIdx or unknown
+    if (!exSets.length) {
+      exSets = last.sets.filter(s =>
+        s.eid === eid && (s.planExIdx == null || s.planExIdx === exIdx)
+      );
+    }
+    // Last resort: any set with matching eid (handles very old data)
+    if (!exSets.length) {
+      exSets = last.sets.filter(s => s.eid === eid);
+    }
     if (!exSets.length) return null;
-    // Return as fresh (undone, non-extra) sets preserving weight/reps per-set
+
+    // Return as fresh sets: done reset, extra cleared (previous extras become base sets).
+    // isWarmup is propagated from the saved set so isWarmupSet() keeps working on carryover.
     return exSets.map((s, i) => ({
       setN:      i + 1,
       reps:      s.reps,
       weight:    s.weight,
       done:      false,
-      planNote:  s.planNote || null,
+      planNote:  s.planNote  || null,
       planExIdx: exIdx,
+      ...(s.isWarmup ? { isWarmup: true } : {}),
       // extra intentionally omitted → previous extra sets become normal base sets
     }));
   };
@@ -3288,15 +3304,20 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     // Fix 1: iterate by instance key to keep duplicate exercises separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({
-        eid:       ex.eid,
-        setN:      s.setN,
-        reps:      s.reps,
-        weight:    s.weight,
-        planNote:  s.planNote  ?? (ex.note || null),
-        planExIdx: s.planExIdx ?? exIdx,
-        ...(s.extra ? {extra:true} : {}),
-      }));
+      (sets[key]||[]).filter(s=>s.done).forEach(s => {
+        const exercise = (allExercises||[]).find(e => e.id === ex.eid);
+        const warmup   = isWarmupSet(s, exercise);
+        allSets.push({
+          eid:       ex.eid,
+          setN:      s.setN,
+          reps:      s.reps,
+          weight:    s.weight,
+          planNote:  s.planNote  ?? (ex.note || null),
+          planExIdx: s.planExIdx ?? exIdx,
+          ...(warmup      ? { isWarmup: true  } : {}),
+          ...(s.extra     ? { extra:    true  } : {}),
+        });
+      });
     });
     if (allSets.length === 0) { setWarnEmpty(true); return; }
     setWarnEmpty(false); clearWorkoutDraft();
@@ -3310,7 +3331,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       <div style={{fontSize:30,fontWeight:900,color:T.accent,marginBottom:8}}>Stark gemacht!</div>
       <div style={{color:T.sub,fontSize:16,marginBottom:6}}>{fmt(elapsed)}</div>
       <div style={{color:T.muted,fontSize:13,marginBottom:40}}>
-        {Object.values(sets).flat().filter(s=>s.done).length} Sätze · {Math.round(vol(Object.values(sets).flat())).toLocaleString()} kg
+        {Object.values(sets).flat().filter(s=>s.done).length} Sätze · {Math.round(vol(Object.values(sets).flat(), allExercises)).toLocaleString()} kg
       </div>
       <Btn onClick={()=>setPhase("select")} full style={{padding:14}}>Neues Training</Btn>
     </div>
@@ -3587,11 +3608,11 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
       if(!ex||(ex.unitType&&ex.unitType!=="reps")) return null;
       const planEx={eid, weight:0, sets:3, reps:10};
       // Fix 2: use actual last-known weight so deload suggestion is non-zero
-      const history=getExercisePerformanceHistory(eid, sessions);
+      const history=getExercisePerformanceHistory(eid, sessions, allExercises);
       const lastKnownWeight = history.length>0 ? (history[history.length-1].sets[0]?.weight||0) : 0;
       const planExWithWeight = {...planEx, weight: lastKnownWeight};
-      const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings);
-      const stag=detectExerciseStagnation(eid,sessions,settings);
+      const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings,allExercises);
+      const stag=detectExerciseStagnation(eid,sessions,settings,allExercises);
       return { eid, name:ex.name, cat:ex.cat, suggestion:sug, stagnation:stag };
     }).filter(Boolean);
   },[sessions,allExercises,settings]);
@@ -3600,7 +3621,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const exObj     = useMemo(()=>selEx?(allExercises||[]).find(e=>e.id===selEx):null,[selEx,allExercises]);
   const exUnitType= exObj?.unitType||"reps";
   const isTimeEx  = exUnitType==="secs"||exUnitType==="mins";
-  const exHistory = useMemo(()=>selEx?getExHistory(sessions,selEx):[]   ,[sessions,selEx]);
+  const exHistory = useMemo(()=>selEx?getExHistory(sessions,selEx,allExercises):[]   ,[sessions,selEx,allExercises]);
   const timeHist  = useMemo(()=>selEx?getTimeExHistory(sessions,selEx):[] ,[sessions,selEx]);
 
   // Trend analysis for selected exercise
@@ -3617,7 +3638,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
       volPct:     pctChange(vl),
       rm1Pct:     pctChange(rm),
       slope:      calcTrend(wt),
-      bestSet:    getBestSet(sessions,selEx),
+      bestSet:    getBestSet(sessions,selEx,allExercises),
       best1RM:    Math.max(0,...rm),
       last30Sets: now30.length,
       latestWt:   wt[wt.length-1],
@@ -3643,7 +3664,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
             {detailSess.source&&<Badge color={T.orange} style={{marginBottom:8}}>{detailSess.source} Import</Badge>}
             <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{fmtD(detailSess.date)}</div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:detailSess.sets.filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(detailSess.sets)/100)/10).toFixed(1)}t`}].map(s=>(
+              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:detailSess.sets.filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(detailSess.sets,allExercises)/100)/10).toFixed(1)}t`}].map(s=>(
                 <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
                   <div style={{fontSize:18,fontWeight:900,color:T.text}}>{s.v}</div>
                   <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
@@ -3722,7 +3743,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         {sessions.length>2 && (
           <Card style={{marginBottom:12}}>
             <Lbl>VOLUMEN LETZTE 8 EINHEITEN</Lbl>
-            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={68}/>
+            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets,allExercises)).reverse()} color={T.blue} height={68}/>
           </Card>
         )}
 
@@ -4011,7 +4032,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
           <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16,fontSize:14}}>Noch keine Trainings.</div>
         )}
         {sessions.map(sess=>{
-          const v=vol(sess.sets);
+          const v=vol(sess.sets,allExercises);
           const dn=plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
           return(
             <Card key={sess.id} style={{marginBottom:8,padding:0,overflow:"hidden"}}>
@@ -4405,7 +4426,7 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
                 {plans.find(p=>p.id===lastSession.planId)?.days.find(d=>d.id===lastSession.dayId)?.name||"Training"}
               </div>
               <div style={{fontSize:12,color:T.sub}}>
-                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets)/100)/10).toFixed(1)}t
+                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets,allExercises)/100)/10).toFixed(1)}t
               </div>
             </div>
             <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastSession.date)}</div>
@@ -4454,7 +4475,7 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
 const SettingsScreen = ({
   settings, onUpdate,
   sessions, metrics, plans, cardio,
-  customExercises, exerciseOverrides,
+  customExercises, exerciseOverrides, allExercises,
   onReset, onImport,
 }) => {
   const [weekGoal,setWeekGoal] = useState(String(settings.weeklyGoal||3));
@@ -4462,7 +4483,7 @@ const SettingsScreen = ({
   const [importStatus,setImportStatus] = useState(null); // null | "ok" | "error" | string
   const importRef = useRef(null);
 
-  const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
+  const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets,allExercises),0),[sessions,allExercises]);
   const streak   = useMemo(()=>calcStreak(sessions,cardio),[sessions,cardio]);
 
   // ── Export ───────────────────────────────────────────
@@ -5008,7 +5029,7 @@ function App() {
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
       case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio} allExercises={allExercises}/>;
       case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
-      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
+      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} allExercises={allExercises} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
       default:             return null;
     }
   };
