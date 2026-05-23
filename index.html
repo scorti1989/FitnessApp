@@ -5256,6 +5256,12 @@ function App() {
   const allExercises = useMemo(() => [...ALL_EDB_BASE, ...customExercises], [customExercises]);
   const resolveEx = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
 
+  // Hide boot screen after first successful render
+  useEffect(() => {
+    const _boot = document.getElementById('boot-screen');
+    if (_boot) { _boot.style.opacity = '0'; setTimeout(() => _boot.remove(), 450); }
+  }, []); // runs once after mount
+
   // Auto-expire deload when activeDeloadUntil is in the past
   useEffect(() => {
     if (settings.activeDeloadUntil && new Date(settings.activeDeloadUntil) <= new Date()) {
@@ -5359,7 +5365,9 @@ function App() {
     setShowMore(false);
   };
 
-  const Screen = () => {
+  // Screen is rendered directly (not as an inline component) to avoid
+  // React unmounting/remounting on every App render (inline component bug).
+  const renderScreen = () => {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
       case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings} sessions={sessions}/>;
@@ -5384,7 +5392,7 @@ function App() {
         <span>● ● ●</span>
       </div>
       <div style={{paddingBottom:74,minHeight:"calc(100vh - 44px)",overflowY:"auto"}}>
-        <Screen/>
+        {renderScreen()}
       </div>
       {/* Punkt 8: Badge unlock overlay after training */}
       {newBadges.length>0&&(
@@ -5420,10 +5428,13 @@ function App() {
   );
 }
 
-    const root = ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
-  
-    // Hide boot screen once React mounts
-    const _boot=document.getElementById('boot-screen');
-    if(_boot){_boot.style.opacity='0';setTimeout(()=>_boot.remove(),450);}</script>
+    const _reactRoot = ReactDOM.createRoot(document.getElementById('root'));
+    _reactRoot.render(<ErrorBoundary><App/></ErrorBoundary>);
+    // Boot screen is now hidden from inside App's first useEffect (see App component)
+    // Fallback: hide after 3s in case React never mounts (e.g. parse error caught by onerror)
+    setTimeout(() => {
+      const _boot = document.getElementById('boot-screen');
+      if (_boot) { _boot.style.opacity = '0'; setTimeout(() => _boot.remove(), 450); }
+    }, 3000);</script>
 </body>
 </html>
