@@ -519,6 +519,29 @@ function getExercisePerformanceHistory(eid, sessions) {
   return history;
 }
 
+// Returns the most recent WORK sets (warmups excluded) for an exercise across ALL sessions.
+// Plan-independent: works for any plan, so switching plans still picks up last real values.
+function getLastWorkSets(eid, sessions) {
+  if (!eid || !sessions?.length) return null;
+  const sorted = [...sessions].sort((a,b) => new Date(b.date) - new Date(a.date));
+  for (const sess of sorted) {
+    const allEid = (sess.sets||[]).filter(s => s.eid===eid && (s.weight||0) > 0);
+    if (!allEid.length) continue;
+    const weights = [...new Set(allEid.map(s=>s.weight))].sort((a,b)=>a-b);
+    const minW = weights[0];
+    const multi = weights.length > 1;
+    const work = allEid.filter(s => {
+      if (s.isWarmup) return false;
+      const note = (s.planNote||s.note||'').toLowerCase();
+      if (note.includes('eingewöhnung') || note.includes('warm')) return false;
+      if (multi && s.weight === minW) return false;
+      return true;
+    });
+    if (work.length) return work; // [{reps, weight, ...}, ...]
+  }
+  return null;
+}
+
 // Core algorithm: calculate progression suggestion for one exercise
 // Returns: { action, suggestedWeight, suggestedReps, reason, isDeload, confidence }
 function calculateProgressionSuggestion(planExercise, exercise, sessions, settings) {
@@ -1336,6 +1359,13 @@ const AudioEngine = (() => {
       tone(660, 0.30, 0.55, 0.0);
       tone(880, 0.45, 0.40, 0.08);
     },
+
+    // Drei kurze Beeps – Signal dass Übungszeit überschritten wurde
+    tripleBeep: () => {
+      tone(1100, 0.08, 0.35, 0.00);
+      tone(1100, 0.08, 0.35, 0.18);
+      tone(1100, 0.08, 0.35, 0.36);
+    },
   };
 })();
 
@@ -1468,16 +1498,22 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
       setElapsed(prev => {
         const next = prev + 1;
         const remaining = targetSecs - next;
+        const overtime  = next > targetSecs;
 
-        // Ticks in final tickStart seconds before target
-        if (remaining > 0 && remaining <= tickStart && !ticked.current.has(remaining)) {
+        // Ticks in final tickStart seconds BEFORE target (countdown warning)
+        if (!overtime && remaining > 0 && remaining <= tickStart && !ticked.current.has(remaining)) {
           ticked.current.add(remaining);
           AudioEngine.tick();
         }
-        // Done sound exactly at target (once)
+        // Done sound exactly when target is reached (once)
         if (next === targetSecs && !donePlayed.current) {
           donePlayed.current = true;
           AudioEngine.done();
+        }
+        // Triple beep every 30s AFTER target – signals how much extra time achieved
+        if (overtime && (next - targetSecs) % 30 === 0 && !ticked.current.has(next)) {
+          ticked.current.add(next);
+          AudioEngine.tripleBeep();
         }
         return next;
       });
@@ -1495,7 +1531,7 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
     : `${ds}`;
   const pct = Math.min(100, (elapsed / targetSecs) * 100);
   const r = 30, circ = 2*Math.PI*r;
-  const nearEnd = remaining > 0 && remaining <= tickStart;
+  const nearEnd = !overtime && remaining > 0 && remaining <= tickStart;
 
   return (
     <div style={{
@@ -1913,6 +1949,7 @@ const ExerciseDBScreen = ({
   customExercises, setCustomExercises,
   exerciseOverrides, setExerciseOverrides,
   onSelect, selectable, selected=[],
+  sessions=[],
   initialDetailId,   // Fix 1: open directly on this exercise id
 }) => {
   const [cat,setCat]   = useState("Alle");
@@ -2086,6 +2123,50 @@ const ExerciseDBScreen = ({
             </div>
           )}
         </Card>
+
+        {/* Last training values */}
+        {(()=>{
+          const lastWork = getLastWorkSets(base.id, sessions);
+          if (!lastWork || !lastWork.length) return null;
+          const w = lastWork[0].weight;
+          const repsArr = lastWork.map(s=>s.reps);
+          const sameReps = repsArr.every(r=>r===repsArr[0]);
+          return (
+            <Card style={{marginBottom:10, border:`1px solid ${T.teal}44`}}>
+              <div style={{fontSize:11,fontWeight:800,color:T.teal,marginBottom:8,letterSpacing:0.3}}>
+                📊 LETZTES TRAINING
+              </div>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                {w > 0 && (
+                  <div style={{textAlign:"center",flex:1}}>
+                    <div style={{fontSize:20,fontWeight:900,color:T.text}}>{w}</div>
+                    <div style={{fontSize:10,color:T.muted,fontWeight:700}}>KG</div>
+                  </div>
+                )}
+                <div style={{textAlign:"center",flex:1}}>
+                  <div style={{fontSize:20,fontWeight:900,color:T.text}}>
+                    {sameReps ? repsArr[0] : `${Math.min(...repsArr)}–${Math.max(...repsArr)}`}
+                  </div>
+                  <div style={{fontSize:10,color:T.muted,fontWeight:700}}>WDH</div>
+                </div>
+                <div style={{textAlign:"center",flex:1}}>
+                  <div style={{fontSize:20,fontWeight:900,color:T.text}}>{lastWork.length}</div>
+                  <div style={{fontSize:10,color:T.muted,fontWeight:700}}>SÄTZE</div>
+                </div>
+              </div>
+              {!sameReps && (
+                <div style={{marginTop:8,display:"flex",gap:4,flexWrap:"wrap"}}>
+                  {repsArr.map((r,i)=>(
+                    <span key={i} style={{fontSize:12,color:T.sub,background:T.bgAlt,
+                      borderRadius:6,padding:"2px 8px",fontWeight:600}}>
+                      Satz {i+1}: {r} Wdh{w>0?` · ${w} kg`:""}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </Card>
+          );
+        })()}
 
         {/* Actions */}
         {selectable&&(
@@ -2346,10 +2427,17 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
   const updDayName=(i,v)=> setDays(d=>d.map((x,j)=>j===i?{...x,name:v}:x));
 
   const addEx = ex => {
-    // Punkt 4: auto-set rest from settings rules
     const defaultRest = getDefaultRestForExercise(ex, settings);
+    // Pre-fill from last real training session for this exercise (any plan)
+    const lastWork = getLastWorkSets(ex.id, sessions||[]);
+    const prefillWeight = lastWork ? lastWork[0].weight : 0;
+    const prefillReps   = lastWork ? Math.min(...lastWork.map(s=>s.reps)) : 10;
+    const prefillSets   = lastWork ? lastWork.length : 3;
     setDays(d=>d.map((x,i)=>i===activeDay
-      ?{...x,exercises:[...x.exercises,{eid:ex.id,sets:3,reps:10,weight:0,rest:defaultRest,note:""}]}
+      ?{...x,exercises:[...x.exercises,{
+          eid:ex.id, sets:prefillSets, reps:prefillReps,
+          weight:prefillWeight, rest:defaultRest, note:"",
+        }]}
       :x));
     setShowDB(false);
   };
@@ -2364,16 +2452,30 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
       }),
     }:day));
   };
-  // Progression anwenden: update planned weights based on last performance
-  const applyProgression = () => {
-    if (!window.confirm("Geplante Gewichte anhand deiner bisherigen Leistung aktualisieren?\n\nBestehende Einträge werden überschrieben.")) return;
+  // Letztes Training übernehmen: weight + reps + sets aus echter letzter Session (planunabhängig)
+  const applyLastSession = () => {
+    if (!window.confirm(
+      "Werte aus letztem Training übernehmen?\n\n" +
+      "Gewicht, Wiederholungen und Satzanzahl werden für alle Übungen " +
+      "dieses Tages aus dem jeweils letzten Training aktualisiert.\n\n" +
+      "Übungen ohne Verlauf bleiben unverändert."
+    )) return;
     setDays(d=>d.map((day,i)=>i!==activeDay?day:{
       ...day,
       exercises:day.exercises.map(ex=>{
-        const exercise=(allExercises||[]).find(e=>e.id===ex.eid);
-        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings);
-        if(!suggestion||suggestion.suggestedWeight<=0) return ex;
-        return {...ex, weight:suggestion.suggestedWeight};
+        const lastWork = getLastWorkSets(ex.eid, sessions||[]);
+        if (!lastWork || !lastWork.length) return ex; // no history → keep unchanged
+        // For warmup entries: only update weight (keep sets=1 and its reps)
+        if (ex.isWarmup) {
+          return {...ex, weight: lastWork[0].weight};
+        }
+        const minReps = Math.min(...lastWork.map(s=>s.reps));
+        return {
+          ...ex,
+          sets:   lastWork.length,
+          reps:   minReps,          // plan stores one reps value = conservative (lowest set)
+          weight: lastWork[0].weight,
+        };
       }),
     }));
   };
@@ -2460,6 +2562,29 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
             <button onClick={()=>remDay(activeDay)} style={{background:"none",border:"none",cursor:"pointer",color:T.red,fontSize:18,padding:4}}>🗑</button>
           </div>
 
+          {/* Progression & Deload Hinweis */}
+          {(()=>{
+            const ps = getProgressionSettings(settings);
+            if (ps.enabled) return null;
+            return (
+              <div style={{
+                padding:"10px 12px", borderRadius:10, marginBottom:8,
+                background:T.teal+"14", border:`1px solid ${T.teal}33`,
+                display:"flex", alignItems:"center", gap:10,
+              }}>
+                <span style={{fontSize:16}}>📈</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:700,color:T.teal,marginBottom:1}}>
+                    Progression & Deload deaktiviert
+                  </div>
+                  <div style={{fontSize:11,color:T.sub,lineHeight:1.4}}>
+                    Aktiviere automatische Vorschläge unter <b style={{color:T.text}}>Mehr → Einstellungen → Progression & Deload</b>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           {days[activeDay].exercises.length===0&&(
             <div style={{textAlign:"center",padding:"20px 0",color:T.muted,fontSize:13,border:`1px dashed ${T.border}`,borderRadius:12,marginBottom:10}}>
               Noch keine Übungen
@@ -2519,16 +2644,17 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
               </div>
             );
           })}
-          <div style={{display:"flex",gap:8,marginTop:6}}>
-            <Btn v="secondary" onClick={()=>setShowDB(true)} style={{flex:2}}>+ Übung hinzufügen</Btn>
-            <Btn v="ghost" onClick={applyRestRules} style={{flex:1,fontSize:11,padding:"8px 4px"}}
+          <div style={{display:"flex",gap:8,marginTop:6,flexWrap:"wrap"}}>
+            <Btn v="secondary" onClick={()=>setShowDB(true)} style={{flex:"2 1 120px"}}>+ Übung hinzufügen</Btn>
+            <Btn v="ghost" onClick={applyRestRules} style={{flex:"1 1 60px",fontSize:11,padding:"8px 4px"}}
               title="Pausen aller Übungen dieses Tages nach den Einstellungen setzen">
               ⏱ Pausen
             </Btn>
-            {getProgressionSettings(settings).enabled&&(sessions||[]).length>=getProgressionSettings(settings).minSessionsBeforeSuggestion&&(
-              <Btn v="ghost" onClick={applyProgression} style={{flex:1,fontSize:11,padding:"8px 4px"}}
-                title="Gewichte anhand letzter Trainingsleistung aktualisieren">
-                📈 Prog.
+            {(sessions||[]).length > 0 && (
+              <Btn v="ghost" onClick={applyLastSession}
+                style={{flex:"1 1 80px",fontSize:11,padding:"8px 4px",color:T.teal,borderColor:T.teal+"66"}}
+                title="Gewicht, Wdh und Satzanzahl aus letztem Training übernehmen (planunabhängig)">
+                📋 Letztes Training
               </Btn>
             )}
           </div>
@@ -4965,7 +5091,7 @@ function App() {
       case "progress":     return <ProgressScreen sessions={sessions} plans={plans} cardio={cardio} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} onDeleteSession={id=>setSessions(p=>p.filter(x=>x.id!==id))}/>;
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
       case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio} allExercises={allExercises}/>;
-      case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
+      case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} sessions={sessions}/>;
       case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
       default:             return null;
     }
