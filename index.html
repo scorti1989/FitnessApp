@@ -2464,17 +2464,21 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
       ...day,
       exercises:day.exercises.map(ex=>{
         const lastWork = getLastWorkSets(ex.eid, sessions||[]);
-        if (!lastWork || !lastWork.length) return ex; // no history → keep unchanged
-        // For warmup entries: only update weight (keep sets=1 and its reps)
+        if (!lastWork || !lastWork.length) return ex;
         if (ex.isWarmup) {
           return {...ex, weight: lastWork[0].weight};
         }
-        const minReps = Math.min(...lastWork.map(s=>s.reps));
+        const newRows = lastWork.map((s, i) => ({
+          reps: s.reps, weight: s.weight,
+          isWarmup: i === 0 && ex.isWarmup,
+        }));
+        const minReps = Math.min(...newRows.map(r=>r.reps));
         return {
           ...ex,
-          sets:   lastWork.length,
-          reps:   minReps,          // plan stores one reps value = conservative (lowest set)
-          weight: lastWork[0].weight,
+          sets:    newRows.length,
+          reps:    minReps,
+          weight:  newRows[0].weight,
+          setRows: newRows,
         };
       }),
     }));
@@ -2490,6 +2494,73 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
   const toggleWarmup= (di,ei) => setDays(d=>d.map((x,i)=>i===di?{
     ...x,exercises:x.exercises.map((e,j)=>j===ei?{...e,isWarmup:!e.isWarmup}:e)
   }:x));
+
+  // Per-set helpers
+  // getSetRows: expand a plan exercise into editable set rows
+  const getSetRows = ex => {
+    const base = ex.setRows || [];
+    const count = ex.sets || 1;
+    return Array.from({length: count}, (_, i) => ({
+      reps:     base[i]?.reps     ?? ex.reps   ?? 10,
+      weight:   base[i]?.weight   ?? ex.weight  ?? 0,
+      isWarmup: base[i]?.isWarmup ?? (i === 0 && ex.isWarmup) ?? false,
+    }));
+  };
+
+  const updSetRow = (di, ei, si, field, val) => setDays(d => d.map((day, i) => {
+    if (i !== di) return day;
+    return {
+      ...day,
+      exercises: day.exercises.map((ex, j) => {
+        if (j !== ei) return ex;
+        const rows = getSetRows(ex);
+        rows[si] = { ...rows[si], [field]: field === 'isWarmup' ? val : (parseFloat(val) || 0) };
+        // Sync top-level sets/reps/weight from rows for backwards compat
+        return {
+          ...ex,
+          sets:    rows.length,
+          reps:    Math.min(...rows.map(r => r.reps)),
+          weight:  rows[0]?.weight ?? ex.weight,
+          isWarmup: rows[0]?.isWarmup ?? false,
+          setRows: rows,
+        };
+      }),
+    };
+  }));
+
+  const addSetRow = (di, ei) => setDays(d => d.map((day, i) => {
+    if (i !== di) return day;
+    return {
+      ...day,
+      exercises: day.exercises.map((ex, j) => {
+        if (j !== ei) return ex;
+        const rows = getSetRows(ex);
+        const last = rows[rows.length - 1] || {reps: ex.reps||10, weight: ex.weight||0, isWarmup:false};
+        const newRows = [...rows, {reps: last.reps, weight: last.weight, isWarmup: false}];
+        return { ...ex, sets: newRows.length, setRows: newRows };
+      }),
+    };
+  }));
+
+  const removeSetRow = (di, ei, si) => setDays(d => d.map((day, i) => {
+    if (i !== di) return day;
+    return {
+      ...day,
+      exercises: day.exercises.map((ex, j) => {
+        if (j !== ei) return ex;
+        const rows = getSetRows(ex).filter((_, k) => k !== si);
+        if (rows.length === 0) return ex; // keep at least 1
+        return {
+          ...ex,
+          sets:    rows.length,
+          reps:    Math.min(...rows.map(r => r.reps)),
+          weight:  rows[0]?.weight ?? ex.weight,
+          isWarmup: rows[0]?.isWarmup ?? false,
+          setRows: rows,
+        };
+      }),
+    };
+  }));
   // Move exercise up/down
   const moveEx = (di,ei,dir) => setDays(d=>d.map((day,i)=>{
     if(i!==di) return day;
@@ -2592,33 +2663,34 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
           )}
 
           {days[activeDay].exercises.map((ex,j)=>{
-            const e=allExercises.find(x=>x.id===ex.eid);
+            const e = allExercises.find(x=>x.id===ex.eid);
+            const override = exerciseOverrides?.[ex.eid]||{};
+            const resolved = {...(e||{}), ...override};
+            const ut = resolved.unitType || "reps+kg";
+            const isTimeBased = ut==="secs"||ut==="mins";
+            const isRepsOnly  = ut==="reps";
+            const rows = getSetRows(ex);
+            const unitLabel = ut==="secs"?"Sek":ut==="mins"?"Min":"Wdh";
+            const anyWarmup = rows.some(r=>r.isWarmup);
+
             return (
-              <div key={`${ex.eid}-${j}`} style={{background:T.bgAlt,borderRadius:12,padding:12,marginBottom:8,border:`1px solid ${T.border}`}}>
-                {/* Header */}
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+              <div key={`${ex.eid}-${j}`} style={{
+                background:T.bgAlt, borderRadius:12, padding:12, marginBottom:8,
+                border:`1px solid ${anyWarmup ? T.orange+"44" : T.border}`,
+              }}>
+                {/* ── Header ── */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{display:"flex",alignItems:"center",gap:6}}>
-                      <div style={{fontSize:14,fontWeight:700,color:T.text}}>{e?.name||"Unbekannte Übung"}</div>
-                      {ex.isWarmup&&<span style={{fontSize:9,fontWeight:800,color:T.orange,background:T.orange+"22",border:`1px solid ${T.orange}44`,borderRadius:4,padding:"1px 5px"}}>WARM</span>}
+                    <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                      <div style={{fontSize:14,fontWeight:700,color:T.text}}>{resolved.name||"Unbekannte Übung"}</div>
+                      {anyWarmup&&<span style={{fontSize:9,fontWeight:800,color:T.orange,background:T.orange+"22",border:`1px solid ${T.orange}44`,borderRadius:4,padding:"1px 5px"}}>WARM</span>}
                     </div>
-                    <div style={{fontSize:11,color:T.sub}}>{e?.cat} · {e?.eq}</div>
+                    <div style={{fontSize:11,color:T.sub,marginTop:1}}>{e?.cat} · {e?.eq}</div>
                   </div>
-                  <div style={{display:"flex",gap:4,flexShrink:0}}>
-                    {/* Info/Edit button – opens exercise detail editor */}
-                    <button onClick={()=>setInfoExId(ex.eid)} title="Beschreibung / Video / Bild bearbeiten"
+                  <div style={{display:"flex",gap:4,flexShrink:0,marginLeft:6}}>
+                    <button onClick={()=>setInfoExId(ex.eid)} title="Übungsdetails"
                       style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:6,
                         padding:"2px 8px",cursor:"pointer",color:T.blue,fontSize:12,fontWeight:700}}>ℹ</button>
-                    <button
-                      onClick={()=>toggleWarmup(activeDay,j)}
-                      title={ex.isWarmup ? "Als Arbeitssatz markieren" : "Als Aufwärmsatz markieren"}
-                      style={{
-                        background: ex.isWarmup ? T.orange+"33" : T.bgInput,
-                        border: `1px solid ${ex.isWarmup ? T.orange : T.border}`,
-                        borderRadius:6, padding:"2px 7px", cursor:"pointer",
-                        color: ex.isWarmup ? T.orange : T.muted,
-                        fontSize:11, fontWeight:700,
-                      }}>🔥</button>
                     <button onClick={()=>moveEx(activeDay,j,-1)} disabled={j===0}
                       style={{background:"none",border:`1px solid ${T.border}`,borderRadius:6,padding:"2px 7px",cursor:"pointer",color:j===0?T.muted:T.sub,fontSize:12}}>↑</button>
                     <button onClick={()=>moveEx(activeDay,j,+1)} disabled={j===days[activeDay].exercises.length-1}
@@ -2627,20 +2699,117 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                       style={{background:"none",border:"none",cursor:"pointer",color:T.red,fontSize:16,padding:"2px 4px"}}>✕</button>
                   </div>
                 </div>
-                {/* Set fields */}
-                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:8}}>
-                  {[{l:"Sätze",f:"sets",v:ex.sets},{l:(()=>{const e=(allExercises||[]).find(x=>x.id===ex.eid);const ut=e?.unitType||"reps";return ut==="secs"?"Sek":ut==="mins"?"Min":"Wdh";})(),f:"reps",v:ex.reps},{l:"kg",f:"weight",v:ex.weight},{l:"Pause (s)",f:"rest",v:ex.rest}].map(fi=>(
-                    <div key={fi.f}>
-                      <div style={{fontSize:9,color:T.muted,textAlign:"center",marginBottom:3}}>{fi.l}</div>
-                      <input type="number" value={fi.v} onChange={e=>updEx(activeDay,j,fi.f,e.target.value)}
-                        style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 4px",color:T.text,fontSize:14,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
-                    </div>
-                  ))}
+
+                {/* ── Pause & Note row ── */}
+                <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:5,flex:1}}>
+                    <span style={{fontSize:11,color:T.muted,whiteSpace:"nowrap"}}>⏱ Pause</span>
+                    <input type="number" value={ex.rest||0}
+                      onChange={e=>updEx(activeDay,j,"rest",e.target.value)}
+                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                        padding:"5px 6px",color:T.text,fontSize:13,fontWeight:700,
+                        width:56,textAlign:"center",boxSizing:"border-box"}}/>
+                    <span style={{fontSize:11,color:T.muted}}>Sek</span>
+                  </div>
+                  <div style={{flex:2}}>
+                    <input value={ex.note||""} onChange={e=>updExNote(activeDay,j,e.target.value)}
+                      placeholder="Notiz zur Übung…"
+                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                        padding:"5px 8px",color:T.text,fontSize:12,width:"100%",
+                        boxSizing:"border-box",outline:"none"}}/>
+                  </div>
                 </div>
-                {/* Note */}
-                <input value={ex.note||""} onChange={e=>updExNote(activeDay,j,e.target.value)}
-                  placeholder="Notiz (optional)"
-                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 10px",color:T.text,fontSize:12,width:"100%",boxSizing:"border-box",outline:"none"}}/>
+
+                {/* ── Per-set rows ── */}
+                {rows.map((row, si) => {
+                  const warmupColor = row.isWarmup ? T.orange : null;
+                  return (
+                    <div key={si} style={{
+                      display:"grid",
+                      gridTemplateColumns: isTimeBased||isRepsOnly
+                        ? "28px 1fr 32px 32px"
+                        : "28px 1fr 20px 1fr 32px 32px",
+                      gap:5, alignItems:"center", marginBottom:6,
+                    }}>
+                      {/* Set badge */}
+                      <div style={{
+                        width:28,height:32,borderRadius:7,fontSize:11,fontWeight:800,
+                        display:"flex",alignItems:"center",justifyContent:"center",
+                        background: row.isWarmup ? T.orange+"22" : T.bgInput,
+                        color: row.isWarmup ? T.orange : T.muted,
+                        border:`1px solid ${row.isWarmup ? T.orange+"55" : T.border}`,
+                      }}>{si+1}</div>
+
+                      {/* Fields */}
+                      {isTimeBased ? (
+                        <div style={{display:"flex",alignItems:"center",gap:4}}>
+                          <input type="number" value={row.reps}
+                            onChange={e=>updSetRow(activeDay,j,si,"reps",e.target.value)}
+                            style={{background:T.bgInput,border:`1px solid ${T.teal}55`,borderRadius:7,
+                              padding:"6px 4px",color:T.teal,fontSize:14,fontWeight:700,
+                              textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                          <span style={{fontSize:11,color:T.teal,fontWeight:700,whiteSpace:"nowrap"}}>{unitLabel}</span>
+                        </div>
+                      ) : isRepsOnly ? (
+                        <div style={{display:"flex",alignItems:"center",gap:4}}>
+                          <input type="number" value={row.reps}
+                            onChange={e=>updSetRow(activeDay,j,si,"reps",e.target.value)}
+                            style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                              padding:"6px 4px",color:T.text,fontSize:14,fontWeight:700,
+                              textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                          <span style={{fontSize:11,color:T.sub,fontWeight:700}}>Wdh</span>
+                        </div>
+                      ) : (<>
+                        <div style={{display:"flex",alignItems:"center",gap:3}}>
+                          <input type="number" value={row.weight}
+                            onChange={e=>updSetRow(activeDay,j,si,"weight",e.target.value)}
+                            style={{background:T.bgInput,border:`1px solid ${warmupColor ? T.orange+"55" : T.border}`,borderRadius:7,
+                              padding:"6px 4px",color:warmupColor||T.text,fontSize:14,fontWeight:700,
+                              textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                          <span style={{fontSize:11,color:T.sub,fontWeight:700}}>kg</span>
+                        </div>
+                        <span style={{textAlign:"center",color:T.muted,fontSize:12}}>×</span>
+                        <div style={{display:"flex",alignItems:"center",gap:3}}>
+                          <input type="number" value={row.reps}
+                            onChange={e=>updSetRow(activeDay,j,si,"reps",e.target.value)}
+                            style={{background:T.bgInput,border:`1px solid ${warmupColor ? T.orange+"55" : T.border}`,borderRadius:7,
+                              padding:"6px 4px",color:warmupColor||T.text,fontSize:14,fontWeight:700,
+                              textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                          <span style={{fontSize:11,color:T.sub,fontWeight:700}}>Wdh</span>
+                        </div>
+                      </>)}
+
+                      {/* Warmup toggle */}
+                      <button
+                        onClick={()=>updSetRow(activeDay,j,si,"isWarmup",!row.isWarmup)}
+                        title={row.isWarmup?"Als Arbeitssatz":"Als Aufwärmsatz"}
+                        style={{
+                          width:32,height:32,borderRadius:7,border:`1px solid ${row.isWarmup?T.orange:T.border}`,
+                          background:row.isWarmup?T.orange+"33":T.bgInput,
+                          color:row.isWarmup?T.orange:T.muted,
+                          fontSize:13,cursor:"pointer",
+                        }}>🔥</button>
+
+                      {/* Remove set */}
+                      <button
+                        onClick={()=>removeSetRow(activeDay,j,si)}
+                        title="Satz entfernen"
+                        style={{
+                          width:32,height:32,borderRadius:7,border:"none",
+                          background:"none",color:T.muted,fontSize:15,cursor:"pointer",
+                        }}>✕</button>
+                    </div>
+                  );
+                })}
+
+                {/* ── + Satz Button ── */}
+                <button
+                  onClick={()=>addSetRow(activeDay,j)}
+                  style={{
+                    width:"100%",marginTop:4,padding:"6px 0",
+                    background:T.accent+"18",border:`1px dashed ${T.accent}55`,
+                    borderRadius:8,color:T.accent,fontSize:12,fontWeight:700,cursor:"pointer",
+                  }}>+ Satz</button>
               </div>
             );
           })}
@@ -3334,17 +3503,20 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
           )
         : [];
 
-      // Build per-set reps + weight: use last session value for each slot, fall back to plan
+      // Build per-set reps + weight:
+      // Priority: 1) last session values (per planExIdx), 2) plan setRows, 3) plan reps/weight
+      const planRows = ex.setRows || [];
       init[key] = Array.from({length: ex.sets}, (_, i) => {
-        const prev = lastSets[i]; // may be undefined if last session had fewer sets
+        const prev    = lastSets[i];
+        const planRow = planRows[i];
         return {
           setN:     i+1,
-          reps:     prev ? prev.reps   : ex.reps,
-          weight:   prev ? prev.weight : ex.weight,
+          reps:     prev ? prev.reps   : (planRow?.reps   ?? ex.reps),
+          weight:   prev ? prev.weight : (planRow?.weight ?? ex.weight),
           done:     false,
           planNote:  ex.note || null,
           planExIdx: exIdx,
-          isWarmup:  ex.isWarmup || false,
+          isWarmup:  planRow?.isWarmup ?? (i === 0 && !!ex.isWarmup),
         };
       });
     });
