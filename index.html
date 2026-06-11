@@ -3189,17 +3189,38 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     setPlanId(pId); setDayId(dId);
     const day = activePlans.find(p=>p.id===pId)?.days.find(d=>d.id===dId);
     if (!day) return;
+
+    // Find the most recent session for this exact plan day to carry over per-set reps+weight
+    const lastMatchSession = (sessions||[]).find(s => s.planId===pId && s.dayId===dId);
+
     const init = {};
-    // Fix 1: key by instance position so duplicate exercises stay separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      init[key] = Array.from({length: ex.sets}, (_, i) => ({
-        setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
-        // Copy plan-level note + position so progression logic can exclude warmup sets
-        planNote:  ex.note || null,
-        planExIdx: exIdx,
-        isWarmup:  ex.isWarmup || false,
-      }));
+
+      // Collect last session's sets for this exact exercise instance.
+      // Match by planExIdx (same position in plan) so warmup and work entries
+      // don't bleed into each other. Fall back to eid-only if planExIdx missing.
+      const lastSets = lastMatchSession
+        ? (lastMatchSession.sets||[]).filter(s =>
+            s.eid === ex.eid &&
+            s.done !== false &&
+            (s.planExIdx !== undefined ? s.planExIdx === exIdx : true)
+          )
+        : [];
+
+      // Build per-set reps + weight: use last session value for each slot, fall back to plan
+      init[key] = Array.from({length: ex.sets}, (_, i) => {
+        const prev = lastSets[i]; // may be undefined if last session had fewer sets
+        return {
+          setN:     i+1,
+          reps:     prev ? prev.reps   : ex.reps,
+          weight:   prev ? prev.weight : ex.weight,
+          done:     false,
+          planNote:  ex.note || null,
+          planExIdx: exIdx,
+          isWarmup:  ex.isWarmup || false,
+        };
+      });
     });
     setSets(init); setPhase("active");
   };
