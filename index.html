@@ -626,27 +626,8 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
     };
   }
 
-  // Below rep range minimum – consider backing off slightly
-  if (minReps < repRange.min - 2 && lastSets.length >= 2) {
-    return {
-      action:          "hold",
-      suggestedWeight: lastWeight,
-      suggestedReps:   repRange.min,
-      reason:          "Gewicht halten – sauber ausführen",
-      isDeload:        false,
-      confidence:      "medium",
-    };
-  }
-
-  // On track – hold weight
-  return {
-    action:          "hold",
-    suggestedWeight: lastWeight,
-    suggestedReps:   repRange.min,
-    reason:          "Solide Leistung – weiter so",
-    isDeload:        false,
-    confidence:      "low",
-  };
+  // Not ready to progress and not stagnating → no suggestion needed
+  return null;
 }
 
 // Detect stagnation for one exercise over last N sessions
@@ -2401,8 +2382,11 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
   const updEx    = (di,ei,f,v) => setDays(d=>d.map((x,i)=>i===di?{
     ...x,exercises:x.exercises.map((e,j)=>j===ei?{...e,[f]:isNaN(Number(v))?v:Number(v)}:e)
   }:x));
-  const updExNote= (di,ei,v) => setDays(d=>d.map((x,i)=>i===di?{
+  const updExNote   = (di,ei,v) => setDays(d=>d.map((x,i)=>i===di?{
     ...x,exercises:x.exercises.map((e,j)=>j===ei?{...e,note:v}:e)
+  }:x));
+  const toggleWarmup= (di,ei) => setDays(d=>d.map((x,i)=>i===di?{
+    ...x,exercises:x.exercises.map((e,j)=>j===ei?{...e,isWarmup:!e.isWarmup}:e)
   }:x));
   // Move exercise up/down
   const moveEx = (di,ei,dir) => setDays(d=>d.map((day,i)=>{
@@ -2489,7 +2473,10 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                 {/* Header */}
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:14,fontWeight:700,color:T.text}}>{e?.name||"Unbekannte Übung"}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      <div style={{fontSize:14,fontWeight:700,color:T.text}}>{e?.name||"Unbekannte Übung"}</div>
+                      {ex.isWarmup&&<span style={{fontSize:9,fontWeight:800,color:T.orange,background:T.orange+"22",border:`1px solid ${T.orange}44`,borderRadius:4,padding:"1px 5px"}}>WARM</span>}
+                    </div>
                     <div style={{fontSize:11,color:T.sub}}>{e?.cat} · {e?.eq}</div>
                   </div>
                   <div style={{display:"flex",gap:4,flexShrink:0}}>
@@ -2497,6 +2484,16 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                     <button onClick={()=>setInfoExId(ex.eid)} title="Beschreibung / Video / Bild bearbeiten"
                       style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:6,
                         padding:"2px 8px",cursor:"pointer",color:T.blue,fontSize:12,fontWeight:700}}>ℹ</button>
+                    <button
+                      onClick={()=>toggleWarmup(activeDay,j)}
+                      title={ex.isWarmup ? "Als Arbeitssatz markieren" : "Als Aufwärmsatz markieren"}
+                      style={{
+                        background: ex.isWarmup ? T.orange+"33" : T.bgInput,
+                        border: `1px solid ${ex.isWarmup ? T.orange : T.border}`,
+                        borderRadius:6, padding:"2px 7px", cursor:"pointer",
+                        color: ex.isWarmup ? T.orange : T.muted,
+                        fontSize:11, fontWeight:700,
+                      }}>🔥</button>
                     <button onClick={()=>moveEx(activeDay,j,-1)} disabled={j===0}
                       style={{background:"none",border:`1px solid ${T.border}`,borderRadius:6,padding:"2px 7px",cursor:"pointer",color:j===0?T.muted:T.sub,fontSize:12}}>↑</button>
                     <button onClick={()=>moveEx(activeDay,j,+1)} disabled={j===days[activeDay].exercises.length-1}
@@ -2730,6 +2727,7 @@ const WorkoutExerciseCard = ({
   const ps = getProgressionSettings(settings);
   const suggestion = useMemo(() => {
     if (!ps.showSuggestionsInWorkout || isTimeBased || isRepsOnly) return null;
+    if (planEx?.isWarmup) return null;  // Aufwärmsätze nie Progression/Deload anzeigen
     return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planEx?.eid, planExIdx, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
@@ -2830,6 +2828,11 @@ const WorkoutExerciseCard = ({
           <div style={{fontSize:11,color:T.teal,marginBottom:6,padding:"4px 8px",
             background:T.teal+"15",borderRadius:6,border:`1px solid ${T.teal}33`}}>
             📌 {resolved.trainingsnotiz}
+          </div>
+        )}
+        {planEx.isWarmup&&(
+          <div style={{fontSize:10,color:T.orange,fontWeight:700,marginBottom:4}}>
+            🔥 Eingewöhnungssatz
           </div>
         )}
         {planEx.note&&(
@@ -3193,8 +3196,9 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       init[key] = Array.from({length: ex.sets}, (_, i) => ({
         setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
         // Copy plan-level note + position so progression logic can exclude warmup sets
-        planNote: ex.note || null,
+        planNote:  ex.note || null,
         planExIdx: exIdx,
+        isWarmup:  ex.isWarmup || false,
       }));
     });
     setSets(init); setPhase("active");
