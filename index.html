@@ -25,145 +25,7 @@
   </style>
 </head>
 <body>
-  <!-- Loading screen shown BEFORE Babel parses the JSX (can take 2-4s on mobile) -->
-  <div id="boot-screen" style="
-    position:fixed;inset:0;background:#07070F;
-    display:flex;flex-direction:column;align-items:center;justify-content:center;
-    font-family:-apple-system,Helvetica Neue,sans-serif;z-index:99999;
-    transition:opacity 0.4s;">
-    <div style="font-size:48px;margin-bottom:16px;">🏋</div>
-    <div style="color:#C8FF00;font-size:22px;font-weight:900;letter-spacing:2px;margin-bottom:8px;">FITTRACK</div>
-    <div style="color:#444466;font-size:13px;">Lädt…</div>
-  </div>
-  <!-- Error screen for Babel parse failures (shown before React mounts) -->
-  <div id="parse-error" style="
-    display:none;position:fixed;inset:0;background:#07070F;
-    padding:40px 24px;font-family:-apple-system,sans-serif;color:#E8E8F0;
-    flex-direction:column;align-items:center;justify-content:flex-start;padding-top:80px;">
-    <div style="font-size:40px;margin-bottom:16px;">⚠️</div>
-    <div style="color:#FF4444;font-size:18px;font-weight:800;margin-bottom:12px;">App konnte nicht starten</div>
-    <div id="parse-error-msg" style="color:#666680;font-size:13px;text-align:center;max-width:300px;line-height:1.6;margin-bottom:24px;"></div>
-    <button onclick="(function(){Object.keys(localStorage).filter(k=>k.startsWith('ft5_')).forEach(k=>localStorage.removeItem(k));location.reload();})()"
-      style="background:#C8FF00;color:#07070F;border:none;border-radius:10px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;margin-bottom:8px;width:100%;max-width:280px;">
-      App-Daten löschen und neu starten
-    </button>
-    <button onclick="(function(){['ft5_exerciseOverrides','ft5_customExercises'].forEach(k=>localStorage.removeItem(k));location.reload();})()"
-      style="background:#FF6B35;color:#fff;border:none;border-radius:10px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;width:100%;max-width:280px;">
-      Nur Importdaten löschen
-    </button>
-  </div>
   <div id="root"></div>
-  <script>
-  // ═══════════════════════════════════════════════════════
-  // SERVICE WORKER – caches this HTML + CDN libs after first load
-  // so the app works fully offline (Home Screen, no network, etc.)
-  // ═══════════════════════════════════════════════════════
-  (function() {
-    if (!('serviceWorker' in navigator)) return;
-
-    // The SW is defined inline as a Blob so no separate sw.js file is needed
-    var SW_VERSION = '3'; // bump this string to force cache refresh on update
-    var CDN_URLS = [
-      'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
-      'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
-      'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
-    ];
-    var CACHE_NAME = 'fittrack-shell-v' + SW_VERSION;
-    var SW_CODE = `
-const CACHE = '${CACHE_NAME}';
-const CDN   = ${JSON.stringify([
-      'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
-      'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
-      'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
-    ])};
-
-self.addEventListener('install', e => {
-  e.waitUntil(
-    caches.open(CACHE).then(c =>
-      // Cache this page + all CDN libs
-      Promise.all([
-        c.add(new Request(self.location.origin + self.registration.scope.replace(self.location.origin,'') + 'index.html', {cache:'reload'})).catch(()=>{}),
-        ...CDN.map(url => c.add(new Request(url, {mode:'cors', cache:'reload'})).catch(()=>{}))
-      ])
-    ).then(() => self.skipWaiting())
-  );
-});
-
-self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
-  );
-});
-
-self.addEventListener('fetch', e => {
-  var url = e.request.url;
-  // Only handle GET requests
-  if (e.request.method !== 'GET') return;
-
-  // Navigation requests (HTML page) – serve from cache, fall back to network
-  if (e.request.mode === 'navigate') {
-    e.respondWith(
-      caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('index.html')))
-    );
-    return;
-  }
-
-  // CDN libs – cache-first (they never change at a fixed URL)
-  if (CDN.includes(url)) {
-    e.respondWith(
-      caches.match(e.request).then(r => {
-        if (r) return r;
-        return fetch(e.request).then(res => {
-          if (res && res.ok) {
-            var clone = res.clone();
-            caches.open(CACHE).then(c => c.put(e.request, clone));
-          }
-          return res;
-        });
-      })
-    );
-    return;
-  }
-});
-`;
-
-    var blob = new Blob([SW_CODE], {type: 'application/javascript'});
-    var swUrl = URL.createObjectURL(blob);
-
-    navigator.serviceWorker.register(swUrl, {scope: './'})
-      .then(function(reg) {
-        console.log('[FitTrack] SW registered, scope:', reg.scope);
-      })
-      .catch(function(err) {
-        // SW failed – app still works online, just won't be offline-capable
-        console.warn('[FitTrack] SW registration failed (app still works online):', err.message);
-      });
-  })();
-  </script>
-
-  <script>
-    // ── Global error handler (before React loads) ──────────────────────────
-    function _ftShowError(msg) {
-      var boot = document.getElementById('boot-screen');
-      if (boot) boot.style.display = 'none';
-      var el = document.getElementById('parse-error');
-      if (!el) return;
-      el.style.display = 'flex';
-      var m = document.getElementById('parse-error-msg');
-      if (m) m.textContent = msg || 'Unbekannter Fehler';
-    }
-    window.onerror = function(msg, src, line, col, err) {
-      console.error('[FitTrack]', msg, 'at', src, line);
-      _ftShowError((err && err.message) || msg || 'Unbekannter Fehler');
-      return true;
-    };
-    window.onunhandledrejection = function(e) {
-      _ftShowError(e.reason && e.reason.message ? e.reason.message : String(e.reason));
-    };
-  </script>
-
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -265,39 +127,20 @@ function isoWeekKey(date) {
   return `${year}-W${String(weekNum).padStart(2,"0")}`;
 }
 
-const isDone = s => s != null && s.done !== false;
+const isDone = s => s.done !== false;
 
-// Central warmup detector – used by vol, getPRs, getWeeklySets, history, etc.
-// Returns true when a set (and its exercise) represents a warmup/mobility set
-// that must NOT influence strength stats, PRs or progression calculations.
-function isWarmupSet(set, exercise) {
-  const noteLC = (set?.planNote || set?.note || "").toLowerCase();
-  if (noteLC.includes("eingewöhnung") || noteLC.includes("aufwärm") || noteLC.includes("warm")) return true;
-  if (set?.isWarmup === true) return true;
-  const cat = exercise?.cat || "";
-  if (cat === "Aufwärmen" || cat === "Dehnung") return true;
-  return false;
-}
-
-// vol() sums weight×reps for strength work-sets only (excludes warmup sets)
-const vol = (sets, allExercises) => (Array.isArray(sets) ? sets : [])
-  .filter(x => {
-    if (!isDone(x) || (x.weight||0) <= 0) return false;
-    const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
-    return !isWarmupSet(x, ex);
-  })
+// vol() sums weight×reps for strength sets only (weight>0 = rep-based)
+// Time exercises have weight=0 so they contribute 0 naturally, but
+// we explicitly guard to make intent clear.
+const vol = sets => sets
+  .filter(x => isDone(x) && (x.weight||0) > 0)
   .reduce((sum, x) => sum + (x.weight||0) * (x.reps||0), 0);
-
-// Safe sets accessor – always returns an array even if session.sets is missing/corrupt
-const getSets = (session) => Array.isArray(session?.sets) ? session.sets : [];
 
 const calcKcal = (type, durationMin, bodyWeightKg) =>
   Math.round((CARDIO_MET[type]||5) * ((bodyWeightKg||75)/60) * (durationMin/60) * 60);
 
 function calcStreak(sessions, cardio=[]) {
-  const _sess = Array.isArray(sessions) ? sessions : [];
-  const _card = Array.isArray(cardio)   ? cardio   : [];
-  const allDates = [..._sess.map(s=>s.date), ..._card.map(c=>c.date)];
+  const allDates = [...sessions.map(s=>s.date), ...cardio.map(c=>c.date)];
   if (!allDates.length) return 0;
   const days = [...new Set(allDates.map(d=>dayKey(d)))].sort((a,b)=>new Date(b)-new Date(a));
   let streak=0, cur=new Date(); cur.setHours(0,0,0,0);
@@ -310,7 +153,6 @@ function calcStreak(sessions, cardio=[]) {
 
 // [FIX 3] Wochenstart Montag (DE/ISO)
 function getWeekActivities(sessions, cardio=[]) {
-  if (!Array.isArray(sessions)) return {sessions:[], cardio:[]};
   const now = new Date();
   const dow = now.getDay(); // 0=So
   const daysFromMon = dow === 0 ? 6 : dow - 1;
@@ -323,14 +165,11 @@ function getWeekActivities(sessions, cardio=[]) {
   };
 }
 
-// getPRs – excludes warmup sets from personal records
-function getPRs(sessions, allExercises) {
+// [FIX 2] getPRs – nur done===true Sätze mit Gewicht > 0
+function getPRs(sessions) {
   const p = {};
-  if (!Array.isArray(sessions)) return p;
-  sessions.forEach(s => (Array.isArray(s.sets) ? s.sets : []).forEach(x => {
-    const ex = allExercises ? (allExercises||[]).find(e=>e.id===x.eid) : null;
-    if (isDone(x) && x.weight > 0 && !isWarmupSet(x, ex) && (!p[x.eid] || x.weight > p[x.eid]))
-      p[x.eid] = x.weight;
+  sessions.forEach(s => s.sets.forEach(x => {
+    if (isDone(x) && x.weight > 0 && (!p[x.eid] || x.weight > p[x.eid])) p[x.eid] = x.weight;
   }));
   return p;
 }
@@ -361,13 +200,10 @@ function calc1RM(weight, reps) {
 }
 
 // Get all strength (weight>0, non-time) history for one exercise
-function getExHistory(sessions, eid, allExercises) {
+function getExHistory(sessions, eid) {
   const rows = [];
-  const exercise = allExercises ? (allExercises||[]).find(e => e.id === eid) : null;
   sessions.forEach(s => {
-    getSets(s).filter(x =>
-      isDone(x) && x.eid===eid && x.weight>0 && !isWarmupSet(x, exercise)
-    ).forEach(x => {
+    s.sets.filter(x => isDone(x) && x.eid===eid && x.weight>0).forEach(x => {
       rows.push({ date:s.date, weight:x.weight, reps:x.reps,
                   vol:x.weight*x.reps, rm1:calc1RM(x.weight,x.reps) });
     });
@@ -379,7 +215,7 @@ function getExHistory(sessions, eid, allExercises) {
 function getTimeExHistory(sessions, eid) {
   const rows = [];
   sessions.forEach(s => {
-    getSets(s).filter(x => isDone(x) && x.eid===eid && x.reps>0 && (!x.weight||x.weight===0)).forEach(x => {
+    s.sets.filter(x => isDone(x) && x.eid===eid && x.reps>0 && (!x.weight||x.weight===0)).forEach(x => {
       rows.push({ date:s.date, reps:x.reps });
     });
   });
@@ -404,30 +240,24 @@ function pctChange(arr) {
 }
 
 // Best set for an exercise
-function getBestSet(sessions, eid, allExercises) {
+function getBestSet(sessions, eid) {
   let best = null;
-  sessions.forEach(s => getSets(s).filter(x => {
-    if (!isDone(x) || x.eid !== eid || (x.weight||0) <= 0) return false;
-    const ex = (allExercises||[]).find(e=>e.id===x.eid);
-    return !isWarmupSet(x, ex);
-  }).forEach(x => {
+  sessions.forEach(s => s.sets.filter(x=>isDone(x)&&x.eid===eid&&x.weight>0).forEach(x => {
     if (!best || x.weight > best.weight) best = {...x, date:s.date};
   }));
   return best;
 }
 
-// Weekly set count per muscle group (last N weeks) – excludes warmup sets
+// Weekly set count per muscle group (last N weeks, default 1)
 function getWeeklySets(sessions, allExercises, weeksBack=1) {
-  if (!Array.isArray(sessions)) return {};
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - weeksBack*7);
   const counts = {};
   Object.keys(MUSCLE_GROUPS).forEach(k => { counts[k]=0; });
   sessions
     .filter(s => new Date(s.date) >= cutoff)
-    .forEach(s => getSets(s).filter(isDone).forEach(x => {
+    .forEach(s => s.sets.filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
-      if (isWarmupSet(x, ex)) return;           // exclude warmup/mobility
       const cat = ex?.cat;
       if (cat && counts[cat]!==undefined) counts[cat]++;
     }));
@@ -458,9 +288,8 @@ function getLastTrainedDays(sessions, allExercises) {
   const last = {};
   [...sessions]
     .sort((a,b)=>new Date(b.date)-new Date(a.date))
-    .forEach(s => getSets(s).filter(isDone).forEach(x => {
+    .forEach(s => s.sets.filter(isDone).forEach(x => {
       const ex = (allExercises||[]).find(e=>e.id===x.eid);
-      if (isWarmupSet(x, ex)) return;   // Bug 2: exclude warmup from recovery tracking
       const cat = ex?.cat;
       if (cat && last[cat]===undefined) {
         const d = Math.floor((Date.now()-new Date(s.date))/86400000);
@@ -481,9 +310,8 @@ function getRecoveryStatus(daysSince) {
 
 // Weekly summary: volume, sessions, top muscle, records, cardio time
 function buildWeeklySummary(sessions, cardio, allExercises) {
-  if (!Array.isArray(sessions)) return {weekVol:0,weekTime:0,cardioMin:0,topMuscle:null,neglected:[],mobilityMins:0};
   const { sessions:ws, cardio:wc } = getWeekActivities(sessions, cardio);
-  const weekVol   = ws.reduce((s,x)=>s+vol(x.sets,allExercises),0);
+  const weekVol   = ws.reduce((s,x)=>s+vol(x.sets),0);
   const weekTime  = ws.reduce((s,x)=>s+(x.duration||0),0);
   const cardioMin = wc.reduce((s,c)=>s+(c.duration||0),0);
   const setCounts = getWeeklySets(sessions, allExercises, 1);
@@ -494,7 +322,7 @@ function buildWeeklySummary(sessions, cardio, allExercises) {
     .filter(([k,v])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&MUSCLE_GROUPS[k].targetSets>0&&v===0)
     .map(([k])=>k);
   const mobilityMins = ws.reduce((s,sess)=>{
-    return s + (Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).reduce((a,x)=>{
+    return s + sess.sets.filter(isDone).reduce((a,x)=>{
       const ex=(allExercises||[]).find(e=>e.id===x.eid);
       if(ex?.cat==="Dehnung"||ex?.cat==="Aufwärmen") return a+(x.reps||0);
       return a;
@@ -655,20 +483,30 @@ function deloadDaysRemaining(settings) {
 //   1. planNote contains "eingewöhnung" or "warm" (copied from planEx.note in start())
 //   2. Old sessions without planNote: sets whose weight is clearly the lowest weight
 //      for that exercise in the same session are treated as warmup (heuristic).
-function getExercisePerformanceHistory(eid, sessions, allExercises) {
+function getExercisePerformanceHistory(eid, sessions) {
   if (!eid || !sessions?.length) return [];
   const history = [];
-  // Resolve the exercise object once for cat-based warmup detection
-  const exercise = allExercises ? (allExercises||[]).find(e => e.id === eid) : null;
 
   [...sessions]
     .sort((a,b) => new Date(a.date) - new Date(b.date))
     .forEach(sess => {
-      const allEidSets = getSets(sess).filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
+      const allEidSets = sess.sets.filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
       if (!allEidSets.length) return;
 
-      // Use isWarmupSet with resolved exercise for full warmup detection (note + cat)
-      const workSets = allEidSets.filter(s => !isWarmupSet(s, exercise));
+      // Heuristic: if there are multiple distinct weights for this EID in one session,
+      // the lowest-weight group is almost certainly a warmup group.
+      const weights = [...new Set(allEidSets.map(s => s.weight))].sort((a,b)=>a-b);
+      const minWeight = weights[0];
+      const hasMultipleWeights = weights.length > 1;
+
+      const workSets = allEidSets.filter(s => {
+        // Explicit note-based warmup marker (new sessions)
+        const noteLC = (s.planNote || s.note || "").toLowerCase();
+        if (noteLC.includes("eingewöhnung") || noteLC.includes("warm")) return false;
+        // Heuristic: lowest weight in a multi-weight session = warmup group
+        if (hasMultipleWeights && s.weight === minWeight) return false;
+        return true;
+      });
 
       if (workSets.length > 0) {
         history.push({
@@ -683,30 +521,27 @@ function getExercisePerformanceHistory(eid, sessions, allExercises) {
 
 // Core algorithm: calculate progression suggestion for one exercise
 // Returns: { action, suggestedWeight, suggestedReps, reason, isDeload, confidence }
-function calculateProgressionSuggestion(planExercise, exercise, sessions, settings, allExercises) {
+function calculateProgressionSuggestion(planExercise, exercise, sessions, settings) {
   const ps = getProgressionSettings(settings);
   if (!ps.enabled) return null;
 
   const unitType = exercise?.unitType || "reps";
   // Only for strength (rep-based) exercises
   if (unitType !== "reps") return null;
-  // Skip if the plan position itself is marked as warmup
-  const planNoteLC = (planExercise?.note || "").toLowerCase();
-  if (planNoteLC.includes("eingewöhnung") || planNoteLC.match(/warm.?up|aufwärm/)) return null;
   // Skip bodyweight exercises (increment = 0)
   const increment = getIncrementForExercise(exercise, settings);
   const repRange  = getRepRangeForPlanExercise(planExercise, settings);
   const eid       = planExercise?.eid;
   if (!eid) return null;
 
-  const history = getExercisePerformanceHistory(eid, sessions, allExercises);
+  const history = getExercisePerformanceHistory(eid, sessions);
   if (history.length < (ps.minSessionsBeforeSuggestion || 2)) return null;
 
   // Check if deload is active
   if (isDeloadActive(settings) && ps.deloadEnabled) {
     const strategy   = ps.deloadStrategy || "weight";
     // Use last known weight from history if planExercise.weight is 0
-    const history_   = getExercisePerformanceHistory(eid, sessions, allExercises);
+    const history_   = getExercisePerformanceHistory(eid, sessions);
     const baseWeight = (planExercise?.weight || 0) > 0
       ? planExercise.weight
       : (history_.length > 0 ? (history_[history_.length-1].sets[0]?.weight || 0) : 0);
@@ -741,7 +576,7 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const avgReps    = lastSets.reduce((a,s)=>a+s.reps,0) / lastSets.length;
 
   // Check stagnation (last 2–3 sessions same or declining weight)
-  const stagnation = detectExerciseStagnation(eid, sessions, settings, allExercises);
+  const stagnation = detectExerciseStagnation(eid, sessions, settings);
 
   // ── DELOAD recommendation based on stagnation ──────────────
   if (stagnation?.stagnating && ps.deloadEnabled && ps.autoDeloadOnStagnation) {
@@ -815,15 +650,15 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
 }
 
 // Detect stagnation for one exercise over last N sessions
-function detectExerciseStagnation(eid, sessions, settings, allExercises) {
-  const history = getExercisePerformanceHistory(eid, sessions, allExercises);
+function detectExerciseStagnation(eid, sessions, settings) {
+  const history = getExercisePerformanceHistory(eid, sessions);
   if (history.length < 3) return { stagnating: false };
   const last3 = history.slice(-3);
   // Check if weight stayed the same or declined across last 3 sessions
   const weights = last3.map(h => h.sets[0]?.weight || 0);
   const noProgress = weights[2] <= weights[0]; // not higher than 3 sessions ago
   // Check if min reps declined
-  const minReps = last3.map(h => Math.min(...getSets(h).map(s=>s.reps||0)));
+  const minReps = last3.map(h => Math.min(...h.sets.map(s=>s.reps||0)));
   const repsDeclined = minReps[2] < minReps[0];
   return {
     stagnating: noProgress && repsDeclined,
@@ -948,21 +783,21 @@ const ACHIEVEMENT_DEFS = [
 
   // ── Volumen ─────────────────────────────────────────
   { id:"volume_1t",   icon:"🏗", name:"Eine Tonne",       cat:"Volumen",
-    desc:"1 Tonne Gesamtvolumen",       check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=1000 },
+    desc:"1 Tonne Gesamtvolumen",       check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=1000 },
   { id:"volume_5t",   icon:"🏗", name:"Fünf Tonnen",      cat:"Volumen",
-    desc:"5 Tonnen Gesamtvolumen",      check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=5000 },
+    desc:"5 Tonnen Gesamtvolumen",      check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=5000 },
   { id:"volume_50t",  icon:"🏋", name:"Fifty Tonnen",     cat:"Volumen",
-    desc:"50 Tonnen Gesamtvolumen",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=50000 },
+    desc:"50 Tonnen Gesamtvolumen",     check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=50000 },
   { id:"volume_100t", icon:"🚀", name:"Century Lifter",   cat:"Volumen",
-    desc:"100 Tonnen Gesamtvolumen",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+vol(x.sets,ae),0)>=100000 },
+    desc:"100 Tonnen Gesamtvolumen",    check:s=>s.reduce((a,x)=>a+vol(x.sets),0)>=100000 },
 
   // ── Sätze ────────────────────────────────────────────
   { id:"sets_50",   icon:"📋", name:"Satzsammler",    cat:"Volumen",
-    desc:"50 abgeschlossene Sätze",     check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=50 },
+    desc:"50 abgeschlossene Sätze",     check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=50 },
   { id:"sets_250",  icon:"📋", name:"Fleißige Hände", cat:"Volumen",
-    desc:"250 abgeschlossene Sätze",    check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=250 },
+    desc:"250 abgeschlossene Sätze",    check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=250 },
   { id:"sets_1000", icon:"📋", name:"Tausend Sätze",  cat:"Volumen",
-    desc:"1000 abgeschlossene Sätze",   check:(s,_,__,___,ae)=>s.reduce((a,x)=>a+(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid))).length,0)>=1000 },
+    desc:"1000 abgeschlossene Sätze",   check:s=>s.reduce((a,x)=>a+x.sets.filter(isDone).length,0)>=1000 },
 
   // ── Trainingszeit ────────────────────────────────────
   { id:"time_5h",  icon:"⏱", name:"5 Stunden Eisen",   cat:"Zeit",
@@ -974,13 +809,13 @@ const ACHIEVEMENT_DEFS = [
 
   // ── Kraft / PRs ──────────────────────────────────────
   { id:"pr_hunter",   icon:"🎯", name:"PR-Jäger",       cat:"Kraft",
-    desc:"5 persönliche Rekorde",       check:(s,_,__,___,ae)=>Object.keys(getPRs(s,ae)).length>=5 },
+    desc:"5 persönliche Rekorde",       check:s=>Object.keys(getPRs(s)).length>=5 },
   { id:"pr_collector",icon:"🏅", name:"PR-Sammler",     cat:"Kraft",
-    desc:"10 persönliche Rekorde",      check:(s,_,__,___,ae)=>Object.keys(getPRs(s,ae)).length>=10 },
+    desc:"10 persönliche Rekorde",      check:s=>Object.keys(getPRs(s)).length>=10 },
   { id:"heavy_lifter",icon:"💎", name:"Schwerer Junge",  cat:"Kraft",
-    desc:"50 kg+ auf einer Übung",      check:(s,_,__,___,ae)=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).some(y=>isDone(y)&&y.weight>=50  &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
+    desc:"50 kg+ auf einer Übung",      check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=50)) },
   { id:"century_club",icon:"💯", name:"Century Club",    cat:"Kraft",
-    desc:"100 kg+ auf einer Übung",     check:(s,_,__,___,ae)=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).some(y=>isDone(y)&&y.weight>=100 &&!isWarmupSet(y,(ae||[]).find(e=>e.id===y.eid)))) },
+    desc:"100 kg+ auf einer Übung",     check:s=>s.some(x=>x.sets.some(y=>isDone(y)&&y.weight>=100)) },
 
   // ── Cardio ────────────────────────────────────────────
   { id:"cardio_5",   icon:"🏃", name:"Läufer",           cat:"Cardio",
@@ -1001,15 +836,15 @@ const ACHIEVEMENT_DEFS = [
   // ── Mobility / Zeitübungen ───────────────────────────
   { id:"plank_master",icon:"🧘", name:"Plank-Meister",   cat:"Mobility",
     desc:"Plank 3× in einer Einheit",
-    check:s=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).filter(y=>isDone(y)&&y.eid==="e23").length>=3) },
+    check:s=>s.some(x=>x.sets.filter(y=>isDone(y)&&y.eid==="e23").length>=3) },
   { id:"plank_5min",  icon:"🧘", name:"5-Minuten-Plank", cat:"Mobility",
     desc:"Plank ≥ 300 Sek in einer Einheit",
-    check:s=>s.some(x=>(Array.isArray(x.sets)?x.sets:[]).filter(isDone).some(y=>y.eid==="e23"&&(y.reps||0)>=300)) },
+    check:s=>s.some(x=>x.sets.filter(isDone).some(y=>y.eid==="e23"&&(y.reps||0)>=300)) },
   { id:"mobility_fan",icon:"🌿", name:"Mobility Master", cat:"Mobility",
     desc:"10 Dehneinheiten abgeschlossen",
     check:s=>{
       let count=0;
-      s.forEach(sess=>(Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).forEach(x=>{if(x.eid&&x.eid.startsWith("s"))count++;}));
+      s.forEach(sess=>sess.sets.filter(isDone).forEach(x=>{if(x.eid&&x.eid.startsWith("s"))count++;}));
       return count>=10;
     },
   },
@@ -1024,7 +859,7 @@ const ACHIEVEMENT_DEFS = [
     check:(s,_,__,___,allExercises)=>s.some(sess=>{
       // Only count exercises in category "Beine"
       const legEids = new Set(
-        (Array.isArray(sess.sets)?sess.sets:[])
+        sess.sets
           .filter(isDone)
           .map(x=>x.eid)
           .filter(id => {
@@ -1046,7 +881,6 @@ const ACHIEVEMENT_DEFS = [
 ];
 
 function calcAchievements(sessions, metrics, streak, cardio, allExercises=[]) {
-  if (!Array.isArray(sessions)) return ACHIEVEMENT_DEFS.map(a=>({...a,unlocked:false}));
   return ACHIEVEMENT_DEFS.map(a => ({
     ...a,
     unlocked: a.check(sessions, metrics, streak, cardio, allExercises),
@@ -1151,9 +985,9 @@ function mergeWithDefaults(saved) {
 // ── Zusätzliche Übungen: Warm-up, Mobilisierung, Dehnung ──────────────
 // Diese werden zu EDB gemergt (custom exercises folgen später im State)
 const EXTRA_EDB = [
-  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"secs",
+  {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"reps",
    desc:"15× vorwärts, 15× rückwärts. Arme hängen locker, große Kreisbewegung."},
-  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",      unitType:"secs",
+  {id:"w2", name:"Handgelenke kreisen",cat:"Aufwärmen", eq:"Körpergewicht", muscle:"core",      unitType:"reps",
    desc:"15× rechts, 15× links. Hände zu Fäusten, langsam im vollen Radius kreisen."},
   {id:"w3", name:"Crosstrainer",        cat:"Aufwärmen", eq:"Maschine",      muscle:"core",      unitType:"secs",
    desc:"Lockeres Aufwärmen, mittleres Tempo."},
@@ -1291,255 +1125,28 @@ function compressImage(dataUrl, maxPx=400, quality=0.72) {
 // ═══════════════════════════════════════════════════════
 // PERSISTENCE (Fix 4+8)
 // ═══════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════
-// BACKUP SANITIZERS – called on import AND lsGet
-// ═══════════════════════════════════════════════════════
-
-function sanitizeSettings(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return mergeWithDefaults({});
-  return mergeWithDefaults({...raw, onboarded: true});
-}
-
-function sanitizeSessions(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(s =>
-    s && typeof s === "object" &&
-    typeof s.id   === "string" && s.id &&
-    typeof s.date === "string" && s.date &&
-    Array.isArray(s.sets)
-  ).map(s => ({
-    ...s,
-    sets: s.sets.filter(x => x && typeof x === "object" &&
-                              typeof x.eid === "string" && x.eid),
-  }));
-}
-
-function sanitizePlans(raw, fallback) {
-  if (!Array.isArray(raw)) return fallback || [];
-  const valid = raw.filter(p =>
-    p && typeof p === "object" &&
-    typeof p.id   === "string" && p.id &&
-    typeof p.name === "string" && p.name &&
-    Array.isArray(p.days)
-  ).map(p => ({
-    ...p,
-    days: (p.days||[]).filter(d =>
-      d && typeof d === "object" && Array.isArray(d.exercises)
-    ).map(d => ({
-      ...d,
-      exercises: (d.exercises||[]).filter(e =>
-        e && typeof e === "object" && typeof e.eid === "string" && e.eid
-      ),
-    })),
-  }));
-  return valid.length ? valid : (fallback || []);
-}
-
-function sanitizeCardio(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(c =>
-    c && typeof c === "object" &&
-    typeof c.id   === "string" && c.id &&
-    typeof c.date === "string" && c.date
-  );
-}
-
-function sanitizeMetrics(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(m =>
-    m && typeof m === "object" &&
-    typeof m.id   === "string" && m.id &&
-    typeof m.date === "string" && m.date
-  );
-}
-
-function sanitizeCustomExercises(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(cx =>
-    cx && typeof cx === "object" &&
-    typeof cx.id   === "string" && cx.id &&
-    typeof cx.name === "string" && cx.name
-  );
-}
-
-function sanitizeExerciseOverrides(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const out = {};
-  Object.entries(raw).forEach(([k,v]) => {
-    if (v && typeof v === "object" && !Array.isArray(v)) out[k] = v;
-  });
-  return out;
-}
-
-// Central entry point used by BOTH import handlers
-function sanitizeBackup(raw) {
-  if (!raw || typeof raw !== "object") throw new Error("Kein gültiges JSON-Objekt");
-  if (!raw._fittrack_version)          throw new Error("Keine FitTrack-Backup-Datei");
-  return {
-    settings:          sanitizeSettings(raw.settings),
-    sessions:          sanitizeSessions(raw.sessions),
-    plans:             sanitizePlans(raw.plans, MY_PLANS),
-    cardio:            sanitizeCardio(raw.cardio),
-    metrics:           sanitizeMetrics(raw.metrics),
-    customExercises:   sanitizeCustomExercises(raw.customExercises),
-    exerciseOverrides: sanitizeExerciseOverrides(raw.exerciseOverrides),
-  };
-}
-
-// ═══════════════════════════════════════════════════════
-// ATOMIC BACKUP PERSISTENCE
-// ═══════════════════════════════════════════════════════
-
-/**
- * Validates all backup fields, checks combined localStorage size,
- * then writes them atomically.  Returns { ok: true } on success or
- * { ok: false, error: string } on any failure – NEVER triggers a reload.
- *
- * Large base64 images in exerciseOverrides / customExercises are
- * stripped automatically when the total payload would exceed the quota
- * budget, so the import still succeeds without the images.
- */
-function persistBackupAtomically(imported) {
-  // ── 1. Prepare serialized blobs ──────────────────────────────────
-  const KEYS = [
-    ["settings",          imported.settings],
-    ["sessions",          imported.sessions],
-    ["cardio",            imported.cardio],
-    ["plans",             imported.plans],
-    ["metrics",           imported.metrics],
-    ["customExercises",   imported.customExercises],
-    ["exerciseOverrides", imported.exerciseOverrides],
-  ];
-
-  const blobs = {};
-  for (const [k, v] of KEYS) {
-    try {
-      blobs[k] = JSON.stringify(v);
-    } catch (e) {
-      return { ok: false, error: `Fehler beim Serialisieren von "${k}": ${e.message}` };
-    }
-  }
-
-  // ── 2. Check total size ──────────────────────────────────────────
-  const QUOTA_BUDGET = 4.5 * 1024 * 1024; // 4.5 MB conservative limit
-  let totalBytes = Object.values(blobs).reduce((s, v) => s + v.length * 2, 0); // UTF-16
-
-  // ── 3. Strip images if over budget ──────────────────────────────
-  if (totalBytes > QUOTA_BUDGET) {
-    console.warn("FitTrack: Backup exceeds quota budget – stripping images from overrides/customExercises");
-
-    // Strip images from exerciseOverrides
-    const strippedOverrides = {};
-    for (const [k, v] of Object.entries(imported.exerciseOverrides || {})) {
-      const { image: _img, ...rest } = (v && typeof v === "object") ? v : {};
-      strippedOverrides[k] = rest;
-    }
-    blobs["exerciseOverrides"] = JSON.stringify(strippedOverrides);
-
-    // Strip images from customExercises
-    const strippedCustom = (imported.customExercises || []).map(cx => {
-      const { image: _img, ...rest } = cx;
-      return rest;
-    });
-    blobs["customExercises"] = JSON.stringify(strippedCustom);
-
-    totalBytes = Object.values(blobs).reduce((s, v) => s + v.length * 2, 0);
-
-    if (totalBytes > QUOTA_BUDGET) {
-      return {
-        ok: false,
-        error: `Backup zu groß für den Browser-Speicher (${(totalBytes / 1024).toFixed(0)} KB). Bitte Bilder aus dem Backup entfernen.`,
-      };
-    }
-  }
-
-  // ── 4. Write all keys – abort on first failure ───────────────────
-  const PREFIX = "ft5_";
-  const written = [];
-  for (const [k, blob] of Object.entries(blobs)) {
-    try {
-      localStorage.setItem(PREFIX + k, blob);
-      written.push(k);
-    } catch (e) {
-      const isQuota = e?.name === "QuotaExceededError" || e?.name === "NS_ERROR_DOM_QUOTA_REACHED";
-      // Roll back already-written keys so old data is preserved
-      for (const wk of written) {
-        try { localStorage.removeItem(PREFIX + wk); } catch (_) {}
-      }
-      if (isQuota) {
-        return {
-          ok: false,
-          error: `Speicher voll beim Schreiben von "${k}". Import abgebrochen – alte Daten erhalten. Bitte Bilder aus dem Backup entfernen.`,
-        };
-      }
-      return { ok: false, error: `Unbekannter Fehler beim Speichern von "${k}": ${e.message}` };
-    }
-  }
-
-  // ── 5. Mark onboarded ────────────────────────────────────────────
-  try {
-    const settingsObj = JSON.parse(blobs["settings"]);
-    settingsObj.onboarded = true;
-    localStorage.setItem(PREFIX + "settings", JSON.stringify(settingsObj));
-  } catch (_) { /* non-fatal – onboarded was already set by sanitizeSettings */ }
-
-  return { ok: true };
-}
-
 const LS_PREFIX = "ft5_";
 
 function lsGet(key, fallback) {
   try {
     const v = localStorage.getItem(LS_PREFIX + key);
-    if (v == null) return fallback;
+    if (!v) return fallback;
     const parsed = JSON.parse(v);
-    if (parsed == null) return fallback;
-    // Per-key sanitization so corrupt localStorage never crashes the app
-    if (key === "settings")          return sanitizeSettings(parsed);
-    if (key === "sessions")          return sanitizeSessions(parsed);
-    if (key === "plans")             return sanitizePlans(parsed, fallback);
-    if (key === "cardio")            return sanitizeCardio(parsed);
-    if (key === "metrics")           return sanitizeMetrics(parsed);
-    if (key === "customExercises")   return sanitizeCustomExercises(parsed);
-    if (key === "exerciseOverrides") return sanitizeExerciseOverrides(parsed);
+    // Fix 1: deep-merge settings so new fields are always present
+    if (key === "settings") return mergeWithDefaults(parsed);
     return parsed;
-  } catch(e) {
-    console.warn("FitTrack: lsGet failed for", key, e?.message);
+  } catch {
     return fallback;
   }
 }
-
-// Storage-quota notification state (module-level, shown once per session)
-let _quotaWarningShown = false;
 
 function lsSet(key, value) {
   try {
     localStorage.setItem(LS_PREFIX + key, JSON.stringify(value));
     return true;
   } catch (e) {
-    const isQuota = e?.name === "QuotaExceededError" ||
-                    e?.name === "NS_ERROR_DOM_QUOTA_REACHED";
-    console.warn("FitTrack: localStorage write failed:", key, e?.name);
-    if (isQuota && !_quotaWarningShown) {
-      _quotaWarningShown = true;
-      // Show non-blocking toast if the DOM is ready
-      setTimeout(() => {
-        const d = document.createElement("div");
-        d.textContent = "⚠️ Speicher voll – Bilder im Backup reduzieren";
-        Object.assign(d.style, {
-          position:"fixed", bottom:"80px", left:"50%",
-          transform:"translateX(-50%)",
-          background:"#FF6B35", color:"#fff",
-          padding:"10px 20px", borderRadius:"10px",
-          fontSize:"13px", fontWeight:"700",
-          zIndex:"9999", boxShadow:"0 4px 20px rgba(0,0,0,0.5)",
-          maxWidth:"300px", textAlign:"center",
-        });
-        document.body.appendChild(d);
-        setTimeout(() => d.remove(), 5000);
-      }, 100);
-    }
+    // QuotaExceededError or similar – show a brief console warning
+    console.warn("FitTrack: localStorage write failed for key:", key, e?.name);
     return false;
   }
 }
@@ -1748,13 +1355,6 @@ const AudioEngine = (() => {
       tone(660, 0.30, 0.55, 0.0);
       tone(880, 0.45, 0.40, 0.08);
     },
-
-    // Drei kurze Pieptöne – alle 30 Sekunden Erinnerung
-    tripleTick: () => {
-      tone(900, 0.09, 0.30, 0.00);
-      tone(900, 0.09, 0.30, 0.15);
-      tone(900, 0.09, 0.30, 0.30);
-    },
   };
 })();
 
@@ -1770,21 +1370,11 @@ const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
   const intervalRef = useRef(null);
   const ticked = useRef(new Set());
 
-  const thirtyBeeps = useRef(new Set()); // track which 30s marks already beeped
-
   useEffect(() => {
     intervalRef.current = setInterval(() => {
       setLeft(prev => {
-        const next   = prev - 1;
-        const elapsed = seconds - next;        // how many seconds have passed
-
-        // Every 30 seconds of running time: triple beep
-        if (elapsed > 0 && elapsed % 30 === 0 && !thirtyBeeps.current.has(elapsed)) {
-          thirtyBeeps.current.add(elapsed);
-          AudioEngine.tripleTick();
-        }
-
-        // Final countdown ticks
+        const next = prev - 1;
+        // Ticks in the final tickStart seconds
         if (next > 0 && next <= tickStart && !ticked.current.has(next)) {
           ticked.current.add(next);
           AudioEngine.tick();
@@ -1892,21 +1482,13 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
   const ticked      = useRef(new Set());
   const donePlayed  = useRef(false);
 
-  const thirtyBeeps = useRef(new Set()); // track 30s marks
-
   useEffect(() => {
     intervalRef.current = setInterval(() => {
       setElapsed(prev => {
-        const next      = prev + 1;
+        const next = prev + 1;
         const remaining = targetSecs - next;
 
-        // Every 30 seconds of elapsed time: triple beep
-        if (next > 0 && next % 30 === 0 && !thirtyBeeps.current.has(next)) {
-          thirtyBeeps.current.add(next);
-          AudioEngine.tripleTick();
-        }
-
-        // Countdown ticks before target
+        // Ticks in final tickStart seconds before target
         if (remaining > 0 && remaining <= tickStart && !ticked.current.has(remaining)) {
           ticked.current.add(remaining);
           AudioEngine.tick();
@@ -1983,7 +1565,7 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
 // ═══════════════════════════════════════════════════════
 // ONBOARDING
 // ═══════════════════════════════════════════════════════
-const OnboardingScreen = ({onDone, onImport, importError}) => {
+const OnboardingScreen = ({onDone, onImport}) => {
   const [step,setStep]   = useState(0);
   const [name,setName]   = useState("");
   const [goal,setGoal]   = useState("");
@@ -2003,18 +1585,28 @@ const OnboardingScreen = ({onDone, onImport, importError}) => {
     reader.onload = ev => {
       try {
         const raw = JSON.parse(ev.target.result);
-        const imported = sanitizeBackup(raw); // central validation + sanitization
-        // importAll writes atomically then reloads on success.
-        // On failure it sets app-level importError and does NOT reload.
-        // We listen for that by checking if reload happens; if not, show local error.
-        const _sessionCount = imported.sessions.length;
-        const _planCount    = imported.plans.length;
+        if (typeof raw !== "object" || !raw)        throw new Error("Kein gültiges JSON");
+        if (!raw._fittrack_version)                  throw new Error("Keine FitTrack-Backup-Datei");
+
+        const imported = {
+          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
+          sessions:          Array.isArray(raw.sessions)          ? raw.sessions          : [],
+          cardio:            Array.isArray(raw.cardio)            ? raw.cardio            : [],
+          plans:             Array.isArray(raw.plans)             ? raw.plans             : [],
+          metrics:           Array.isArray(raw.metrics)           ? raw.metrics           : [],
+          customExercises:   Array.isArray(raw.customExercises)   ? raw.customExercises   : [],
+          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides)
+                               ? raw.exerciseOverrides : {},
+        };
+        imported.sessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
+        imported.plans    = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
+        // Mark as onboarded so the app opens normally after import
+        // Punkt 10: deep-merge timerSettings + restRules on import
+        imported.settings = mergeWithDefaults({...imported.settings, onboarded: true});
+
         onImport(imported);
-        // If we reach this line the page did NOT reload → importAll returned an error.
-        // The app-level importError state carries the real message.
-        // Surface a generic fallback here since we can't read that state directly.
-        setImportState("error");
-        setImportMsg("Import fehlgeschlagen – bitte prüfe den Fehlermeldungsbereich.");
+        setImportState("ok");
+        setImportMsg(`${imported.sessions.length} Trainings, ${imported.plans.length} Pläne wiederhergestellt.`);
       } catch(err) {
         setImportState("error");
         setImportMsg(err.message || "Ungültige Datei");
@@ -2092,7 +1684,7 @@ const OnboardingScreen = ({onDone, onImport, importError}) => {
                   marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
                   background:T.red+"18",color:T.red,border:`1px solid ${T.red}44`,
                 }}>
-                  ✗ {importError || importMsg}
+                  ✗ {importMsg}
                 </div>
               )}
             </div>
@@ -2355,16 +1947,9 @@ const ExerciseDBScreen = ({
   const [fLink,setFLink] = useState("");
   const [fImg,setFImg]   = useState(null);
   const [fNote,setFNote] = useState(""); // Fix 5: Trainingsnotiz (Kurznotiz)
+  const [fUnitType,setFUnitType] = useState("reps"); // Messtyp: reps | secs | mins | reps+kg
   const [imgLoading,setImgLoading] = useState(false);
   const fileRef = useRef(null);
-
-  // Fix 1: Reset mode/activeId when the exercise no longer exists (avoid setter-during-render)
-  useEffect(() => {
-    if (mode === "detail" && activeId) {
-      const stillExists = (allExercises||[]).some(e => e.id === activeId);
-      if (!stillExists) { setMode("list"); setActiveId(null); }
-    }
-  }, [mode, activeId, allExercises]);
 
   // Resolve an exercise with any overrides applied
   const resolve = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
@@ -2372,7 +1957,7 @@ const ExerciseDBScreen = ({
   // Fix 1: openEdit properly pre-fills form and sets activeId so back→detail works
   const openCreate = () => {
     setFName(""); setFCat("Brust"); setFEq("Maschine");
-    setFDesc(""); setFLink(""); setFImg(null); setFNote("");
+    setFDesc(""); setFLink(""); setFImg(null); setFNote(""); setFUnitType("reps");
     setActiveId(null); setMode("create");
   };
 
@@ -2385,6 +1970,7 @@ const ExerciseDBScreen = ({
     setFLink(resolved.link || "");
     setFImg(resolved.img   || null);
     setFNote(resolved.trainingsnotiz || ""); // Fix 5
+    setFUnitType(resolved.unitType === "secs" ? "secs" : resolved.unitType === "mins" ? "mins" : resolved.unitType === "reps" ? "reps" : "reps+kg");
     setActiveId(ex.id);
     setMode("edit");
   }, [resolve]);
@@ -2411,6 +1997,7 @@ const ExerciseDBScreen = ({
     const entry = {
       id:`cx${uid()}`, name:fName.trim(), cat:fCat, eq:fEq,
       muscle:fCat.toLowerCase(),
+      unitType: (fUnitType==="reps+kg"||fUnitType==="reps") ? undefined : fUnitType,
       desc:fDesc.trim()||null, link:fLink.trim()||null, img:fImg||null,
       trainingsnotiz: fNote.trim()||null, // Fix 5
       custom:true,
@@ -2429,6 +2016,7 @@ const ExerciseDBScreen = ({
       const updated = {
         ...ex, name:fName.trim(), cat:fCat, eq:fEq,
         muscle:fCat.toLowerCase(),
+        unitType: (fUnitType==="reps+kg"||fUnitType==="reps") ? undefined : fUnitType,
         desc:fDesc.trim()||null, link:fLink.trim()||null, img:fImg||null,
         trainingsnotiz: fNote.trim()||null, // Fix 5
       };
@@ -2440,10 +2028,9 @@ const ExerciseDBScreen = ({
         link: fLink.trim()||null,
         img:  fImg||null,
         trainingsnotiz: fNote.trim()||null, // Fix 5
+        unitType: (fUnitType==="reps+kg"||fUnitType==="reps") ? null : fUnitType,
       };
-      // Remove override entirely if all fields are empty (cleanup)
-      // Fix 1: keep override if ANY field is set, including trainingsnotiz
-      const hasAny = override.desc || override.link || override.img || override.trainingsnotiz;
+      const hasAny = override.desc || override.link || override.img || override.trainingsnotiz || override.unitType;
       if (hasAny) {
         setExerciseOverrides(prev=>({...prev, [activeId]: override}));
       } else {
@@ -2468,8 +2055,8 @@ const ExerciseDBScreen = ({
 
   // ── DETAIL VIEW ──────────────────────────────────────
   if (mode==="detail" && activeId) {
-    const base = (allExercises||[]).find(e=>e.id===activeId);
-    if (!base) return null; // useEffect above will reset mode
+    const base = allExercises.find(e=>e.id===activeId);
+    if (!base) { setMode("list"); return null; }
     const ex = resolve(base);
     const hasOverride = !base.custom && exerciseOverrides?.[base.id];
 
@@ -2595,6 +2182,32 @@ const ExerciseDBScreen = ({
               </div>
             </div>
           </>}
+
+          {/* Messtyp – available for ALL exercises incl. built-ins */}
+          <div style={{marginBottom:12}}>
+            <Lbl>MESSTYP</Lbl>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:4}}>
+              {[
+                {v:"reps",      label:"Wdh",          desc:"Nur Wiederholungen (z.B. Kreisen, Dehnung)"},
+                {v:"reps+kg",   label:"kg + Wdh",     desc:"Gewicht und Wiederholungen (Standard Krafttraining)"},
+                {v:"secs",      label:"Sekunden",      desc:"Zeitbasiert in Sekunden (z.B. Plank, Dehnung)"},
+                {v:"mins",      label:"Minuten",       desc:"Zeitbasiert in Minuten (z.B. Cardio)"},
+              ].map(opt=>(
+                <button key={opt.v} onClick={()=>setFUnitType(opt.v)} style={{
+                  background: fUnitType===opt.v ? T.accent : T.bgInput,
+                  color:      fUnitType===opt.v ? "#07070F" : T.sub,
+                  border:     `1px solid ${fUnitType===opt.v ? T.accent : T.border}`,
+                  borderRadius:8, padding:"7px 12px", fontSize:12, fontWeight:700, cursor:"pointer",
+                }}>{opt.label}</button>
+              ))}
+            </div>
+            <div style={{fontSize:10,color:T.muted,marginTop:5,lineHeight:1.5}}>
+              {fUnitType==="reps"    && "Nur Wiederholungen – kein Gewichtsfeld (Kreisen, Stretching …)"}
+              {fUnitType==="reps+kg" && "Gewicht × Wiederholungen – Standard für Kraftübungen"}
+              {fUnitType==="secs"    && "Zeit in Sekunden – Feld zeigt Sekunden statt Wdh (Plank, Dehnung …)"}
+              {fUnitType==="mins"    && "Zeit in Minuten – z.B. für Cardio-Einheiten im Training"}
+            </div>
+          </div>
 
           {/* Media fields – available for ALL exercises */}
           <div style={{marginBottom:10}}>
@@ -2777,7 +2390,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
       ...day,
       exercises:day.exercises.map(ex=>{
         const exercise=(allExercises||[]).find(e=>e.id===ex.eid);
-        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings, allExercises);
+        const suggestion=calculateProgressionSuggestion(ex, exercise, sessions||[], settings);
         if(!suggestion||suggestion.suggestedWeight<=0) return ex;
         return {...ex, weight:suggestion.suggestedWeight};
       }),
@@ -2949,13 +2562,6 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
   const [sel,setSel]       = useState(null);
   const [editing,setEditing] = useState(null);
 
-  // Fix 1: reset to list view if the selected plan no longer exists
-  useEffect(() => {
-    if (view === "detail" && sel && !plans.find(p => p.id === sel)) {
-      setView("list"); setSel(null);
-    }
-  }, [view, sel, plans]);
-
   const activePlans   = plans.filter(p=>!p.archived);
   const archivedPlans = plans.filter(p=>p.archived);
 
@@ -2993,8 +2599,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 
   if (view==="detail" && sel) {
     const plan = plans.find(p=>p.id===sel);
-    // Fix 1: no setter during render — guard renders nothing; effect below resets
-    if (!plan) return null;
+    if (!plan) { setView("list"); return null; }
     return (
       <div style={{padding:"0 16px 24px"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,padding:"20px 0 14px"}}>
@@ -3096,7 +2701,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 // ─────────────────────────────────────────────────────────────────────
 const WorkoutExerciseCard = ({
   planEx, planExIdx, allExercises, exerciseOverrides,
-  sets, setSets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
+  sets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
 }) => {
   const ikey     = instKey(planEx.eid, planExIdx);
   const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
@@ -3105,8 +2710,9 @@ const WorkoutExerciseCard = ({
   const exSets   = sets[ikey]||[];
   const doneCount= exSets.filter(s=>s.done).length;
   const allDone  = exSets.length>0 && exSets.every(s=>s.done);
-  const unitType = resolved.unitType || "reps";
-  const isTimeBased = unitType === "secs" || unitType === "mins";
+  const unitType = resolved.unitType || "reps+kg"; // undefined = standard kg+Wdh
+  const isTimeBased  = unitType === "secs" || unitType === "mins";
+  const isRepsOnly   = unitType === "reps"; // Nur Wdh, kein Gewicht
   const repLabel = repsFieldLabel(unitType);
   const hasExpandableInfo = !!(resolved.desc || resolved.link || resolved.img);
   const hasExtraInfo = hasExpandableInfo;
@@ -3120,14 +2726,23 @@ const WorkoutExerciseCard = ({
   }, [allDone]); // eslint-disable-line
   // Is the exercise timer currently running for this card?
   const isThisTimerActive = exTimer?.ikey === ikey;
-  // Progression suggestion — skip if this planEx is a warmup position
+  // Progression suggestion (only for strength exercises, computed once)
   const ps = getProgressionSettings(settings);
-  const isWarmupPosition = !!((planEx.note||"").toLowerCase().match(/eingewöhnung|warm[\s-]?up|aufwärm|warmup/));
   const suggestion = useMemo(() => {
-    if (!ps.showSuggestionsInWorkout || isTimeBased || isWarmupPosition) return null;
-    return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings, allExercises);
+    if (!ps.showSuggestionsInWorkout || isTimeBased || isRepsOnly) return null;
+    return calculateProgressionSuggestion(planEx, exercise, sessions||[], settings);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planEx?.eid, planExIdx, isWarmupPosition, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
+  }, [planEx?.eid, planExIdx, sessions?.length, JSON.stringify(settings?.progressionSettings)]);
+
+  // Editable override values shown in the suggestion box before applying
+  const [sugWeight, setSugWeight] = React.useState(null); // null = use suggestion value
+  const [sugReps,   setSugReps]   = React.useState(null);
+
+  // When suggestion changes, reset the edit fields
+  React.useEffect(() => {
+    setSugWeight(null);
+    setSugReps(null);
+  }, [suggestion?.suggestedWeight, suggestion?.suggestedReps]);
 
   // Apply suggestion to all sets of this exercise
   // Apply suggestion: update weight for all undone sets in one batched call.
@@ -3135,12 +2750,16 @@ const WorkoutExerciseCard = ({
   const applySuggestion = () => {
     if (!suggestion) return;
     const ikey_ = instKey(planEx.eid, planExIdx);
+    // Use edited values if the user adjusted them, otherwise fall back to suggestion
+    const finalWeight = sugWeight !== null ? Number(sugWeight) : suggestion.suggestedWeight;
+    const finalReps   = sugReps   !== null ? Number(sugReps)   : null; // reps editing optional
     setSets(prev => {
       const curSets  = prev[ikey_] || [];
       let updated    = curSets.map(s =>
         s.done ? s : {
           ...s,
-          weight: suggestion.suggestedWeight > 0 ? suggestion.suggestedWeight : s.weight,
+          weight: finalWeight > 0 ? finalWeight : s.weight,
+          ...(finalReps !== null && finalReps > 0 ? {reps: finalReps} : {}),
         }
       );
       // For deload with set reduction: keep done sets + trim undone sets to target count
@@ -3163,9 +2782,9 @@ const WorkoutExerciseCard = ({
 
       {/* ── Header – always visible ─────────────────────────── */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:collapsed?0:6}}>
-        <div style={{flex:1, cursor:collapsed?"pointer":"default"}} onClick={()=>{
+        <div style={{flex:1}} onClick={()=>{
           if(collapsed){setCollapsed(false);setManuallyOpened(true);}
-        }}>
+        }} style={{flex:1,cursor:collapsed?"pointer":"default"}}>
           <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text,display:"flex",gap:6,alignItems:"center"}}>
             {resolved.name||"?"}
             {allDone && <span style={{fontSize:11,color:T.accentDim}}>✓</span>}
@@ -3219,24 +2838,57 @@ const WorkoutExerciseCard = ({
 
         {/* ── Progression suggestion box ─────────────────── */}
         {suggestion&&(()=>{
-          const repRange = getRepRangeForPlanExercise(planEx, settings);
+          const repRange  = getRepRangeForPlanExercise(planEx, settings);
+          const accent    = suggestion.isDeload ? T.orange : T.teal;
+          const dispW     = sugWeight !== null ? sugWeight : suggestion.suggestedWeight;
+          const dispR     = sugReps   !== null ? sugReps   : repRange.min;
+          const label     = suggestion.isDeload ? "⬇ DELOAD" : suggestion.action==="increase" ? "↑ PROGRESSION" : "→ GEWICHT HALTEN";
           return (
           <div style={{
-            marginBottom:8, padding:"8px 10px", borderRadius:10,
-            background: suggestion.isDeload ? T.orange+"18" : T.teal+"18",
-            border:`1px solid ${suggestion.isDeload ? T.orange+"55" : T.teal+"55"}`,
+            marginBottom:8, padding:"10px 12px", borderRadius:10,
+            background: accent+"18",
+            border:`1px solid ${accent}55`,
           }}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
-              <div style={{flex:1}}>
-                <div style={{fontSize:11,fontWeight:800,letterSpacing:0.3,marginBottom:2,
-                  color: suggestion.isDeload ? T.orange : T.teal}}>
-                  {suggestion.isDeload ? "⬇ DELOAD" : suggestion.action==="increase" ? "↑ PROGRESSION" : "→ HALTEN"}
-                </div>
-                <div style={{fontSize:12,color:suggestion.isDeload?T.orange:T.teal,fontWeight:700,marginBottom:2}}>
-                  {suggestion.suggestedWeight>0 ? `${suggestion.suggestedWeight} kg` : "—"}
-                  {" × "}{repRange.min}–{repRange.max} Wdh
-                </div>
-                <div style={{fontSize:10,color:T.sub}}>{suggestion.reason}</div>
+            {/* Header row */}
+            <div style={{fontSize:11,fontWeight:800,letterSpacing:0.3,marginBottom:6,color:accent}}>
+              {label}
+            </div>
+            {/* Editable weight + reps row */}
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              {suggestion.suggestedWeight>0 && (
+                <>
+                  <input
+                    type="number"
+                    value={dispW}
+                    onChange={e=>setSugWeight(e.target.value)}
+                    style={{
+                      width:72, padding:"6px 8px", borderRadius:8, textAlign:"center",
+                      border:`1.5px solid ${accent}88`,
+                      background:accent+"14", color:accent,
+                      fontSize:16, fontWeight:800,
+                    }}
+                  />
+                  <span style={{fontSize:12,color:accent,fontWeight:700}}>kg</span>
+                  <span style={{fontSize:13,color:T.muted}}>×</span>
+                </>
+              )}
+              <input
+                type="number"
+                value={dispR}
+                onChange={e=>setSugReps(e.target.value)}
+                style={{
+                  width:56, padding:"6px 8px", borderRadius:8, textAlign:"center",
+                  border:`1.5px solid ${accent}88`,
+                  background:accent+"14", color:accent,
+                  fontSize:16, fontWeight:800,
+                }}
+              />
+              <span style={{fontSize:12,color:accent,fontWeight:700}}>Wdh</span>
+            </div>
+            {/* Reason + apply row */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+              <div>
+                <div style={{fontSize:10,color:T.sub,lineHeight:1.4}}>{suggestion.reason}</div>
                 {suggestion.isDeload&&suggestion.suggestedSets!=null&&(
                   <div style={{fontSize:10,color:T.orange,marginTop:2,fontWeight:700}}>
                     → {suggestion.suggestedSets} Sätze empfohlen
@@ -3246,12 +2898,11 @@ const WorkoutExerciseCard = ({
               <button
                 onClick={applySuggestion}
                 style={{
-                  background: suggestion.isDeload ? T.orange : T.teal,
-                  color:"#07070F", border:"none", borderRadius:7,
-                  padding:"5px 10px", fontSize:11, fontWeight:800,
+                  background: accent, color:"#07070F", border:"none", borderRadius:8,
+                  padding:"7px 13px", fontSize:12, fontWeight:800,
                   cursor:"pointer", flexShrink:0, whiteSpace:"nowrap",
                 }}
-              >Übernehmen</button>
+              >Auf alle Sätze</button>
             </div>
           </div>
           );
@@ -3281,27 +2932,20 @@ const WorkoutExerciseCard = ({
         {/* ── Set rows (Points 2,3,4,5,6,7) ──────────────── */}
         {exSets.map((s,i)=>{
           // Point 4: track extra (user-added) sets by planEx.sets
-          // Bug 1 fix: extra sets identified ONLY by explicit flag, never by index
-          // (index-based fallback caused prev-session extra sets to stay "extra" after carryover)
-          const isExtra = s.extra === true;
+          const isExtra = i >= (planEx.sets || 0);
           const startTimer = () => {
             const targetSecs = unitType==="mins" ? (s.reps||1)*60 : (s.reps||30);
             setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
           };
           const handleDone = () => {
-            if (isTimeBased && !s.done) {
-              // Fix 5: prevent double-start if timer already running for this set
-              if (isThisTimerActive && exTimer?.setIdx === i) return;
-              startTimer();
-            } else {
-              toggle(ikey, i, planEx.rest);
-            }
+            if (isTimeBased && !s.done) startTimer();
+            else toggle(ikey, i, planEx.rest);
           };
           return (
             <div key={i} style={{
               display:"grid",
               // Point 2+3: no summary column, no left check – just [num] [fields…] [✓]
-              gridTemplateColumns: isTimeBased ? "30px 1fr 38px" : "30px 1fr 24px 1fr 38px",
+              gridTemplateColumns: (isTimeBased || isRepsOnly) ? "30px 1fr 38px" : "30px 1fr 24px 1fr 38px",
               alignItems:"center", gap:5, marginBottom:7,
               opacity:s.done ? 0.45 : 1,
             }}>
@@ -3340,8 +2984,24 @@ const WorkoutExerciseCard = ({
                     {unitType==="mins" ? "Min" : "Sek"}
                   </span>
                 </div>
+              ) : isRepsOnly ? (
+                /* Nur Wiederholungen, kein Gewicht */
+                <div style={{display:"flex", alignItems:"center", gap:4}}>
+                  <input
+                    type="number"
+                    value={s.reps}
+                    onChange={e => upd(ikey, i, "reps", e.target.value)}
+                    style={{
+                      background:T.bgInput, border:`1px solid ${T.border}`,
+                      borderRadius:8, padding:"8px 6px",
+                      color:T.text, fontSize:15, fontWeight:700,
+                      textAlign:"center", width:"100%", boxSizing:"border-box",
+                    }}
+                  />
+                  <span style={{fontSize:11, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>Wdh</span>
+                </div>
               ) : (
-                /* Point 2: no summary column – just weight × reps */
+                /* Standard: Gewicht × Wiederholungen */
                 <>
                   {/* Weight field with "kg" label */}
                   <div style={{display:"flex", alignItems:"center", gap:3}}>
@@ -3356,7 +3016,7 @@ const WorkoutExerciseCard = ({
                         textAlign:"center", width:"100%", boxSizing:"border-box",
                       }}
                     />
-                    <span style={{fontSize:10, color:T.muted, whiteSpace:"nowrap"}}>kg</span>
+                    <span style={{fontSize:11, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>kg</span>
                   </div>
                   <span style={{textAlign:"center", color:T.muted, fontSize:12}}>×</span>
                   {/* Reps field with "Wdh" label */}
@@ -3372,36 +3032,23 @@ const WorkoutExerciseCard = ({
                         textAlign:"center", width:"100%", boxSizing:"border-box",
                       }}
                     />
-                    <span style={{fontSize:10, color:T.muted, whiteSpace:"nowrap"}}>Wdh</span>
+                    <span style={{fontSize:11, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>Wdh</span>
                   </div>
                 </>
               )}
 
               {/* Point 3+5: right done/start button only, slightly larger touch target */}
-              {/* Fix 6: clearer done button with better contrast + active state */}
               <button
                 onClick={handleDone}
-                aria-label={s.done ? "Satz abgeschlossen" : "Satz abschließen"}
-                title={s.done ? "Abgeschlossen" : isTimeBased ? "Timer starten" : "Satz abhaken"}
                 style={{
-                  width:38, height:38, borderRadius:9, cursor:"pointer",
-                  flexShrink:0,
-                  border: s.done
-                    ? `2px solid ${T.accent}`
-                    : isTimeBased
-                    ? `2px solid ${T.blue}88`
-                    : `2px solid ${T.border}`,
-                  background: s.done
-                    ? T.accent+"33"
-                    : isTimeBased && isThisTimerActive && exTimer?.setIdx===i
-                    ? T.blue+"55"
-                    : isTimeBased
-                    ? T.blue+"22"
-                    : T.bgInput,
-                  color: s.done ? T.accent : isTimeBased ? T.blue : T.sub,
-                  fontSize: s.done ? 16 : 18,
-                  fontWeight:800,
-                  transition:"background 0.15s, border-color 0.15s",
+                  width:38, height:38, borderRadius:9, border:"none", cursor:"pointer",
+                  background: s.done ? T.accent+"44"
+                    : isTimeBased ? T.blue+"44"
+                    : T.bgAlt,
+                  color: s.done ? T.accent
+                    : isTimeBased ? T.blue
+                    : T.sub,
+                  fontSize:16, fontWeight:700,
                 }}
               >
                 {s.done ? "✓" : isTimeBased ? "▶" : "○"}
@@ -3412,18 +3059,12 @@ const WorkoutExerciseCard = ({
 
         {/* Point 4+6: + Satz button (left, prominent) + delete extra set button */}
         {(()=>{
-          // Bug 1 fix: only sets explicitly marked extra:true are deletable extras
-          const extraSets = exSets.filter(s => s.extra === true);
+          const extraSets = exSets.filter((_,i) => i >= (planEx.sets||0));
           const hasExtra  = extraSets.length > 0;
           return (
             <div style={{display:"flex", gap:6, marginTop:4}}>
               <button
-                onClick={()=>addSet(ikey, {
-                    reps:      planEx.reps,
-                    weight:    planEx.weight,
-                    planNote:  planEx.note  || null,
-                    planExIdx: planExIdx,
-                  })}
+                onClick={()=>addSet(ikey, planEx)}
                 style={{
                   background:T.accent+"22", border:`1px solid ${T.accent}55`,
                   borderRadius:8, padding:"7px 14px",
@@ -3438,18 +3079,12 @@ const WorkoutExerciseCard = ({
                     setSets(prev => {
                       const cur = [...(prev[ikey]||[])];
                       // Find last undone extra set index
-                      // Bug 1 fix: only delete sets explicitly marked extra:true
                       let target = -1;
-                      for (let i=cur.length-1; i>=0; i--) {
-                        if (cur[i].extra === true && !cur[i].done) { target=i; break; }
+                      for (let i=cur.length-1; i>=(planEx.sets||0); i--) {
+                        if (!cur[i].done) { target=i; break; }
                       }
-                      // Fallback: last extra set even if done
-                      if (target === -1) {
-                        for (let i=cur.length-1; i>=0; i--) {
-                          if (cur[i].extra === true) { target=i; break; }
-                        }
-                      }
-                      if (target === -1) return prev; // nothing to delete
+                      if (target === -1) target = cur.length - 1; // fallback: last set
+                      if (target < (planEx.sets||0)) return prev;  // safety: never delete planned
                       const next = cur.filter((_,i)=>i!==target);
                       return {...prev, [ikey]: next};
                     });
@@ -3515,15 +3150,6 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const [confirmPlanId, setConfirmPlanId] = useState(null);
   const [confirmDayId,  setConfirmDayId]  = useState(null);
 
-  // Fix 1: reset confirm phase if the selected plan/day no longer exists
-  useEffect(() => {
-    if (phase === "confirm") {
-      const cp = activePlans.find(p => p.id === confirmPlanId);
-      const cd = cp?.days.find(d => d.id === confirmDayId);
-      if (!cp || !cd) { setPhase("select"); setConfirmPlanId(null); setConfirmDayId(null); }
-    }
-  }, [phase, confirmPlanId, confirmDayId, activePlans]);
-
   const t0Ref    = useRef(null);
   const [elapsed,setElapsed] = useState(() => hasDraft ? (draft.elapsed||0) : 0);
 
@@ -3554,50 +3180,6 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     saveWorkoutDraft({ phase:"active", planId, dayId, sets, note, elapsed });
   }, [phase, sets, note, elapsed, planId, dayId]);
 
-  // ── Helper: get last session's set values for an exercise position ──────────
-  // Returns array of set objects ready to use as starting values, or null.
-  const getLastSessionSetDefaults = (pId, dId, exIdx, eid) => {
-    // Find most recent session with same plan+day
-    const matching = [...sessions]
-      .filter(s => s.planId === pId && s.dayId === dId)
-      .sort((a,b) => new Date(b.date) - new Date(a.date));
-    if (!matching.length) return null;
-    const last = matching[0];
-
-    // Carryover rule: include ALL sets for this exact position (warmup and worksets alike).
-    // Warmup-sets ARE excluded from vol/PR/badge stats (isWarmupSet guards there),
-    // but a user who changed a warmup weight deserves to see that change next session.
-    //
-    // Primary: exact planExIdx + eid match (preserves set-type separation)
-    let exSets = getSets(last).filter(s =>
-      s.planExIdx === exIdx && s.eid === eid
-    );
-    // Fallback for old sessions without planExIdx: match eid only, same planExIdx or unknown
-    if (!exSets.length) {
-      exSets = getSets(last).filter(s =>
-        s.eid === eid && (s.planExIdx == null || s.planExIdx === exIdx)
-      );
-    }
-    // Last resort: any set with matching eid (handles very old data)
-    if (!exSets.length) {
-      exSets = getSets(last).filter(s => s.eid === eid);
-    }
-    if (!exSets.length) return null;
-
-    // Return as fresh sets: done reset, extra cleared (previous extras become base sets).
-    // isWarmup is propagated from the saved set so isWarmupSet() keeps working on carryover.
-    return exSets.map((s, i) => ({
-      setN:      i + 1,
-      reps:      s.reps,
-      weight:    s.weight,
-      done:      false,
-      planNote:  s.planNote  || null,
-      planExIdx: exIdx,
-      ...(s.isWarmup ? { isWarmup: true } : {}),
-      // extra intentionally omitted → previous extra sets become normal base sets
-    }));
-  };
-
   const start = (pId, dId) => {
     t0Ref.current = Date.now();
     setElapsed(0); setWarnEmpty(false);
@@ -3605,22 +3187,15 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     const day = activePlans.find(p=>p.id===pId)?.days.find(d=>d.id===dId);
     if (!day) return;
     const init = {};
+    // Fix 1: key by instance position so duplicate exercises stay separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      // Prefer last session values; fall back to plan defaults
-      const lastDefaults = getLastSessionSetDefaults(pId, dId, exIdx, ex.eid);
-      if (lastDefaults) {
-        init[key] = lastDefaults;
-      } else {
-        init[key] = Array.from({length: ex.sets}, (_, i) => ({
-          setN:      i + 1,
-          reps:      ex.reps,
-          weight:    ex.weight,
-          done:      false,
-          planNote:  ex.note || null,
-          planExIdx: exIdx,
-        }));
-      }
+      init[key] = Array.from({length: ex.sets}, (_, i) => ({
+        setN: i+1, reps: ex.reps, weight: ex.weight, done: false,
+        // Copy plan-level note + position so progression logic can exclude warmup sets
+        planNote: ex.note || null,
+        planExIdx: exIdx,
+      }));
     });
     setSets(init); setPhase("active");
   };
@@ -3640,20 +3215,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     return upd;
   });
   const upd    = (ikey,idx,f,v) => setSets(p=>({...p,[ikey]:(p[ikey]||[]).map((s,i)=>i===idx?{...s,[f]:parseFloat(v)||0}:s)}));
-  // Fix 4: new sets carry metadata + extra:true so they are robustly identified
-  const addSet = (ikey, tmpl) => setSets(p => {
-    const cur = p[ikey] || [];
-    const newSet = {
-      setN:      cur.length + 1,
-      reps:      tmpl.reps,
-      weight:    tmpl.weight,
-      done:      false,
-      extra:     true,          // Fix 3: explicit marker
-      planNote:  tmpl.planNote  || null,
-      planExIdx: tmpl.planExIdx ?? null,
-    };
-    return { ...p, [ikey]: [...cur, newSet] };
-  });
+  const addSet = (ikey,tmpl)    => setSets(p=>({...p,[ikey]:[...(p[ikey]||[]),{setN:(p[ikey]||[]).length+1,reps:tmpl.reps,weight:tmpl.weight,done:false}]}));
 
   const discardDraft = () => {
     clearWorkoutDraft(); t0Ref.current = null;
@@ -3669,20 +3231,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     // Fix 1: iterate by instance key to keep duplicate exercises separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
-      (sets[key]||[]).filter(s=>s.done).forEach(s => {
-        const exercise = (allExercises||[]).find(e => e.id === ex.eid);
-        const warmup   = isWarmupSet(s, exercise);
-        allSets.push({
-          eid:       ex.eid,
-          setN:      s.setN,
-          reps:      s.reps,
-          weight:    s.weight,
-          planNote:  s.planNote  ?? (ex.note || null),
-          planExIdx: s.planExIdx ?? exIdx,
-          ...(warmup      ? { isWarmup: true  } : {}),
-          ...(s.extra     ? { extra:    true  } : {}),
-        });
-      });
+      (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({eid:ex.eid,...s}));
     });
     if (allSets.length === 0) { setWarnEmpty(true); return; }
     setWarnEmpty(false); clearWorkoutDraft();
@@ -3696,7 +3245,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
       <div style={{fontSize:30,fontWeight:900,color:T.accent,marginBottom:8}}>Stark gemacht!</div>
       <div style={{color:T.sub,fontSize:16,marginBottom:6}}>{fmt(elapsed)}</div>
       <div style={{color:T.muted,fontSize:13,marginBottom:40}}>
-        {Object.values(sets).flat().filter(s=>s.done).length} Sätze · {Math.round(vol(Object.values(sets).flat(), allExercises)).toLocaleString()} kg
+        {Object.values(sets).flat().filter(s=>s.done).length} Sätze · {Math.round(vol(Object.values(sets).flat())).toLocaleString()} kg
       </div>
       <Btn onClick={()=>setPhase("select")} full style={{padding:14}}>Neues Training</Btn>
     </div>
@@ -3707,8 +3256,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   if (phase === "confirm") {
     const cp  = activePlans.find(p=>p.id===confirmPlanId);
     const cd  = cp?.days.find(d=>d.id===confirmDayId);
-    // Fix 1: no setter during render — effect below handles the reset
-    if (!cp || !cd) return null;
+    if (!cp || !cd) { setPhase("select"); return null; }
     const totalSets = cd.exercises.reduce((s,e)=>s+e.sets, 0);
     return (
       <div style={{padding:"0 16px 32px"}}>
@@ -3732,7 +3280,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
             const exercise = (allExercises||[]).find(e=>e.id===ex.eid);
             const override = exerciseOverrides?.[ex.eid] || {};
             const resolved = {...(exercise||{}), ...override};
-            const unitType = resolved.unitType || "reps";
+            const unitType = resolved.unitType || "reps+kg"; // undefined = standard kg+Wdh
             return (
               <div key={instKey(ex.eid, i)} style={{
                 display:"flex", justifyContent:"space-between", alignItems:"center",
@@ -3896,7 +3444,6 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
           allExercises={allExercises}
           exerciseOverrides={exerciseOverrides}
           sets={sets}
-          setSets={setSets}
           toggle={toggle}
           upd={upd}
           addSet={addSet}
@@ -3952,9 +3499,9 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const [detailSess,setDetailSess] = useState(null);
 
   // ── Pre-computed data ─────────────────────────────────
-  const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>getSets(s).filter(isDone).map(x=>x.eid)))],[sessions]);
-  const prs       = useMemo(()=>getPRs(sessions,allExercises),[sessions,allExercises]);
-  const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets,allExercises),0),[sessions,allExercises]);
+  const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>s.sets.filter(isDone).map(x=>x.eid)))],[sessions]);
+  const prs       = useMemo(()=>getPRs(sessions),[sessions]);
+  const totalVol  = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
   const weekSets  = useMemo(()=>getWeeklySets(sessions,allExercises,1),[sessions,allExercises]);
   const sets4w    = useMemo(()=>getWeeklySets(sessions,allExercises,4),[sessions,allExercises]);
   const lastTrained=useMemo(()=>getLastTrainedDays(sessions,allExercises),[sessions,allExercises]);
@@ -3966,18 +3513,18 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
     if(!sessions||sessions.length<2) return [];
     const ps = getProgressionSettings(settings);
     const strengthEids=[...new Set(
-      sessions.flatMap(s=>getSets(s).filter(x=>isDone(x)&&(x.weight||0)>0).map(x=>x.eid))
+      sessions.flatMap(s=>s.sets.filter(x=>isDone(x)&&(x.weight||0)>0).map(x=>x.eid))
     )];
     return strengthEids.slice(0,12).map(eid=>{
       const ex=(allExercises||[]).find(e=>e.id===eid);
       if(!ex||(ex.unitType&&ex.unitType!=="reps")) return null;
       const planEx={eid, weight:0, sets:3, reps:10};
       // Fix 2: use actual last-known weight so deload suggestion is non-zero
-      const history=getExercisePerformanceHistory(eid, sessions, allExercises);
+      const history=getExercisePerformanceHistory(eid, sessions);
       const lastKnownWeight = history.length>0 ? (history[history.length-1].sets[0]?.weight||0) : 0;
       const planExWithWeight = {...planEx, weight: lastKnownWeight};
-      const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings,allExercises);
-      const stag=detectExerciseStagnation(eid,sessions,settings,allExercises);
+      const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings);
+      const stag=detectExerciseStagnation(eid,sessions,settings);
       return { eid, name:ex.name, cat:ex.cat, suggestion:sug, stagnation:stag };
     }).filter(Boolean);
   },[sessions,allExercises,settings]);
@@ -3986,7 +3533,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const exObj     = useMemo(()=>selEx?(allExercises||[]).find(e=>e.id===selEx):null,[selEx,allExercises]);
   const exUnitType= exObj?.unitType||"reps";
   const isTimeEx  = exUnitType==="secs"||exUnitType==="mins";
-  const exHistory = useMemo(()=>selEx?getExHistory(sessions,selEx,allExercises):[]   ,[sessions,selEx,allExercises]);
+  const exHistory = useMemo(()=>selEx?getExHistory(sessions,selEx):[]   ,[sessions,selEx]);
   const timeHist  = useMemo(()=>selEx?getTimeExHistory(sessions,selEx):[] ,[sessions,selEx]);
 
   // Trend analysis for selected exercise
@@ -4003,7 +3550,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
       volPct:     pctChange(vl),
       rm1Pct:     pctChange(rm),
       slope:      calcTrend(wt),
-      bestSet:    getBestSet(sessions,selEx,allExercises),
+      bestSet:    getBestSet(sessions,selEx),
       best1RM:    Math.max(0,...rm),
       last30Sets: now30.length,
       latestWt:   wt[wt.length-1],
@@ -4014,7 +3561,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   // Session detail overlay
   if (detailSess) {
     const byEx = {};
-    getSets(detailSess).filter(isDone).forEach(s=>{if(!byEx[s.eid])byEx[s.eid]=[];byEx[s.eid].push(s);});
+    detailSess.sets.filter(isDone).forEach(s=>{if(!byEx[s.eid])byEx[s.eid]=[];byEx[s.eid].push(s);});
     return (
       <div style={{position:"fixed",inset:0,background:T.bg,zIndex:200,overflowY:"auto"}}>
         <div style={{padding:"16px 16px 0",display:"flex",gap:10,alignItems:"center"}}>
@@ -4029,7 +3576,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
             {detailSess.source&&<Badge color={T.orange} style={{marginBottom:8}}>{detailSess.source} Import</Badge>}
             <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{fmtD(detailSess.date)}</div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:getSets(detailSess).filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(getSets(detailSess),allExercises)/100)/10).toFixed(1)}t`}].map(s=>(
+              {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:detailSess.sets.filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(detailSess.sets)/100)/10).toFixed(1)}t`}].map(s=>(
                 <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
                   <div style={{fontSize:18,fontWeight:900,color:T.text}}>{s.v}</div>
                   <div style={{fontSize:9,color:T.muted,marginTop:2}}>{s.l}</div>
@@ -4108,7 +3655,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         {sessions.length>2 && (
           <Card style={{marginBottom:12}}>
             <Lbl>VOLUMEN LETZTE 8 EINHEITEN</Lbl>
-            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets,allExercises)).reverse()} color={T.blue} height={68}/>
+            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={68}/>
           </Card>
         )}
 
@@ -4397,7 +3944,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
           <div style={{textAlign:"center",padding:"40px",color:T.muted,border:`1px dashed ${T.border}`,borderRadius:16,fontSize:14}}>Noch keine Trainings.</div>
         )}
         {sessions.map(sess=>{
-          const v=vol(getSets(sess),allExercises);
+          const v=vol(sess.sets);
           const dn=plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
           return(
             <Card key={sess.id} style={{marginBottom:8,padding:0,overflow:"hidden"}}>
@@ -4410,7 +3957,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
                         {sess.source&&<Badge color={T.orange}>{sess.source}</Badge>}
                       </div>
                       <div style={{fontSize:12,color:T.sub}}>{fmtD(sess.date)}</div>
-                      <div style={{fontSize:11,color:T.muted,marginTop:3}}>{(Array.isArray(sess.sets)?sess.sets:[]).filter(isDone).length} Sätze · {sess.duration} min</div>
+                      <div style={{fontSize:11,color:T.muted,marginTop:3}}>{sess.sets.filter(isDone).length} Sätze · {sess.duration} min</div>
                     </div>
                     <div style={{textAlign:"right",marginLeft:12}}>
                       <div style={{fontSize:15,fontWeight:800,color:T.accent}}>{Math.round(v).toLocaleString()} kg</div>
@@ -4699,7 +4246,7 @@ const AchievementsScreen = ({sessions, metrics, streak, cardio, allExercises=[]}
 // ═══════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════
-const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, allExercises, onStartWorkout, onGoTo}) => {
+const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, onStartWorkout, onGoTo}) => {
   const latest   = metrics[metrics.length-1];
   const {sessions:weekS, cardio:weekC} = useMemo(()=>getWeekActivities(sessions,cardio),[sessions,cardio]);
   const weekGoal = settings.weeklyGoal||3;
@@ -4788,13 +4335,13 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
               <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:3}}>
-                {plans.find(p=>p.id===lastSession?.planId)?.days?.find(d=>d.id===lastSession?.dayId)?.name||"Training"}
+                {plans.find(p=>p.id===lastSession.planId)?.days.find(d=>d.id===lastSession.dayId)?.name||"Training"}
               </div>
               <div style={{fontSize:12,color:T.sub}}>
-                {Array.isArray(lastSession?.sets) ? lastSession.sets.filter(isDone).length : 0} Sätze · {lastSession?.duration||0} min · {(Math.round(vol(Array.isArray(lastSession?.sets)?lastSession.sets:[],allExercises)/100)/10).toFixed(1)}t
+                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets)/100)/10).toFixed(1)}t
               </div>
             </div>
-            <div style={{fontSize:11,color:T.muted}}>{lastSession?.date ? fmtDShort(lastSession.date) : ""}</div>
+            <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastSession.date)}</div>
           </div>
         </Card>
       )}
@@ -4804,15 +4351,15 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
           <Lbl>LETZTE AKTIVITÄT</Lbl>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div style={{display:"flex",gap:10,alignItems:"center"}}>
-              <span style={{fontSize:20}}>{CARDIO_ICONS[lastCardio?.type]||"🏃"}</span>
+              <span style={{fontSize:20}}>{CARDIO_ICONS[lastCardio.type]||"🏃"}</span>
               <div>
-                <div style={{fontSize:14,fontWeight:700,color:T.text}}>{lastCardio?.type||""}</div>
+                <div style={{fontSize:14,fontWeight:700,color:T.text}}>{lastCardio.type}</div>
                 <div style={{fontSize:12,color:T.sub}}>
-                  {lastCardio?.duration||0} min{lastCardio?.distance?` · ${lastCardio.distance} km`:""}
+                  {lastCardio.duration} min{lastCardio.distance?` · ${lastCardio.distance} km`:""}
                 </div>
               </div>
             </div>
-            <div style={{fontSize:11,color:T.muted}}>{lastCardio?.date ? fmtDShort(lastCardio.date) : ""}</div>
+            <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastCardio.date)}</div>
           </div>
         </Card>
       )}
@@ -4840,15 +4387,15 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
 const SettingsScreen = ({
   settings, onUpdate,
   sessions, metrics, plans, cardio,
-  customExercises, exerciseOverrides, allExercises,
-  onReset, onImport, importError,
+  customExercises, exerciseOverrides,
+  onReset, onImport,
 }) => {
   const [weekGoal,setWeekGoal] = useState(String(settings.weeklyGoal||3));
   const [confirmReset,setConfirmReset] = useState(false);
   const [importStatus,setImportStatus] = useState(null); // null | "ok" | "error" | string
   const importRef = useRef(null);
 
-  const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets,allExercises),0),[sessions,allExercises]);
+  const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
   const streak   = useMemo(()=>calcStreak(sessions,cardio),[sessions,cardio]);
 
   // ── Export ───────────────────────────────────────────
@@ -4881,23 +4428,49 @@ const SettingsScreen = ({
   const handleImportFile = e => {
     const file = e.target.files?.[0];
     if (!file) return;
-    e.target.value = "";
+    e.target.value = ""; // reset so same file can be re-selected
     const reader = new FileReader();
     reader.onload = ev => {
       try {
         const raw = JSON.parse(ev.target.result);
-        const imported = sanitizeBackup(raw); // central validation + sanitization
-        // importAll handles atomicWrite + reload on success, or sets importError on failure
-        setImportStatus("loading");
-        onImport(imported);
-        // If we reach here without reload, importAll failed – importError state carries the message
-        // Show a short "processing" note; the importError prop will render the real error
-        setTimeout(() => setImportStatus(null), 200);
+
+        // Validation
+        if (typeof raw !== "object" || !raw) throw new Error("Kein gültiges JSON-Objekt");
+        if (!raw._fittrack_version) throw new Error("Keine FitTrack-Backup-Datei");
+
+        // Normalise – older exports may miss some fields
+        const imported = {
+          settings:          (typeof raw.settings === "object" && raw.settings) ? raw.settings : {},
+          sessions:          Array.isArray(raw.sessions)   ? raw.sessions   : [],
+          cardio:            Array.isArray(raw.cardio)     ? raw.cardio     : [],
+          plans:             Array.isArray(raw.plans)      ? raw.plans      : [],
+          metrics:           Array.isArray(raw.metrics)    ? raw.metrics    : [],
+          customExercises:   Array.isArray(raw.customExercises) ? raw.customExercises : [],
+          exerciseOverrides: (typeof raw.exerciseOverrides === "object" && raw.exerciseOverrides) ? raw.exerciseOverrides : {},
+        };
+
+        // Sanity: sessions need id + date + sets
+        const validSessions = imported.sessions.filter(s => s?.id && s?.date && Array.isArray(s?.sets));
+        if (imported.sessions.length !== validSessions.length) {
+          console.warn(`FitTrack import: ${imported.sessions.length - validSessions.length} ungültige Sessions übersprungen`);
+        }
+        imported.sessions = validSessions;
+
+        // Sanity: plans need id + name + days
+        imported.plans = imported.plans.filter(p => p?.id && p?.name && Array.isArray(p?.days));
+
+        onImport({...imported, settings:{...DEFAULT_SETTINGS, ...imported.settings, onboarded:true}});
+        setImportStatus("ok");
+        setTimeout(()=>setImportStatus(null), 4000);
       } catch(err) {
-        setImportStatus("error:" + (err.message || "Ungültige Datei"));
+        setImportStatus(`Fehler: ${err.message || "Ungültige Datei"}`);
+        setTimeout(()=>setImportStatus(null), 6000);
       }
     };
-    reader.onerror = () => setImportStatus("error:Datei konnte nicht gelesen werden");
+    reader.onerror = () => {
+      setImportStatus("Datei konnte nicht gelesen werden");
+      setTimeout(()=>setImportStatus(null), 6000);
+    };
     reader.readAsText(file);
   };
 
@@ -4994,25 +4567,17 @@ const SettingsScreen = ({
           style={{display:"none"}}
         />
 
-        {/* Status feedback – local parse errors */}
-        {importStatus && importStatus !== "loading" && (
+        {/* Status feedback */}
+        {importStatus && (
           <div style={{
             padding:"10px 12px", borderRadius:10, fontSize:13, fontWeight:600,
-            background: T.red+"22", color: T.red,
-            border:`1px solid ${T.red+"44"}`,
+            background: importStatus==="ok" ? T.green+"22" : T.red+"22",
+            color:      importStatus==="ok" ? T.green       : T.red,
+            border:`1px solid ${importStatus==="ok" ? T.green+"44" : T.red+"44"}`,
           }}>
-            {importStatus}
-          </div>
-        )}
-        {/* Global import error from importAll (quota, serialisation, etc.) */}
-        {importError && (
-          <div style={{
-            padding:"10px 12px", borderRadius:10, fontSize:13, fontWeight:600,
-            background: T.red+"22", color: T.red,
-            border:`1px solid ${T.red+"44"}`,
-            marginTop: importStatus ? 6 : 0,
-          }}>
-            ❌ {importError}
+            {importStatus==="ok"
+              ? "✓ Backup erfolgreich importiert – alle Daten wiederhergestellt"
+              : importStatus}
           </div>
         )}
 
@@ -5264,78 +4829,6 @@ const SettingsScreen = ({
 // ═══════════════════════════════════════════════════════
 // ROOT APP
 // ═══════════════════════════════════════════════════════
-// ── Error Boundary ──────────────────────────────────────────────────────
-// Without this, any render crash shows a completely blank screen.
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { error: null };
-  }
-  static getDerivedStateFromError(err) {
-    return { error: err };
-  }
-  componentDidCatch(err, info) {
-    console.error("FitTrack render error:", err, info?.componentStack);
-  }
-  render() {
-    if (this.state.error) {
-      // Use hardcoded safe colors – T / THEME may not be in scope or may be the crash source
-      const bg="#07070F", text="#E8E8F0", red="#FF4444", muted="#666680",
-            accent="#C8FF00", card="#0F0F1C";
-      const btnStyle = (col) => ({
-        background:col, color:"#07070F", border:"none", borderRadius:10,
-        padding:"11px 20px", fontWeight:800, fontSize:13, cursor:"pointer",
-        width:"100%", marginBottom:8,
-      });
-      return (
-        <div style={{padding:32, fontFamily:"-apple-system,sans-serif",
-          background:bg, color:text, minHeight:"100vh",
-          display:"flex", flexDirection:"column", alignItems:"center",
-          justifyContent:"flex-start", paddingTop:60}}>
-          <div style={{fontSize:40, marginBottom:16}}>⚠️</div>
-          <div style={{fontSize:18, fontWeight:800, color:red, marginBottom:8}}>
-            Fehler beim Laden
-          </div>
-          <div style={{fontSize:13, color:muted, marginBottom:4,
-            textAlign:"center", maxWidth:300, lineHeight:1.6}}>
-            {this.state.error?.message || "Unbekannter Fehler"}
-          </div>
-          <details style={{marginBottom:24, maxWidth:300, width:"100%"}}>
-            <summary style={{fontSize:11, color:muted, cursor:"pointer", textAlign:"center"}}>
-              Details
-            </summary>
-            <pre style={{fontSize:10, color:muted, overflowX:"auto", whiteSpace:"pre-wrap",
-              background:card, padding:8, borderRadius:8, marginTop:6}}>
-              {this.state.error?.stack || ""}
-            </pre>
-          </details>
-          {/* Option 1: delete only import/exercise-overrides data (large blobs) */}
-          <button onClick={()=>{
-              ["exerciseOverrides","customExercises"].forEach(k =>
-                localStorage.removeItem("ft5_"+k));
-              window.location.reload();
-            }} style={btnStyle("#FF6B35")}>
-            Nur Importdaten löschen
-          </button>
-          {/* Option 2: full reset */}
-          <button onClick={()=>{
-              Object.keys(localStorage)
-                .filter(k=>k.startsWith("ft5_"))
-                .forEach(k=>localStorage.removeItem(k));
-              window.location.reload();
-            }} style={btnStyle(accent)}>
-            App komplett zurücksetzen
-          </button>
-          <div style={{fontSize:11, color:muted, marginTop:4, textAlign:"center"}}>
-            Beim kompletten Zurücksetzen gehen alle Trainingsdaten verloren.
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
 function App() {
   const [settings, setSettings] = usePersistedState("settings", DEFAULT_SETTINGS);
   const [sessions, setSessions] = usePersistedState("sessions", SEED_SESSIONS);
@@ -5349,18 +4842,11 @@ function App() {
   const [tab,      setTab]      = useState("dashboard");
   const [showMore, setShowMore] = useState(false);
   const [preselectedPlanId, setPreselectedPlanId] = useState(null);
-  const [importError, setImportError] = useState(null); // null | string
 
   // Full exercise database = base + extra + user-created
   // allExercises are the raw entries; resolved = {...ex, ...overrides[ex.id]}
   const allExercises = useMemo(() => [...ALL_EDB_BASE, ...customExercises], [customExercises]);
   const resolveEx = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
-
-  // Hide boot screen after first successful render
-  useEffect(() => {
-    const _boot = document.getElementById('boot-screen');
-    if (_boot) { _boot.style.opacity = '0'; setTimeout(() => _boot.remove(), 450); }
-  }, []); // runs once after mount
 
   // Auto-expire deload when activeDeloadUntil is in the past
   useEffect(() => {
@@ -5402,35 +4888,15 @@ function App() {
     setSettings({...DEFAULT_SETTINGS,onboarded:false});
   }, []);
 
-  const importAll = useCallback((rawImported) => {
-    setImportError(null);
-
-    // 1. Re-sanitize defensively regardless of caller
-    let imported;
-    try {
-      imported = {
-        settings:          sanitizeSettings(rawImported.settings),
-        sessions:          sanitizeSessions(rawImported.sessions),
-        cardio:            sanitizeCardio(rawImported.cardio),
-        plans:             sanitizePlans(rawImported.plans, MY_PLANS),
-        metrics:           sanitizeMetrics(rawImported.metrics),
-        customExercises:   sanitizeCustomExercises(rawImported.customExercises),
-        exerciseOverrides: sanitizeExerciseOverrides(rawImported.exerciseOverrides),
-      };
-    } catch (e) {
-      setImportError("Backup-Validierung fehlgeschlagen: " + (e.message || "Unbekannter Fehler"));
-      return;
-    }
-
-    // 2. Write atomically – no reload on quota/serialisation errors
-    const result = persistBackupAtomically(imported);
-    if (!result.ok) {
-      setImportError(result.error);
-      return;
-    }
-
-    // 3. Only reload on full success – app re-reads clean state from localStorage
-    window.location.reload();
+  // Fix 4: Import handler – fully replaces all state from backup
+  const importAll = useCallback(({settings:s, sessions:se, cardio:ca, plans:pl, metrics:me, customExercises:cx, exerciseOverrides:eo}) => {
+    if (s)  setSettings(s);
+    if (se) setSessions(se);
+    if (ca) setCardio(ca);
+    if (pl) setPlans(pl);
+    if (me) setMetrics(me);
+    if (cx) setCustomExercises(cx);
+    if (eo) setExerciseOverrides(eo);
   }, []);
   const finishOnboarding = useCallback(({name,goal,weeklyGoal,weight}) => {
     setSettings(p=>({...p,name,fitnessGoal:goal,weeklyGoal,onboarded:true,bodyWeight:weight||null}));
@@ -5442,7 +4908,7 @@ function App() {
     setTab("workout");
   }, []);
 
-  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding} onImport={importAll} importError={importError}/>;
+  if (!settings.onboarded) return <OnboardingScreen onDone={finishOnboarding} onImport={importAll}/>;
 
   const TABS = [
     {id:"dashboard", icon:"⌂",  label:"Home"},
@@ -5465,9 +4931,7 @@ function App() {
     setShowMore(false);
   };
 
-  // Screen is rendered directly (not as an inline component) to avoid
-  // React unmounting/remounting on every App render (inline component bug).
-  const renderScreen = () => {
+  const Screen = () => {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
       case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings} sessions={sessions}/>;
@@ -5477,7 +4941,7 @@ function App() {
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
       case "achievements": return <AchievementsScreen sessions={sessions} metrics={metrics} streak={streak} cardio={cardio} allExercises={allExercises}/>;
       case "exercises":    return <ExerciseDBScreen allExercises={allExercises} customExercises={customExercises} setCustomExercises={setCustomExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides}/>;
-      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} allExercises={allExercises} onUpdate={updateSettings} onReset={resetAll} onImport={importAll} importError={importError}/>;
+      case "settings":     return <SettingsScreen sessions={sessions} metrics={metrics} plans={plans} settings={settings} cardio={cardio} customExercises={customExercises} exerciseOverrides={exerciseOverrides} onUpdate={updateSettings} onReset={resetAll} onImport={importAll}/>;
       default:             return null;
     }
   };
@@ -5492,7 +4956,7 @@ function App() {
         <span>● ● ●</span>
       </div>
       <div style={{paddingBottom:74,minHeight:"calc(100vh - 44px)",overflowY:"auto"}}>
-        {renderScreen()}
+        <Screen/>
       </div>
       {/* Punkt 8: Badge unlock overlay after training */}
       {newBadges.length>0&&(
@@ -5528,17 +4992,8 @@ function App() {
   );
 }
 
-    // ── Mount React ────────────────────────────────────────────────────────
-    try {
-      const container = document.getElementById('root');
-      const root = ReactDOM.createRoot(container);
-      root.render(<ErrorBoundary><App/></ErrorBoundary>);
-      // Boot screen is hidden inside App's first useEffect (see App component above).
-      // Safety fallback: if the useEffect never fires (catastrophic crash caught by
-      // ErrorBoundary), the ErrorBoundary render itself is visible – no blank screen.
-    } catch(e) {
-      console.error('[FitTrack] Fatal mount error:', e);
-      _ftShowError(e && e.message ? e.message : 'App konnte nicht gestartet werden');
-    }</script>
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App/>);
+  </script>
 </body>
 </html>
