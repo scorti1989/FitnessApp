@@ -14,6 +14,7 @@
   <title>FitTrack</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+    @keyframes pulse{0%,100%{opacity:1;transform:translateX(14px) scale(1)}50%{opacity:0.5;transform:translateX(14px) scale(1.4)}}
     html,body{background:#07070F;height:100%;overscroll-behavior:none;}
     #root{height:100%;}
     input[type=number]::-webkit-inner-spin-button,
@@ -1377,28 +1378,48 @@ const AudioEngine = (() => {
 // tickStart: seconds before end where beeping begins (from settings)
 // ─────────────────────────────────────────────────────────────────────
 const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
+  // Use a timestamp-based approach so the timer stays accurate when the user
+  // switches tabs or leaves the app. endAt is the absolute finish time.
+  const endAt    = useRef(Date.now() + seconds * 1000);
   const [left, setLeft] = useState(seconds);
   const intervalRef = useRef(null);
-  const ticked = useRef(new Set());
+  const ticked   = useRef(new Set());
+  const doneFired= useRef(false);
 
   useEffect(() => {
+    // Re-request notification permission so we can alert when in background
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
     intervalRef.current = setInterval(() => {
-      setLeft(prev => {
-        const next = prev - 1;
-        // Ticks in the final tickStart seconds
-        if (next > 0 && next <= tickStart && !ticked.current.has(next)) {
-          ticked.current.add(next);
-          AudioEngine.tick();
+      const remaining = Math.round((endAt.current - Date.now()) / 1000);
+      const next = Math.max(0, remaining);
+      setLeft(next);
+
+      // Ticks in final tickStart seconds
+      if (next > 0 && next <= tickStart && !ticked.current.has(next)) {
+        ticked.current.add(next);
+        AudioEngine.tick();
+      }
+      // Done – fire once
+      if (next <= 0 && !doneFired.current) {
+        doneFired.current = true;
+        clearInterval(intervalRef.current);
+        AudioEngine.done();
+        // Notify even if app is in background
+        if ('Notification' in window && Notification.permission === 'granted') {
+          try {
+            new Notification('FitTrack', {
+              body: 'Pause vorbei – nächster Satz!',
+              icon: 'icons/icon.svg',
+              silent: true, // AudioEngine already played the sound
+            });
+          } catch(_) {}
         }
-        if (next <= 0) {
-          clearInterval(intervalRef.current);
-          AudioEngine.done();
-          onDone();
-          return 0;
-        }
-        return next;
-      });
-    }, 1000);
+        onDone();
+      }
+    }, 500); // poll twice per second for accuracy after tab switch
     return () => clearInterval(intervalRef.current);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -3428,7 +3449,7 @@ function clearWorkoutDraft() {
   try { localStorage.removeItem(WS_KEY); } catch {}
 }
 
-const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessions, onSave, preselectedPlanId}) => {
+const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessions, onSave, preselectedPlanId, globalRest, setGlobalRest}) => {
   // Fix 3: only non-archived plans
   const activePlans = useMemo(() => (plans||[]).filter(p => !p.archived), [plans]);
 
@@ -3440,7 +3461,9 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const [dayId,setDayId]   = useState(() => hasDraft ? draft.dayId  : null);
   const [sets,setSets]     = useState(() => hasDraft ? (draft.sets||{}) : {});
   const [note,setNote]     = useState(() => hasDraft ? (draft.note||"") : "");
-  const [rest,setRest]     = useState(null);
+  // rest timer is lifted to App via globalRest/setGlobalRest so it persists across tabs
+  const rest    = globalRest;
+  const setRest = setGlobalRest;
   // ExerciseTimer state: {ikey, setIdx, targetSecs} or null
   const [exTimer, setExTimer] = useState(null);
   const [warnEmpty,setWarnEmpty] = useState(false);
@@ -3720,12 +3743,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
 
   return (
     <div style={{padding:"0 16px 24px"}}>
-      {rest&&<RestTimer
-          seconds={rest.secs}
-          onDone={()=>setRest(null)}
-          onSkip={()=>setRest(null)}
-          tickStart={settings?.timerSettings?.restTickStart ?? 10}
-        />}
+      {/* RestTimer is now rendered globally in App so it persists across tab switches */}
         {/* Exercise timer overlay (Punkt 6) */}
         {exTimer&&<ExerciseTimer
           targetSecs={exTimer.targetSecs}
@@ -5165,6 +5183,8 @@ function App() {
   const [tab,      setTab]      = useState("dashboard");
   const [showMore, setShowMore] = useState(false);
   const [preselectedPlanId, setPreselectedPlanId] = useState(null);
+  // Global rest timer – lives in App so it keeps running across all screens
+  const [globalRest, setGlobalRest] = useState(null); // null | {secs, endAt}
 
   // Full exercise database = base + extra + user-created
   // allExercises are the raw entries; resolved = {...ex, ...overrides[ex.id]}
@@ -5258,7 +5278,7 @@ function App() {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
       case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings} sessions={sessions}/>;
-      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} sessions={sessions} onSave={saveSession} preselectedPlanId={preselectedPlanId}/>;
+      case "workout":      return <WorkoutScreen plans={plans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} sessions={sessions} onSave={saveSession} preselectedPlanId={preselectedPlanId} globalRest={globalRest} setGlobalRest={setGlobalRest}/>;
       case "cardio":       return <CardioScreen cardio={cardio} onSave={saveCardio} settings={settings}/>;
       case "progress":     return <ProgressScreen sessions={sessions} plans={plans} cardio={cardio} allExercises={allExercises} exerciseOverrides={exerciseOverrides} settings={settings} onDeleteSession={id=>setSessions(p=>p.filter(x=>x.id!==id))}/>;
       case "body":         return <BodyScreen metrics={metrics} settings={settings} onSaveMetric={saveMetric} onUpdateSettings={updateSettings}/>;
@@ -5278,6 +5298,8 @@ function App() {
         <span style={{color:T.accentDim,fontWeight:800,letterSpacing:0.8}}>FITTRACK</span>
         <span>● ● ●</span>
       </div>
+      {/* Global rest timer overlay – visible on all screens */}
+      {globalRestOverlay}
       <div style={{paddingBottom:74,minHeight:"calc(100vh - 44px)",overflowY:"auto"}}>
         <Screen/>
       </div>
@@ -5308,6 +5330,15 @@ function App() {
             <span style={{fontSize:18}}>{t.icon}</span>
             <span style={{fontSize:9,fontWeight:700,letterSpacing:0.3,color:(tab===t.id||(t.id==="more"&&isMoreTab))?T.accent:T.muted}}>{t.label}</span>
             {(tab===t.id||(t.id==="more"&&isMoreTab))&&<div style={{width:3,height:3,borderRadius:"50%",background:T.accent}}/>}
+            {globalRest && t.id==="workout" && tab!=="workout" && (
+              <div style={{
+                position:"absolute",top:4,right:"50%",transform:"translateX(14px)",
+                width:7,height:7,borderRadius:"50%",
+                background:T.orange,
+                boxShadow:`0 0 6px ${T.orange}`,
+                animation:"pulse 1s infinite",
+              }}/>
+            )}
           </button>
         ))}
       </div>
