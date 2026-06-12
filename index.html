@@ -5274,7 +5274,8 @@ function App() {
     setShowMore(false);
   };
 
-  const Screen = () => {
+  // renderScreen: plain function (NOT inline component) to avoid React remount bug
+  const renderScreen = () => {
     switch (tab) {
       case "dashboard":    return <DashboardScreen sessions={sessions} plans={plans} metrics={metrics} settings={settings} cardio={cardio} streak={streak} achievements={achievements} allExercises={allExercises} onStartWorkout={()=>goTab("workout")} onGoTo={goTab}/>;
       case "plans":        return <PlansScreen plans={plans} setPlans={setPlans} allExercises={allExercises} exerciseOverrides={exerciseOverrides} setExerciseOverrides={setExerciseOverrides} customExercises={customExercises} setCustomExercises={setCustomExercises} onSelectPlan={handleSelectPlan} settings={settings} sessions={sessions}/>;
@@ -5291,6 +5292,16 @@ function App() {
 
   const isMoreTab = MORE.some(m=>m.id===tab);
 
+  // Global rest timer overlay – defined as variable so it can be used in JSX below
+  const restOverlay = globalRest ? (
+    <RestTimer
+      seconds={globalRest.secs}
+      onDone={()=>setGlobalRest(null)}
+      onSkip={()=>setGlobalRest(null)}
+      tickStart={settings?.timerSettings?.restTickStart ?? 10}
+    />
+  ) : null;
+
   return (
     <div style={{background:T.bg,minHeight:"100vh",maxWidth:390,margin:"0 auto",fontFamily:"-apple-system,'Helvetica Neue',sans-serif",color:T.text,position:"relative",boxShadow:"0 0 120px rgba(0,0,0,0.99)"}}>
       <div style={{padding:"10px 20px 0",display:"flex",justifyContent:"space-between",fontSize:12,color:T.muted}}>
@@ -5298,10 +5309,9 @@ function App() {
         <span style={{color:T.accentDim,fontWeight:800,letterSpacing:0.8}}>FITTRACK</span>
         <span>● ● ●</span>
       </div>
-      {/* Global rest timer overlay – visible on all screens */}
-      {globalRestOverlay}
+      {restOverlay}
       <div style={{paddingBottom:74,minHeight:"calc(100vh - 44px)",overflowY:"auto"}}>
-        <Screen/>
+        {renderScreen()}
       </div>
       {/* Punkt 8: Badge unlock overlay after training */}
       {newBadges.length>0&&(
