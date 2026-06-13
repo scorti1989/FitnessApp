@@ -39,7 +39,7 @@
 const T = {
   bg:"#07070F", bgCard:"#0F0F1C", bgAlt:"#161626", bgInput:"#1A1A2E",
   accent:"#C8FF00", accentDim:"#8FAF00", accentGlow:"rgba(200,255,0,0.08)",
-  text:"#ECEEFF", sub:"#7070A0", muted:"#404060", border:"#1C1C2E",
+  text:"#ECEEFF", sub:"#9898C8", muted:"#606080", border:"#1C1C2E",
   red:"#FF4060", orange:"#FF9020", blue:"#3090FF", purple:"#A855F7",
   green:"#00F090", teal:"#00C8C8", gold:"#FFD700", pink:"#FF60B0",
 };
@@ -108,8 +108,30 @@ const CARDIO_MET={Joggen:9.8,Spazieren:3.5,Radfahren:7.5,Schwimmen:8.0,HIIT:12.0
 // ═══════════════════════════════════════════════════════
 const uid     = () => `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
 // Unique key per plan-exercise instance (fixes duplicate-exercise bug)
+// Exercise ID aliases – duplicate exercises that should aggregate together
+const CANONICAL_EID = {
+  "e38": "e13",  // Latziehen zur Brust → Lat Pulldown (gleiche Übung)
+  "e39": "e14",  // Rudern Seilzug eng  → Sitzrudern (sehr ähnlich, gleiche Muskeln)
+};
+// Resolve canonical ID for analytics (so old sessions with e38/e39 still count)
+const canonicalEid = id => CANONICAL_EID[id] || id;
+
 // Format: "eid__planIndex" e.g. "e36__0" and "e36__4" for warmup vs. worksets
 const instKey = (eid, idx) => `${eid}__${idx}`;
+
+// Central warmup-set guard used by all analytics.
+// Returns true when a set should be EXCLUDED from strength analysis.
+function isWarmupSet(set) {
+  if (!set) return false;
+  if (set.isWarmup) return true;
+  const note = (set.planNote || set.note || '').toLowerCase();
+  return note.includes('eingewöhnung') || note.includes('warm-up') || note.includes('warmup') || note.includes('warm');
+}
+
+// Central work-set guard: done, has weight, not warmup.
+function isWorkSet(set) {
+  return isDone(set) && (set.weight || 0) > 0 && !isWarmupSet(set);
+}
 const fmt     = s  => `${Math.floor(s/60).toString().padStart(2,"0")}:${(s%60).toString().padStart(2,"0")}`;
 const fmtD    = d  => new Date(d).toLocaleDateString("de-DE",{day:"numeric",month:"short",year:"numeric"});
 const fmtDShort=d  => new Date(d).toLocaleDateString("de-DE",{weekday:"short",day:"numeric",month:"short"});
@@ -133,8 +155,8 @@ const isDone = s => s.done !== false;
 // vol() sums weight×reps for strength sets only (weight>0 = rep-based)
 // Time exercises have weight=0 so they contribute 0 naturally, but
 // we explicitly guard to make intent clear.
-const vol = sets => sets
-  .filter(x => isDone(x) && (x.weight||0) > 0)
+const vol = sets => (Array.isArray(sets) ? sets : [])
+  .filter(x => isDone(x) && (x.weight||0) > 0 && !isWarmupSet(x))
   .reduce((sum, x) => sum + (x.weight||0) * (x.reps||0), 0);
 
 const calcKcal = (type, durationMin, bodyWeightKg) =>
@@ -169,8 +191,10 @@ function getWeekActivities(sessions, cardio=[]) {
 // [FIX 2] getPRs – nur done===true Sätze mit Gewicht > 0
 function getPRs(sessions) {
   const p = {};
-  sessions.forEach(s => s.sets.forEach(x => {
-    if (isDone(x) && x.weight > 0 && (!p[x.eid] || x.weight > p[x.eid])) p[x.eid] = x.weight;
+  (sessions||[]).filter(s => !s.isDeload).forEach(s => s.sets.forEach(x => {
+    if (!isWorkSet(x)) return;
+    const ceid = canonicalEid(x.eid);
+    if (!p[ceid] || x.weight > p[ceid]) p[ceid] = x.weight;
   }));
   return p;
 }
@@ -188,11 +212,87 @@ const MUSCLE_GROUPS = {
   Rücken:    { label:"Rücken",   pull:true,  upper:true,  targetSets:10 },
   Beine:     { label:"Beine",    push:false, upper:false, targetSets:10 },
   Schultern: { label:"Schultern",push:true,  upper:true,  targetSets:8  },
-  Arme:      { label:"Arme",     push:false, upper:true,  targetSets:6  },
+  Bizeps:    { label:"Bizeps",   pull:true,  upper:true,  targetSets:6  },
+  Trizeps:   { label:"Trizeps",  push:true,  upper:true,  targetSets:6  },
   Core:      { label:"Core",     core:true,  upper:false, targetSets:6  },
+  // Legacy – kept so old Arme sessions still render without errors
+  Arme:      { label:"Arme",     push:false, upper:true,  targetSets:0, legacy:true },
   Aufwärmen: { label:"Aufwärmen",mobility:true,           targetSets:0  },
   Dehnung:   { label:"Dehnung",  mobility:true,           targetSets:0  },
 };
+
+// Primary + secondary muscle profile per exercise ID.
+// primaryMuscles: +1.0 set  |  secondaryMuscles: +0.5 set
+// Fallback: if eid not listed, use exercise.cat as primary (+1.0).
+const MUSCLE_PROFILE = {
+  // ── Brust ──────────────────────────────────────────────────────────────────
+  e1:  { primary:["Brust"],     secondary:["Trizeps","Schultern"] }, // Bankdrücken
+  e2:  { primary:["Brust"],     secondary:["Schultern","Trizeps"] }, // Kniebeugen → Brust nicht passend, kept as-is from DB
+  e11: { primary:["Brust"],     secondary:["Schultern","Trizeps"] }, // Schrägbank
+  e12: { primary:["Brust"],     secondary:["Trizeps","Schultern"] }, // Brustpresse
+  e30: { primary:["Brust"],     secondary:["Schultern"] },           // Pec Deck
+  e36: { primary:["Brust"],     secondary:["Trizeps","Schultern"] }, // Bankdrücken Gerät
+  // ── Schultern ──────────────────────────────────────────────────────────────
+  e7:  { primary:["Schultern"], secondary:["Trizeps"] },             // Schulterdrücken
+  e15: { primary:["Schultern"], secondary:[] },                       // Seitheben
+  e16: { primary:["Schultern"], secondary:[] },                       // Frontheben
+  e26: { primary:["Schultern"], secondary:["Rücken"] },              // Face Pull / Seile
+  e27: { primary:["Schultern"], secondary:[] },                       // Shrugs
+  e31: { primary:["Schultern"], secondary:["Trizeps"] },             // Schulterdrücken KH
+  e37: { primary:["Schultern"], secondary:["Trizeps"] },             // Schulterdrücken Masch.
+  e41: { primary:["Schultern"], secondary:[] },                       // Seitheben Kabel
+  // ── Rücken ─────────────────────────────────────────────────────────────────
+  e3:  { primary:["Rücken"],    secondary:["Bizeps"] },              // Kreuzheben
+  e4:  { primary:["Rücken"],    secondary:["Bizeps"] },              // Klimmzüge
+  e6:  { primary:["Rücken"],    secondary:["Bizeps"] },              // Klimmzüge BW
+  e10: { primary:["Rücken"],    secondary:["Bizeps"] },              // Rudern Langhantel
+  e13: { primary:["Rücken"],    secondary:["Bizeps"] },              // Lat Pulldown
+  e14: { primary:["Rücken"],    secondary:["Bizeps"] },              // Sitzrudern
+  e29: { primary:["Rücken"],    secondary:["Bizeps"] },              // Rudern KH
+  e34: { primary:["Rücken"],    secondary:["Bizeps"] },              // Hyperextension
+  e38: { primary:["Rücken"],    secondary:["Bizeps"] },              // Latziehen zur Brust
+  e39: { primary:["Rücken"],    secondary:["Bizeps"] },              // Rudern Seilzug eng
+  e40: { primary:["Rücken"],    secondary:["Bizeps"] },              // Rudern Maschine / Beinbeuger
+  // ── Beine ──────────────────────────────────────────────────────────────────
+  e5:  { primary:["Beine"],     secondary:[] },                       // Kniebeugen BW
+  e9:  { primary:["Beine"],     secondary:["Core"] },                // Beinpresse
+  e19: { primary:["Beine"],     secondary:[] },                       // Beinstrecker
+  e20: { primary:["Beine"],     secondary:[] },                       // Beinbeuger
+  e21: { primary:["Beine"],     secondary:[] },                       // Ausfallschritte
+  e22: { primary:["Beine"],     secondary:["Core"] },                // Hip Thrust / Brücke
+  e28: { primary:["Beine"],     secondary:[] },                       // Wadenheben
+  e42: { primary:["Beine"],     secondary:["Core"] },                // Hüftstrecken
+  e43: { primary:["Beine"],     secondary:["Core"] },                // Glute Bridge
+  // ── Arme ───────────────────────────────────────────────────────────────────
+  e8:  { primary:["Bizeps"],    secondary:[] },                       // Curls
+  e17: { primary:["Bizeps"],    secondary:[] },                       // Hammer Curls
+  e18: { primary:["Trizeps"],   secondary:[] },                       // Trizeps Kickback
+  e25: { primary:["Trizeps"],   secondary:[] },                       // Russian Twist → Core, keep below
+  e32: { primary:["Bizeps"],    secondary:[] },                       // Curls KH
+  e33: { primary:["Trizeps"],   secondary:[] },                       // Trizeps Stirndrücken
+  // ── Core ───────────────────────────────────────────────────────────────────
+  e23: { primary:["Core"],      secondary:[] },                       // Plank
+  e24: { primary:["Core"],      secondary:[] },                       // Crunch
+  e25: { primary:["Core"],      secondary:[] },                       // Russian Twist
+  e35: { primary:["Core"],      secondary:["Schultern"] },          // Kabelzug Core / Mountain Climber
+  // Custom exercises and others fall back to exercise.cat
+};
+
+// Resolve muscle contribution for one set (primary +1, secondary +0.5)
+// Returns { [muscleName]: weightedCount }
+function getMuscleContribution(eid, allExercises) {
+  const profile = MUSCLE_PROFILE[canonicalEid(eid)];
+  if (profile) {
+    const result = {};
+    (profile.primary||[]).forEach(m => { result[m] = (result[m]||0) + 1.0; });
+    (profile.secondary||[]).forEach(m => { result[m] = (result[m]||0) + 0.5; });
+    return result;
+  }
+  // Fallback: use exercise cat as primary
+  const cat = (allExercises||[]).find(e=>e.id===eid)?.cat;
+  if (cat && MUSCLE_GROUPS[cat]) return { [cat]: 1.0 };
+  return {};
+}
 
 // Estimated 1RM using Epley formula
 function calc1RM(weight, reps) {
@@ -203,8 +303,10 @@ function calc1RM(weight, reps) {
 // Get all strength (weight>0, non-time) history for one exercise
 function getExHistory(sessions, eid) {
   const rows = [];
-  sessions.forEach(s => {
-    s.sets.filter(x => isDone(x) && x.eid===eid && x.weight>0).forEach(x => {
+  const lookupEids = new Set([eid, ...Object.entries(CANONICAL_EID)
+    .filter(([,v]) => v === eid).map(([k]) => k)]);
+  (sessions||[]).filter(s => !s.isDeload).forEach(s => {
+    s.sets.filter(x => isWorkSet(x) && lookupEids.has(x.eid)).forEach(x => {
       rows.push({ date:s.date, weight:x.weight, reps:x.reps,
                   vol:x.weight*x.reps, rm1:calc1RM(x.weight,x.reps) });
     });
@@ -243,24 +345,30 @@ function pctChange(arr) {
 // Best set for an exercise
 function getBestSet(sessions, eid) {
   let best = null;
-  sessions.forEach(s => s.sets.filter(x=>isDone(x)&&x.eid===eid&&x.weight>0).forEach(x => {
-    if (!best || x.weight > best.weight) best = {...x, date:s.date};
-  }));
+  const lookupEids = new Set([eid, ...Object.entries(CANONICAL_EID)
+    .filter(([,v]) => v === eid).map(([k]) => k)]);
+  (sessions||[]).filter(s => !s.isDeload).forEach(s =>
+    s.sets.filter(x => isWorkSet(x) && lookupEids.has(x.eid)).forEach(x => {
+      if (!best || x.weight > best.weight) best = {...x, eid, date:s.date};
+    })
+  );
   return best;
 }
 
-// Weekly set count per muscle group (last N weeks, default 1)
+// Weekly set count per muscle group (last N weeks, default 1).
+// Uses getMuscleContribution so primary muscles get +1.0 and secondary get +0.5 per set.
 function getWeeklySets(sessions, allExercises, weeksBack=1) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - weeksBack*7);
   const counts = {};
   Object.keys(MUSCLE_GROUPS).forEach(k => { counts[k]=0; });
   sessions
-    .filter(s => new Date(s.date) >= cutoff)
-    .forEach(s => s.sets.filter(isDone).forEach(x => {
-      const ex = (allExercises||[]).find(e=>e.id===x.eid);
-      const cat = ex?.cat;
-      if (cat && counts[cat]!==undefined) counts[cat]++;
+    .filter(s => new Date(s.date) >= cutoff && !s.isDeload)
+    .forEach(s => s.sets.filter(x => isDone(x) && !isWarmupSet(x)).forEach(x => {
+      const contrib = getMuscleContribution(x.eid, allExercises);
+      Object.entries(contrib).forEach(([muscle, weight]) => {
+        if (counts[muscle] !== undefined) counts[muscle] += weight;
+      });
     }));
   return counts;
 }
@@ -275,28 +383,31 @@ function getMuscleStatus(sets, target) {
   return               { label:"Vernachlässigt",color:T.red    };
 }
 
-// Push/Pull/Upper/Lower ratios
+// Push/Pull ratios. Trizeps counts toward Push, Bizeps toward Pull.
 function getPushPullRatio(sets) {
-  const push = (sets.Brust||0) + (sets.Schultern||0);
-  const pull = sets.Rücken||0;
+  const push = (sets.Brust||0) + (sets.Schultern||0) + (sets.Trizeps||0);
+  const pull = (sets.Rücken||0) + (sets.Bizeps||0);
   const total = push+pull;
   if (total===0) return null;
   return { push:+(push/total*100).toFixed(0), pull:+(pull/total*100).toFixed(0) };
 }
 
-// Days since each muscle group was last trained
+// Days since each muscle group was last trained.
+// Uses getMuscleContribution: a muscle is considered trained if it received
+// any contribution (primary or secondary) from a completed work set.
 function getLastTrainedDays(sessions, allExercises) {
   const last = {};
   [...sessions]
     .sort((a,b)=>new Date(b.date)-new Date(a.date))
-    .forEach(s => s.sets.filter(isDone).forEach(x => {
-      const ex = (allExercises||[]).find(e=>e.id===x.eid);
-      const cat = ex?.cat;
-      if (cat && last[cat]===undefined) {
-        const d = Math.floor((Date.now()-new Date(s.date))/86400000);
-        last[cat] = d;
-      }
-    }));
+    .forEach(s => {
+      const d = Math.floor((Date.now()-new Date(s.date))/86400000);
+      s.sets.filter(x => isDone(x) && !isWarmupSet(x)).forEach(x => {
+        const contrib = getMuscleContribution(x.eid, allExercises);
+        Object.keys(contrib).forEach(muscle => {
+          if (last[muscle] === undefined) last[muscle] = d;
+        });
+      });
+    });
   return last;
 }
 
@@ -317,10 +428,10 @@ function buildWeeklySummary(sessions, cardio, allExercises) {
   const cardioMin = wc.reduce((s,c)=>s+(c.duration||0),0);
   const setCounts = getWeeklySets(sessions, allExercises, 1);
   const topMuscle = Object.entries(setCounts)
-    .filter(([k])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility)
+    .filter(([k])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&!MUSCLE_GROUPS[k].legacy)
     .sort((a,b)=>b[1]-a[1])[0];
   const neglected = Object.entries(setCounts)
-    .filter(([k,v])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&MUSCLE_GROUPS[k].targetSets>0&&v===0)
+    .filter(([k,v])=>MUSCLE_GROUPS[k]&&!MUSCLE_GROUPS[k].mobility&&!MUSCLE_GROUPS[k].legacy&&MUSCLE_GROUPS[k].targetSets>0&&v===0)
     .map(([k])=>k);
   const mobilityMins = ws.reduce((s,sess)=>{
     return s + sess.sets.filter(isDone).reduce((a,x)=>{
@@ -344,32 +455,32 @@ function buildRecommendations(sessions, cardio, allExercises, streak) {
   const pushSets  = (sets4w.Brust||0)+(sets4w.Schultern||0);
   const pullSets  = sets4w.Rücken||0;
   if (pushSets > pullSets*1.5 && pullSets > 0)
-    tips.push({ icon:"⚠️", text:"Du trainierst Push-Muskeln deutlich mehr als Pull. Mehr Rückenübungen wären ausgewogen." });
+    tips.push({ icon:"!", text:"Du trainierst Push-Muskeln deutlich mehr als Pull. Mehr Rückenübungen wären ausgewogen." });
   else if (pullSets > pushSets*1.5 && pushSets > 0)
-    tips.push({ icon:"⚠️", text:"Viel Rücken-Training – mehr Brust/Schulter würde das Gleichgewicht verbessern." });
+    tips.push({ icon:"!", text:"Viel Rücken-Training – mehr Brust/Schulter würde das Gleichgewicht verbessern." });
 
   if ((sets4w.Beine||0) === 0 && sessions.length > 3)
-    tips.push({ icon:"🦵", text:"Beine wurden kaum trainiert. Ein Bein-Tag würde die Balance deutlich verbessern." });
+    tips.push({ icon:"–", text:"Beine wurden kaum trainiert. Ein Bein-Tag würde die Balance deutlich verbessern." });
 
   if (streak >= 7)
-    tips.push({ icon:"🔥", text:`${streak} Tage Serie – Ausnahme Konsistenz! Weiter so.` });
+    tips.push({ icon:"↑", text:`${streak} Tage Serie – Ausnahme Konsistenz! Weiter so.` });
   else if (streak >= 3)
-    tips.push({ icon:"⚡", text:`${streak} Tage am Stück – starker Start. Dranbleiben!` });
+    tips.push({ icon:"↑", text:`${streak} Tage am Stück – starker Start. Dranbleiben!` });
 
   if (ws.length >= 4)
-    tips.push({ icon:"💪", text:"Sehr gute Woche – Wochenziel bereits erreicht oder übertroffen." });
+    tips.push({ icon:"✓", text:"Sehr gute Woche – Wochenziel bereits erreicht oder übertroffen." });
 
   const cardioMin = cardio.filter(c=>{
     const cutoff=new Date(); cutoff.setDate(cutoff.getDate()-7);
     return new Date(c.date)>=cutoff;
   }).reduce((s,c)=>s+(c.duration||0),0);
   if (cardioMin >= 90)
-    tips.push({ icon:"🏃", text:`${cardioMin} Minuten Cardio diese Woche – top Ausdauerarbeit.` });
+    tips.push({ icon:"↺", text:`${cardioMin} Minuten Cardio diese Woche – top Ausdauerarbeit.` });
   else if (cardioMin === 0 && sessions.length > 2)
-    tips.push({ icon:"🏃", text:"Kein Cardio diese Woche. Schon 20 Minuten verbessern Regeneration und Ausdauer." });
+    tips.push({ icon:"–", text:"Kein Cardio diese Woche. Schon 20 Minuten verbessern Regeneration und Ausdauer." });
 
   if (tips.length === 0)
-    tips.push({ icon:"✅", text:"Starke Trainingsbasis. Bleib konstant und steigere das Gewicht schrittweise." });
+    tips.push({ icon:"✓", text:"Starke Trainingsbasis. Bleib konstant und steigere das Gewicht schrittweise." });
 
   return tips.slice(0,4);
 }
@@ -486,25 +597,27 @@ function deloadDaysRemaining(settings) {
 //      for that exercise in the same session are treated as warmup (heuristic).
 function getExercisePerformanceHistory(eid, sessions) {
   if (!eid || !sessions?.length) return [];
+  // Also include sessions where sets were recorded under alias IDs (e.g. e38 → e13)
+  const lookupEids = new Set([eid, ...Object.entries(CANONICAL_EID)
+    .filter(([,v]) => v === eid).map(([k]) => k)]);
   const history = [];
 
   [...sessions]
+    .filter(sess => !sess.isDeload)
     .sort((a,b) => new Date(a.date) - new Date(b.date))
     .forEach(sess => {
-      const allEidSets = sess.sets.filter(s => isDone(s) && s.eid === eid && (s.weight||0) > 0);
+      const allEidSets = sess.sets.filter(s =>
+        isDone(s) && lookupEids.has(s.eid) && (s.weight||0) > 0
+      );
       if (!allEidSets.length) return;
 
-      // Heuristic: if there are multiple distinct weights for this EID in one session,
-      // the lowest-weight group is almost certainly a warmup group.
+      // Use central isWarmupSet guard; fall back to weight-heuristic for old sessions
       const weights = [...new Set(allEidSets.map(s => s.weight))].sort((a,b)=>a-b);
       const minWeight = weights[0];
       const hasMultipleWeights = weights.length > 1;
 
       const workSets = allEidSets.filter(s => {
-        // Explicit note-based warmup marker (new sessions)
-        const noteLC = (s.planNote || s.note || "").toLowerCase();
-        if (noteLC.includes("eingewöhnung") || noteLC.includes("warm")) return false;
-        // Heuristic: lowest weight in a multi-weight session = warmup group
+        if (isWarmupSet(s)) return false;
         if (hasMultipleWeights && s.weight === minWeight) return false;
         return true;
       });
@@ -524,21 +637,23 @@ function getExercisePerformanceHistory(eid, sessions) {
 // Plan-independent: works for any plan, so switching plans still picks up last real values.
 function getLastWorkSets(eid, sessions) {
   if (!eid || !sessions?.length) return null;
-  const sorted = [...sessions].sort((a,b) => new Date(b.date) - new Date(a.date));
+  const lookupEids = new Set([eid, ...Object.entries(CANONICAL_EID)
+    .filter(([,v]) => v === eid).map(([k]) => k)]);
+  const sorted = [...sessions]
+    .filter(sess => !sess.isDeload)
+    .sort((a,b) => new Date(b.date) - new Date(a.date));
   for (const sess of sorted) {
-    const allEid = (sess.sets||[]).filter(s => s.eid===eid && (s.weight||0) > 0);
+    const allEid = (sess.sets||[]).filter(s => lookupEids.has(s.eid) && (s.weight||0) > 0);
     if (!allEid.length) continue;
     const weights = [...new Set(allEid.map(s=>s.weight))].sort((a,b)=>a-b);
-    const minW = weights[0];
-    const multi = weights.length > 1;
+    const minW    = weights[0];
+    const multi   = weights.length > 1;
     const work = allEid.filter(s => {
-      if (s.isWarmup) return false;
-      const note = (s.planNote||s.note||'').toLowerCase();
-      if (note.includes('eingewöhnung') || note.includes('warm')) return false;
+      if (isWarmupSet(s)) return false;
       if (multi && s.weight === minW) return false;
       return true;
     });
-    if (work.length) return work; // [{reps, weight, ...}, ...]
+    if (work.length) return work;
   }
   return null;
 }
@@ -557,8 +672,9 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const repRange  = getRepRangeForPlanExercise(planExercise, settings);
   const eid       = planExercise?.eid;
   if (!eid) return null;
+  const ceid = canonicalEid(eid);
 
-  const history = getExercisePerformanceHistory(eid, sessions);
+  const history = getExercisePerformanceHistory(ceid, sessions);
   if (history.length < (ps.minSessionsBeforeSuggestion || 2)) return null;
 
   // Check if deload is active
@@ -600,7 +716,7 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   const avgReps    = lastSets.reduce((a,s)=>a+s.reps,0) / lastSets.length;
 
   // Check stagnation (last 2–3 sessions same or declining weight)
-  const stagnation = detectExerciseStagnation(eid, sessions, settings);
+  const stagnation = detectExerciseStagnation(ceid, sessions, settings);
 
   // ── DELOAD recommendation based on stagnation ──────────────
   if (stagnation?.stagnating && ps.deloadEnabled && ps.autoDeloadOnStagnation) {
@@ -654,56 +770,111 @@ function calculateProgressionSuggestion(planExercise, exercise, sessions, settin
   return null;
 }
 
-// Detect stagnation for one exercise over last N sessions
+// Detect stagnation for ONE exercise over the last 3 sessions.
+// Only counts work sets (warmup-filtered by getExercisePerformanceHistory).
+// An exercise stagnates when:
+//   – weight has not increased over 3 sessions, AND
+//   – minimum reps per session have not increased (or have declined)
 function detectExerciseStagnation(eid, sessions, settings) {
-  const history = getExercisePerformanceHistory(eid, sessions);
+  const history = getExercisePerformanceHistory(canonicalEid(eid), sessions);
   if (history.length < 3) return { stagnating: false };
-  const last3 = history.slice(-3);
-  // Check if weight stayed the same or declined across last 3 sessions
+  const last3   = history.slice(-3);
   const weights = last3.map(h => h.sets[0]?.weight || 0);
-  const noProgress = weights[2] <= weights[0]; // not higher than 3 sessions ago
-  // Check if min reps declined
-  const minReps = last3.map(h => Math.min(...h.sets.map(s=>s.reps||0)));
-  const repsDeclined = minReps[2] < minReps[0];
+  const minReps = last3.map(h => Math.min(...(h.sets||[]).map(s => s.reps || 0)));
+  // Weight not higher than 3 sessions ago AND reps not improving
+  const noWeightProgress = weights[2] <= weights[0];
+  const noRepProgress    = minReps[2] <= minReps[0];
   return {
-    stagnating: noProgress && repsDeclined,
+    stagnating:      noWeightProgress && noRepProgress,
     sessionsChecked: last3.length,
-    weightTrend: weights[2] - weights[0],
+    weightTrend:     weights[2] - weights[0],
+    repTrend:        minReps[2] - minReps[0],
   };
 }
 
-// Detect whether a global deload is recommended based on recent training load
-function detectDeloadRecommendation(sessions, settings) {
+// Detect global stagnation: how many main exercises are stagnating?
+// "Main" = strength exercises that have at least 3 sessions of work-set history.
+// Returns { stagnatingCount, total, stagnatingEids }
+function detectGlobalStagnation(plans, sessions, allExercises, settings) {
+  if (!plans?.length || !sessions?.length) return { stagnatingCount: 0, total: 0 };
+
+  // Collect unique eids from active plan exercises (non-warmup, non-time, with weight)
+  const seenEids = new Set();
+  for (const plan of plans) {
+    if (plan.archived) continue;
+    for (const day of (plan.days || [])) {
+      for (const ex of (day.exercises || [])) {
+        if (ex.isWarmup) continue;
+        const fullEx = (allExercises || []).find(e => e.id === ex.eid);
+        if (!fullEx) continue;
+        const ut = fullEx.unitType;
+        // Skip time-based and reps-only (no weight). undefined/"reps+kg" = normal strength
+        if (ut === "secs" || ut === "mins" || ut === "reps") continue;
+        seenEids.add(ex.eid);
+      }
+    }
+  }
+
+  let stagnatingCount = 0;
+  const stagnatingEids = [];
+  for (const eid of seenEids) {
+    const hist = getExercisePerformanceHistory(canonicalEid(eid), sessions);
+    if (hist.length < 3) continue;
+    const result = detectExerciseStagnation(canonicalEid(eid), sessions, settings);
+    if (result.stagnating) {
+      stagnatingCount++;
+      stagnatingEids.push(eid);
+    }
+  }
+
+  return { stagnatingCount, total: seenEids.size, stagnatingEids };
+}
+
+// Detect whether a global deload is recommended.
+// Priority:
+//   1. Active deload → always confirm
+//   2. Scheduled deload (only when scheduledDeloadEnabled === true)
+//   3. Stagnation-based deload (when autoDeloadOnStagnation === true and ≥2 exercises stagnate)
+function detectDeloadRecommendation(sessions, settings, plans, allExercises) {
   const ps = getProgressionSettings(settings);
   if (!ps.deloadEnabled) return null;
 
-  // Already in active deload – confirm it (auto-expire handled by isDeloadActive)
+  // 1. Already in active deload
   if (isDeloadActive(settings)) {
     const daysLeft = deloadDaysRemaining(settings);
     return {
       recommend: true,
-      reason:    `Aktiver Deload – noch ${daysLeft} ${daysLeft===1?"Tag":"Tage"}`,
+      reason:    `Aktiver Deload – noch ${daysLeft} ${daysLeft === 1 ? "Tag" : "Tage"}.`,
       urgency:   "active",
     };
   }
 
-  const now = Date.now();
-  // Periodic deload: time since last deload
-  if (settings?.lastDeloadDate) {
-    const weeksSince = (now - new Date(settings.lastDeloadDate)) / (7*86400000);
-    if (weeksSince >= ps.deloadEveryWeeks) {
+  // 2. Scheduled deload – only when explicitly enabled
+  if (ps.scheduledDeloadEnabled) {
+    const now = Date.now();
+    if (settings?.lastDeloadDate) {
+      const weeksSince = (now - new Date(settings.lastDeloadDate)) / (7 * 86400000);
+      if (weeksSince >= ps.deloadEveryWeeks) {
+        return {
+          recommend: true,
+          reason:    `${Math.round(weeksSince)} Wochen seit letzter Entlastung – planmäßige Deload-Woche.`,
+          urgency:   "scheduled",
+        };
+      }
+    }
+  }
+
+  // 3. Stagnation-based deload
+  if (ps.autoDeloadOnStagnation && plans?.length && allExercises?.length) {
+    const global = detectGlobalStagnation(plans, sessions, allExercises, settings);
+    if (global.stagnatingCount >= 2) {
       return {
         recommend: true,
-        reason:    `${Math.round(weeksSince)} Wochen seit letzter Entlastung`,
-        urgency:   "scheduled",
+        reason:    "Deload empfohlen: Mehrere Hauptübungen stagnieren. Eine leichte Woche mit ca. 15\u202f% weniger Gewicht oder 30\u202f% weniger Sätzen kann helfen.",
+        urgency:   "stagnation",
+        stagnatingCount: global.stagnatingCount,
       };
     }
-  } else if ((sessions||[]).length >= ps.deloadEveryWeeks) {
-    return {
-      recommend: true,
-      reason:    `${sessions.length} Trainings – erste Deload-Woche empfohlen`,
-      urgency:   "scheduled",
-    };
   }
 
   return null;
@@ -717,7 +888,7 @@ const ACHIEVEMENT_DEFS = [
   { id:"first_workout",   icon:"🏁", name:"Erster Schritt",     cat:"Start",
     desc:"Erstes Training abgeschlossen",
     check: s=>s.length>=1 },
-  { id:"total_10",        icon:"💪", name:"Fleißig",             cat:"Konsistenz",
+  { id:"total_10",        icon:"→", name:"Fleißig",             cat:"Konsistenz",
     desc:"10 Trainings absolviert",
     check: s=>s.length>=10 },
   { id:"total_50",        icon:"🏆", name:"Harter Kern",         cat:"Konsistenz",
@@ -885,6 +1056,35 @@ const ACHIEVEMENT_DEFS = [
   },
 ];
 
+// A/B-Rotation: find the recommended next plan+day based on last session
+// Works for any set of active plans, not just hardcoded pg_ab
+function getNextABRecommendation(plans, sessions) {
+  const activePlans = (plans||[]).filter(p => !p.archived);
+  if (!activePlans.length) return null;
+
+  // Collect all plan+day combinations
+  const slots = [];
+  for (const plan of activePlans) {
+    for (const day of (plan.days||[])) {
+      slots.push({ planId: plan.id, dayId: day.id, planName: plan.name, dayName: day.name });
+    }
+  }
+  if (!slots.length) return null;
+  if (slots.length === 1) return slots[0]; // only one option
+
+  // Find the last session that matches any slot
+  const sortedSessions = [...(sessions||[])].sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const lastMatch = sortedSessions.find(s =>
+    slots.some(sl => sl.planId === s.planId && sl.dayId === s.dayId)
+  );
+  if (!lastMatch) return slots[0]; // no history – start with first
+
+  // Find the slot after the last one used
+  const lastIdx = slots.findIndex(sl => sl.planId===lastMatch.planId && sl.dayId===lastMatch.dayId);
+  const nextIdx = (lastIdx + 1) % slots.length;
+  return slots[nextIdx];
+}
+
 function calcAchievements(sessions, metrics, streak, cardio, allExercises=[]) {
   return ACHIEVEMENT_DEFS.map(a => ({
     ...a,
@@ -936,6 +1136,7 @@ const DEFAULT_SETTINGS = {
     enabled:                   true,
     mode:                      "normal",   // "conservative"|"normal"|"aggressive"
     deloadEnabled:             true,
+    scheduledDeloadEnabled:    false,      // false = nur Stagnation, kein fixer Rhythmus
     deloadStrategy:            "weight",   // "weight"|"sets"|"both"
     deloadEveryWeeks:          6,
     autoDeloadOnStagnation:    true,
@@ -1030,7 +1231,7 @@ const ALL_CATS = ["Alle","Brust","Rücken","Beine","Schultern","Arme","Core","Au
 const CAT_COLOR_EXT = {...CAT_COLOR, Aufwärmen:"#00C8C8", Dehnung:"#FF60B0"};
 
 // ── Gainsfire-Plan: korrekte Satzstruktur mit Warm-up-Satz ─────────────
-// Jede Hauptübung hat 1 Eingewöhnungssatz (niedrigeres Gewicht) + 3 Arbeitssätze
+// Jede Hauptübung hat 1 Warm-up-Satz (niedrigeres Gewicht) + 3 Arbeitssätze
 // Quelle: PDF 29.04.2026
 const MY_PLANS = [
   {
@@ -1040,7 +1241,7 @@ const MY_PLANS = [
     archived: false,
     days:[{
       id:"pgd1",
-      name:"Ganzkörper 🏋",
+      name:"Ganzkörper",
       exercises:[
         // ── Aufwärmen & Mobilisierung ──────────────────────────
         {eid:"w3", sets:1, reps:300, weight:0, rest:0,
@@ -1052,31 +1253,31 @@ const MY_PLANS = [
         // ── Bankdrücken Gerät: 1×WU + 3×Arbeit ────────────────
         // Laut PDF: 25kg×15 (WU), 39kg×15, 39kg×15, 39kg×13
         {eid:"e36", sets:1, reps:15, weight:25, rest:60,
-         note:"⬆ Eingewöhnungssatz"},
+         note:"Warm-up-Satz"},
         {eid:"e36", sets:3, reps:14, weight:39, rest:90,
          note:"3 Arbeitssätze · Ziel ≥13 Wdh"},
         // ── Schulterdrücken Maschine: 1×WU + 3×Arbeit ─────────
         // PDF: 9kg×12 (WU), 18kg×8, 18kg×7, 48kg×7
         {eid:"e37", sets:1, reps:12, weight:9,  rest:60,
-         note:"⬆ Eingewöhnungssatz"},
+         note:"Warm-up-Satz"},
         {eid:"e37", sets:3, reps:7,  weight:18, rest:90,
          note:"3 Arbeitssätze · 18 kg"},
         // ── Latziehen zur Brust: 1×WU + 3×Arbeit ──────────────
         // PDF: 25kg×10 (WU), 39kg×12, 39kg×10, 39kg×9
         {eid:"e38", sets:1, reps:10, weight:25, rest:60,
-         note:"⬆ Eingewöhnungssatz"},
+         note:"Warm-up-Satz"},
         {eid:"e38", sets:3, reps:10, weight:39, rest:90,
          note:"3 Arbeitssätze · Ziel ≥9 Wdh"},
         // ── Beinpresse: 1×WU + 3×Arbeit ───────────────────────
         // PDF: 39kg×10 (WU), 59kg×12, 59kg×12, 59kg×12
         {eid:"e9",  sets:1, reps:10, weight:39, rest:90,
-         note:"⬆ Eingewöhnungssatz"},
+         note:"Warm-up-Satz"},
         {eid:"e9",  sets:3, reps:12, weight:59, rest:120,
          note:"3 Arbeitssätze · 59 kg"},
         // ── Rudern Seilzug: 1×WU + 3×Arbeit ───────────────────
         // PDF: 25kg×15 (WU), 41kg×15, 41kg×10, 41kg×8
         {eid:"e39", sets:1, reps:15, weight:25, rest:60,
-         note:"⬆ Eingewöhnungssatz"},
+         note:"Warm-up-Satz"},
         {eid:"e39", sets:3, reps:11, weight:41, rest:90,
          note:"3 Arbeitssätze · 41 kg"},
         // ── Beinbeugen sitzend: 3 Arbeitssätze ────────────────
@@ -1130,6 +1331,15 @@ function compressImage(dataUrl, maxPx=400, quality=0.72) {
 // ═══════════════════════════════════════════════════════
 // PERSISTENCE (Fix 4+8)
 // ═══════════════════════════════════════════════════════
+// Default overrides for built-in exercises (images, etc.)
+// Merged into exerciseOverrides so they're always available even without backup
+const BUILTIN_IMG_OVERRIDES = {
+  "e15": { img: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMjgwIiB2aWV3Qm94PSIwIDAgNDAwIDI4MCI+CiAgPHJlY3Qgd2lkdGg9IjQwMCIgaGVpZ2h0PSIyODAiIGZpbGw9IndoaXRlIi8+CiAgPCEtLSBTVEFSVCBwb3NpdGlvbjogYXJtcyBkb3duIC0tPgogIDxjaXJjbGUgY3g9IjExMCIgY3k9Ijg4IiByPSIyMCIgZmlsbD0iIzFhMWEyZSIgc3Ryb2tlPSIjMWExYTJlIiBzdHJva2Utd2lkdGg9IjIiLz4KICA8cmVjdCB4PSIxMDAiIHk9IjEwOCIgd2lkdGg9IjIwIiBoZWlnaHQ9IjU1IiByeD0iOCIgZmlsbD0iIzJhMmEzZSIvPgogIDxsaW5lIHgxPSIxMTAiIHkxPSIxMTgiIHgyPSI3NCIgeTI9IjE0OCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMTEwIiB5MT0iMTE4IiB4Mj0iMTQ2IiB5Mj0iMTQ4IiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxjaXJjbGUgY3g9IjcwIiBjeT0iMTUyIiByPSI2IiBmaWxsPSIjNTU1Ii8+CiAgPGNpcmNsZSBjeD0iMTUwIiBjeT0iMTUyIiByPSI2IiBmaWxsPSIjNTU1Ii8+CiAgPGxpbmUgeDE9IjEwMiIgeTE9IjE2MyIgeDI9IjkwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIxMTgiIHkxPSIxNjMiIHgyPSIxMzAiIHkyPSIyMTAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPHRleHQgeD0iMTEwIiB5PSIyMzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiM2NjYiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtZmFtaWx5PSItYXBwbGUtc3lzdGVtLHNhbnMtc2VyaWYiPlN0YXJ0PC90ZXh0PgogIDwhLS0gRU5EIHBvc2l0aW9uOiBhcm1zIHJhaXNlZCAtLT4KICA8Y2lyY2xlIGN4PSIyOTAiIGN5PSI4OCIgcj0iMjAiIGZpbGw9IiMxYTFhMmUiIHN0cm9rZT0iIzFhMWEyZSIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHJlY3QgeD0iMjgwIiB5PSIxMDgiIHdpZHRoPSIyMCIgaGVpZ2h0PSI1NSIgcng9IjgiIGZpbGw9IiMyYTJhM2UiLz4KICA8bGluZSB4MT0iMjkwIiB5MT0iMTE4IiB4Mj0iMjM4IiB5Mj0iMTEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIyOTAiIHkxPSIxMTgiIHgyPSIzNDIiIHkyPSIxMTAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGNpcmNsZSBjeD0iMjMyIiBjeT0iMTA3IiByPSI2IiBmaWxsPSIjYzhmZjAwIi8+CiAgPGNpcmNsZSBjeD0iMzQ4IiBjeT0iMTA3IiByPSI2IiBmaWxsPSIjYzhmZjAwIi8+CiAgPGxpbmUgeDE9IjI4MiIgeTE9IjE2MyIgeDI9IjI3MCIgeTI9IjIxMCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMjk4IiB5MT0iMTYzIiB4Mj0iMzEwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDx0ZXh0IHg9IjI5MCIgeT0iMjM1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjNjY2IiBmb250LXNpemU9IjEzIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5aaWVsPC90ZXh0PgogIDwhLS0gQXJyb3cgLS0+CiAgPHRleHQgeD0iMjAwIiB5PSIxNDUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiNjOGZmMDAiIGZvbnQtc2l6ZT0iMjgiIGZvbnQtd2VpZ2h0PSJib2xkIj7ihpI8L3RleHQ+CiAgPHRleHQgeD0iMjAwIiB5PSIyNjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiMxYTFhMmUiIGZvbnQtc2l6ZT0iMTQiIGZvbnQtd2VpZ2h0PSJib2xkIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5TZWl0aGViZW48L3RleHQ+Cjwvc3ZnPg==" },
+  "e16": { img: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMjgwIiB2aWV3Qm94PSIwIDAgNDAwIDI4MCI+CiAgPHJlY3Qgd2lkdGg9IjQwMCIgaGVpZ2h0PSIyODAiIGZpbGw9IndoaXRlIi8+CiAgPGNpcmNsZSBjeD0iMTEwIiBjeT0iODgiIHI9IjIwIiBmaWxsPSIjMWExYTJlIi8+CiAgPHJlY3QgeD0iMTAwIiB5PSIxMDgiIHdpZHRoPSIyMCIgaGVpZ2h0PSI1NSIgcng9IjgiIGZpbGw9IiMyYTJhM2UiLz4KICA8bGluZSB4MT0iMTEwIiB5MT0iMTE4IiB4Mj0iNzgiIHkyPSIxNDgiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjExMCIgeTE9IjExOCIgeDI9IjE0MiIgeTI9IjE0OCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSI3NCIgY3k9IjE1MiIgcj0iNiIgZmlsbD0iIzU1NSIvPgogIDxjaXJjbGUgY3g9IjE0NiIgY3k9IjE1MiIgcj0iNiIgZmlsbD0iIzU1NSIvPgogIDxsaW5lIHgxPSIxMDIiIHkxPSIxNjMiIHgyPSI5MCIgeTI9IjIxMCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMTE4IiB5MT0iMTYzIiB4Mj0iMTMwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDx0ZXh0IHg9IjExMCIgeT0iMjM1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjNjY2IiBmb250LXNpemU9IjEzIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5TdGFydDwvdGV4dD4KICA8Y2lyY2xlIGN4PSIyOTAiIGN5PSI4OCIgcj0iMjAiIGZpbGw9IiMxYTFhMmUiLz4KICA8cmVjdCB4PSIyODAiIHk9IjEwOCIgd2lkdGg9IjIwIiBoZWlnaHQ9IjU1IiByeD0iOCIgZmlsbD0iIzJhMmEzZSIvPgogIDxsaW5lIHgxPSIyOTAiIHkxPSIxMTgiIHgyPSIyNTUiIHkyPSI5MiIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMjkwIiB5MT0iMTE4IiB4Mj0iMzI1IiB5Mj0iMTQ4IiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxjaXJjbGUgY3g9IjI1MCIgY3k9Ijg4IiByPSI2IiBmaWxsPSIjYzhmZjAwIi8+CiAgPGNpcmNsZSBjeD0iMzI5IiBjeT0iMTUyIiByPSI2IiBmaWxsPSIjNTU1Ii8+CiAgPGxpbmUgeDE9IjI4MiIgeTE9IjE2MyIgeDI9IjI3MCIgeTI9IjIxMCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMjk4IiB5MT0iMTYzIiB4Mj0iMzEwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDx0ZXh0IHg9IjI5MCIgeT0iMjM1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjNjY2IiBmb250LXNpemU9IjEzIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5aaWVsPC90ZXh0PgogIDx0ZXh0IHg9IjIwMCIgeT0iMTQ1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjYzhmZjAwIiBmb250LXNpemU9IjI4IiBmb250LXdlaWdodD0iYm9sZCI+4oaSPC90ZXh0PgogIDx0ZXh0IHg9IjIwMCIgeT0iMjY1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjMWExYTJlIiBmb250LXNpemU9IjE0IiBmb250LXdlaWdodD0iYm9sZCIgZm9udC1mYW1pbHk9Ii1hcHBsZS1zeXN0ZW0sc2Fucy1zZXJpZiI+RnJvbnRoZWJlbjwvdGV4dD4KPC9zdmc+" },
+  "e17": { img: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMjgwIiB2aWV3Qm94PSIwIDAgNDAwIDI4MCI+CiAgPHJlY3Qgd2lkdGg9IjQwMCIgaGVpZ2h0PSIyODAiIGZpbGw9IndoaXRlIi8+CiAgPGNpcmNsZSBjeD0iMTEwIiBjeT0iODgiIHI9IjIwIiBmaWxsPSIjMWExYTJlIi8+CiAgPHJlY3QgeD0iMTAwIiB5PSIxMDgiIHdpZHRoPSIyMCIgaGVpZ2h0PSI1NSIgcng9IjgiIGZpbGw9IiMyYTJhM2UiLz4KICA8bGluZSB4MT0iMTEwIiB5MT0iMTE4IiB4Mj0iNzgiIHkyPSIxNDgiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjExMCIgeTE9IjExOCIgeDI9IjE0MiIgeTI9IjE0OCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iNzgiIHkxPSIxNDgiIHgyPSI3NSIgeTI9IjE4NSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMTQyIiB5MT0iMTQ4IiB4Mj0iMTQ1IiB5Mj0iMTg1IiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxjaXJjbGUgY3g9Ijc1IiBjeT0iMTg5IiByPSI3IiBmaWxsPSIjNTU1Ii8+CiAgPGNpcmNsZSBjeD0iMTQ1IiBjeT0iMTg5IiByPSI3IiBmaWxsPSIjNTU1Ii8+CiAgPGxpbmUgeDE9IjEwMiIgeTE9IjE2MyIgeDI9IjkwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIxMTgiIHkxPSIxNjMiIHgyPSIxMzAiIHkyPSIyMTAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPHRleHQgeD0iMTEwIiB5PSIyMzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiM2NjYiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtZmFtaWx5PSItYXBwbGUtc3lzdGVtLHNhbnMtc2VyaWYiPlN0YXJ0PC90ZXh0PgogIDxjaXJjbGUgY3g9IjI5MCIgY3k9Ijg4IiByPSIyMCIgZmlsbD0iIzFhMWEyZSIvPgogIDxyZWN0IHg9IjI4MCIgeT0iMTA4IiB3aWR0aD0iMjAiIGhlaWdodD0iNTUiIHJ4PSI4IiBmaWxsPSIjMmEyYTNlIi8+CiAgPGxpbmUgeDE9IjI5MCIgeTE9IjExOCIgeDI9IjI1OCIgeTI9IjE0OCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMjkwIiB5MT0iMTE4IiB4Mj0iMzIyIiB5Mj0iMTQ4IiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIyNTgiIHkxPSIxNDgiIHgyPSIyNDgiIHkyPSIxMTUiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjMyMiIgeTE9IjE0OCIgeDI9IjMzMiIgeTI9IjExNSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSIyNDYiIGN5PSIxMTEiIHI9IjciIGZpbGw9IiNjOGZmMDAiLz4KICA8Y2lyY2xlIGN4PSIzMzQiIGN5PSIxMTEiIHI9IjciIGZpbGw9IiNjOGZmMDAiLz4KICA8bGluZSB4MT0iMjgyIiB5MT0iMTYzIiB4Mj0iMjcwIiB5Mj0iMjEwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIyOTgiIHkxPSIxNjMiIHgyPSIzMTAiIHkyPSIyMTAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPHRleHQgeD0iMjkwIiB5PSIyMzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiM2NjYiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtZmFtaWx5PSItYXBwbGUtc3lzdGVtLHNhbnMtc2VyaWYiPlppZWw8L3RleHQ+CiAgPHRleHQgeD0iMjAwIiB5PSIxNDUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiNjOGZmMDAiIGZvbnQtc2l6ZT0iMjgiIGZvbnQtd2VpZ2h0PSJib2xkIj7ihpI8L3RleHQ+CiAgPHRleHQgeD0iMjAwIiB5PSIyNjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiMxYTFhMmUiIGZvbnQtc2l6ZT0iMTQiIGZvbnQtd2VpZ2h0PSJib2xkIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5IYW1tZXIgQ3VybHM8L3RleHQ+Cjwvc3ZnPg==" },
+  "e18": { img: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMjgwIiB2aWV3Qm94PSIwIDAgNDAwIDI4MCI+CiAgPHJlY3Qgd2lkdGg9IjQwMCIgaGVpZ2h0PSIyODAiIGZpbGw9IndoaXRlIi8+CiAgPCEtLSBMZWljaHQgdm9yZ2ViZXVndGVyIEvDtnJwZXIgLS0+CiAgPGNpcmNsZSBjeD0iMTEwIiBjeT0iOTUiIHI9IjIwIiBmaWxsPSIjMWExYTJlIi8+CiAgPGxpbmUgeDE9IjExMCIgeTE9IjExNSIgeDI9IjEwOCIgeTI9IjE3MCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHRyYW5zZm9ybT0icm90YXRlKC0xNSwxMTAsMTQwKSIvPgogIDxsaW5lIHgxPSIxMTAiIHkxPSIxMjUiIHgyPSI3OCIgeTI9IjE0NSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iNzgiIHkxPSIxNDUiIHgyPSI4MiIgeTI9IjE3NSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSI4MSIgY3k9IjE3OCIgcj0iNyIgZmlsbD0iIzU1NSIvPgogIDxsaW5lIHgxPSIxMTAiIHkxPSIxMjUiIHgyPSIxMzgiIHkyPSIxNDAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjEzOCIgeTE9IjE0MCIgeDI9IjEyNSIgeTI9IjE2OCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSIxMjIiIGN5PSIxNzEiIHI9IjciIGZpbGw9IiM1NTUiLz4KICA8bGluZSB4MT0iMTA1IiB5MT0iMTY4IiB4Mj0iOTAiIHkyPSIyMTUiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjExOCIgeTE9IjE2NSIgeDI9IjEyOCIgeTI9IjIxNSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8dGV4dCB4PSIxMTAiIHk9IjIzOCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iIzY2NiIgZm9udC1zaXplPSIxMyIgZm9udC1mYW1pbHk9Ii1hcHBsZS1zeXN0ZW0sc2Fucy1zZXJpZiI+U3RhcnQ8L3RleHQ+CiAgPGNpcmNsZSBjeD0iMjkwIiBjeT0iOTUiIHI9IjIwIiBmaWxsPSIjMWExYTJlIi8+CiAgPGxpbmUgeDE9IjI5MCIgeTE9IjExNSIgeDI9IjI4OCIgeTI9IjE3MCIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHRyYW5zZm9ybT0icm90YXRlKC0xNSwyOTAsMTQwKSIvPgogIDxsaW5lIHgxPSIyOTAiIHkxPSIxMjUiIHgyPSIyNTgiIHkyPSIxNDUiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGxpbmUgeDE9IjI1OCIgeTE9IjE0NSIgeDI9IjI2MiIgeTI9IjE3NSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSIyNjEiIGN5PSIxNzgiIHI9IjciIGZpbGw9IiM1NTUiLz4KICA8bGluZSB4MT0iMjkwIiB5MT0iMTI1IiB4Mj0iMzE4IiB5Mj0iMTQwIiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxsaW5lIHgxPSIzMTgiIHkxPSIxNDAiIHgyPSIzNDgiIHkyPSIxNDAiIHN0cm9rZT0iIzJhMmEzZSIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CiAgPGNpcmNsZSBjeD0iMzUxIiBjeT0iMTQwIiByPSI3IiBmaWxsPSIjYzhmZjAwIi8+CiAgPGxpbmUgeDE9IjI4NSIgeTE9IjE2OCIgeDI9IjI3MCIgeTI9IjIxNSIgc3Ryb2tlPSIjMmEyYTNlIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8bGluZSB4MT0iMjk4IiB5MT0iMTY1IiB4Mj0iMzA4IiB5Mj0iMjE1IiBzdHJva2U9IiMyYTJhM2UiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDx0ZXh0IHg9IjI5MCIgeT0iMjM4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjNjY2IiBmb250LXNpemU9IjEzIiBmb250LWZhbWlseT0iLWFwcGxlLXN5c3RlbSxzYW5zLXNlcmlmIj5aaWVsPC90ZXh0PgogIDx0ZXh0IHg9IjIwMCIgeT0iMTU1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjYzhmZjAwIiBmb250LXNpemU9IjI4IiBmb250LXdlaWdodD0iYm9sZCI+4oaSPC90ZXh0PgogIDx0ZXh0IHg9IjIwMCIgeT0iMjY1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjMWExYTJlIiBmb250LXNpemU9IjE0IiBmb250LXdlaWdodD0iYm9sZCIgZm9udC1mYW1pbHk9Ii1hcHBsZS1zeXN0ZW0sc2Fucy1zZXJpZiI+VHJpemVwcyBLaWNrYmFjazwvdGV4dD4KPC9zdmc+" },
+};
+
 const LS_PREFIX = "ft5_";
 
 function lsGet(key, fallback) {
@@ -1139,6 +1349,14 @@ function lsGet(key, fallback) {
     const parsed = JSON.parse(v);
     // Fix 1: deep-merge settings so new fields are always present
     if (key === "settings") return mergeWithDefaults(parsed);
+    // Merge built-in images into exerciseOverrides (without overwriting user data)
+    if (key === "exerciseOverrides") {
+      const merged = {...BUILTIN_IMG_OVERRIDES};
+      for (const [k,v] of Object.entries(parsed||{})) {
+        merged[k] = {...(BUILTIN_IMG_OVERRIDES[k]||{}), ...v};
+      }
+      return merged;
+    }
     return parsed;
   } catch {
     return fallback;
@@ -1656,7 +1874,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
 
   const steps = [
     {
-      title:"Willkommen bei FitTrack 💪",
+      title:"Willkommen bei FitTrack",
       sub:"Privates Trainings-Tagebuch. Offline, nur für dich.",
       content:(
         <div>
@@ -1691,7 +1909,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
 
               <Btn v="secondary" onClick={()=>importRef.current?.click()} full
                 style={{fontSize:13,padding:"10px 0"}}>
-                📥 Backup-Datei hochladen
+                Backup-Datei hochladen
               </Btn>
               <input
                 ref={importRef}
@@ -1735,7 +1953,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
       sub:"Wähle deinen Fokus.",
       content:(
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          {[{id:"Muskelaufbau",icon:"💪",desc:"Masse aufbauen"},{id:"Kraftzuwachs",icon:"🏋",desc:"Stärker werden"},{id:"Abnehmen",icon:"🔥",desc:"Fett verbrennen"},{id:"Fitness",icon:"⚡",desc:"Fit bleiben"}].map(g=>(
+          {[{id:"Muskelaufbau",icon:"→",desc:"Masse aufbauen"},{id:"Kraftzuwachs",icon:"🏋",desc:"Stärker werden"},{id:"Abnehmen",icon:"🔥",desc:"Fett verbrennen"},{id:"Fitness",icon:"⚡",desc:"Fit bleiben"}].map(g=>(
             <div key={g.id} onClick={()=>setGoal(g.id)} style={{background:goal===g.id?T.accentGlow:T.bgAlt,border:`2px solid ${goal===g.id?T.accent:T.border}`,borderRadius:14,padding:"14px 12px",cursor:"pointer",textAlign:"center",transition:"all 0.15s"}}>
               <div style={{fontSize:28,marginBottom:6}}>{g.icon}</div>
               <div style={{fontSize:13,fontWeight:700,color:goal===g.id?T.accent:T.text}}>{g.id}</div>
@@ -1804,7 +2022,7 @@ const OnboardingScreen = ({onDone, onImport}) => {
               : ()=>setStep(s=>s+1)}
             disabled={!canNext}
             style={{flex:2,padding:14,fontSize:16}}
-          >{isLast?"Los geht's! 🚀":"Weiter →"}</Btn>
+          >{"Los geht's!"}</Btn>
         </div>
       )}
     </div>
@@ -1857,7 +2075,7 @@ const CardioScreen = ({cardio, onSave, settings}) => {
       <div style={{padding:"22px 0 14px"}}>
         <div style={{fontSize:24,fontWeight:900,color:T.text,marginBottom:12}}>Aktivitäten</div>
         <div style={{display:"flex",gap:8}}>
-          {[{v:"log",l:"➕ Erfassen"},{v:"history",l:"📋 Verlauf"},{v:"stats",l:"📊 Statistik"}].map(b=>(
+          {[{v:"log",l:"Erfassen"},{v:"history",l:"Verlauf"},{v:"stats",l:"Statistik"}].map(b=>(
             <button key={b.v} onClick={()=>setView(b.v)} style={{background:view===b.v?T.accent:T.bgCard,color:view===b.v?"#07070F":T.sub,border:`1px solid ${view===b.v?T.accent:T.border}`,borderRadius:9,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>{b.l}</button>
           ))}
         </div>
@@ -1913,9 +2131,9 @@ const CardioScreen = ({cardio, onSave, settings}) => {
                   <div style={{fontSize:15,fontWeight:700,color:T.text}}>{c.type}</div>
                   <div style={{fontSize:12,color:T.sub,marginTop:2}}>{fmtDShort(c.date)}</div>
                   <div style={{display:"flex",gap:10,marginTop:4,fontSize:12,color:T.muted}}>
-                    <span>⏱ {c.duration} min</span>
-                    {c.distance&&<span>📍 {c.distance} km</span>}
-                    {c.kcal&&<span>🔥 {c.kcal} kcal</span>}
+                    <span>{c.duration} min</span>
+                    {c.distance&&<span>{c.distance} km</span>}
+                    {c.kcal&&<span>{c.kcal} kcal</span>}
                   </div>
                   {c.note&&<div style={{fontSize:11,color:T.sub,marginTop:4,fontStyle:"italic"}}>"{c.note}"</div>}
                 </div>
@@ -2122,7 +2340,7 @@ const ExerciseDBScreen = ({
           {ex.trainingsnotiz&&(
             <div style={{fontSize:12,color:T.teal,marginBottom:8,padding:"6px 10px",
               background:T.teal+"15",borderRadius:8,border:`1px solid ${T.teal}33`}}>
-              📌 Trainingsnotiz: {ex.trainingsnotiz}
+              Notiz: {ex.trainingsnotiz}
             </div>
           )}
           {ex.desc&&(
@@ -2135,12 +2353,12 @@ const ExerciseDBScreen = ({
               style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",
                 background:T.bgAlt,borderRadius:10,color:T.blue,fontSize:13,
                 fontWeight:700,textDecoration:"none",marginTop:ex.desc?0:4}}>
-              🎥 Anleitungsvideo öffnen
+              Video öffnen
             </a>
           )}
           {!ex.desc&&!ex.link&&!ex.img&&(
             <div style={{fontSize:13,color:T.muted,fontStyle:"italic"}}>
-              Noch keine Beschreibung · tippe ✎ um Infos hinzuzufügen
+              Noch keine Beschreibung · tippe Bearbeiten um Infos hinzuzufügen
             </div>
           )}
         </Card>
@@ -2155,7 +2373,7 @@ const ExerciseDBScreen = ({
           return (
             <Card style={{marginBottom:10, border:`1px solid ${T.teal}44`}}>
               <div style={{fontSize:11,fontWeight:800,color:T.teal,marginBottom:8,letterSpacing:0.3}}>
-                📊 LETZTES TRAINING
+                LETZTES TRAINING
               </div>
               <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
                 {w > 0 && (
@@ -2201,7 +2419,7 @@ const ExerciseDBScreen = ({
           </Btn>
         )}
         {ex.custom&&(
-          <Btn v="danger" onClick={()=>deleteCustom(ex.id)} full>🗑 Übung löschen</Btn>
+          <Btn v="danger" onClick={()=>deleteCustom(ex.id)} full>Übung löschen</Btn>
         )}
       </div>
     );
@@ -2325,7 +2543,7 @@ const ExerciseDBScreen = ({
               : <div onClick={()=>!imgLoading&&fileRef.current?.click()}
                   style={{border:`1px dashed ${T.border}`,borderRadius:10,padding:"22px",
                     textAlign:"center",cursor:imgLoading?"default":"pointer",color:T.muted,fontSize:13}}>
-                  {imgLoading ? "⏳ Komprimiere…" : "📷 Bild auswählen"}
+                  {"Bild auswählen"}
                 </div>
             }
             <input ref={fileRef} type="file" accept="image/*" onChange={handleImg} style={{display:"none"}}/>
@@ -2358,7 +2576,7 @@ const ExerciseDBScreen = ({
             <Btn v="secondary" onClick={openCreate} style={{padding:"7px 14px",fontSize:12}}>+ Eigene</Btn>
           )}
         </div>
-        <Inp value={search} onChange={setSearch} placeholder="🔍 Suchen..."/>
+        <Inp value={search} onChange={setSearch} placeholder="Suchen…"/>
       </div>
 
       <div style={{display:"flex",gap:6,overflowX:"auto",marginBottom:10,paddingBottom:2}}>
@@ -2392,7 +2610,7 @@ const ExerciseDBScreen = ({
               background:`${CAT_COLOR_EXT[ex.cat]||T.accent}22`,
               display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,
             }}>
-              {{Brust:"🏋",Rücken:"🔙",Beine:"🦵",Schultern:"💪",Arme:"💪",Core:"⚡",Aufwärmen:"🔥",Dehnung:"🧘"}[ex.cat]||"•"}
+              {{Brust:"·",Rücken:"·",Beine:"·",Schultern:"·",Arme:"·",Core:"·",Aufwärmen:"·",Dehnung:"·"}[ex.cat]||"•"}
             </div>
 
             {/* Main tap area */}
@@ -2651,7 +2869,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
             <input value={days[activeDay].name} onChange={e=>updDayName(activeDay,e.target.value)}
               style={{background:"transparent",border:"none",outline:"none",fontSize:16,fontWeight:700,color:T.accent,flex:1}}/>
-            <button onClick={()=>remDay(activeDay)} style={{background:"none",border:"none",cursor:"pointer",color:T.red,fontSize:18,padding:4}}>🗑</button>
+            <button onClick={()=>remDay(activeDay)} style={{background:"none",border:"none",cursor:"pointer",color:T.red,fontSize:18,padding:4}}>Löschen</button>
           </div>
 
           {/* Progression & Deload Hinweis */}
@@ -2664,7 +2882,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                 background:T.teal+"14", border:`1px solid ${T.teal}33`,
                 display:"flex", alignItems:"center", gap:10,
               }}>
-                <span style={{fontSize:16}}>📈</span>
+                <span style={{fontSize:16}}>↑</span>
                 <div style={{flex:1}}>
                   <div style={{fontSize:12,fontWeight:700,color:T.teal,marginBottom:1}}>
                     Progression & Deload deaktiviert
@@ -2724,7 +2942,7 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                 {/* ── Pause & Note row ── */}
                 <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
                   <div style={{display:"flex",alignItems:"center",gap:5,flex:1}}>
-                    <span style={{fontSize:11,color:T.muted,whiteSpace:"nowrap"}}>⏱ Pause</span>
+                    <span style={{fontSize:11,color:T.muted,whiteSpace:"nowrap"}}>Pause</span>
                     <input type="number" value={ex.rest||0}
                       onChange={e=>updEx(activeDay,j,"rest",e.target.value)}
                       style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
@@ -2803,13 +3021,13 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
                       {/* Warmup toggle */}
                       <button
                         onClick={()=>updSetRow(activeDay,j,si,"isWarmup",!row.isWarmup)}
-                        title={row.isWarmup?"Als Arbeitssatz":"Als Aufwärmsatz"}
+                        title={row.isWarmup?"Als Arbeitssatz":"Als Warm-up-Satz"}
                         style={{
                           width:32,height:32,borderRadius:7,border:`1px solid ${row.isWarmup?T.orange:T.border}`,
                           background:row.isWarmup?T.orange+"33":T.bgInput,
                           color:row.isWarmup?T.orange:T.muted,
                           fontSize:13,cursor:"pointer",
-                        }}>🔥</button>
+                        }}>W</button>
 
                       {/* Remove set */}
                       <button
@@ -2838,13 +3056,13 @@ const PlanEditor = ({plan, allExercises, exerciseOverrides, setExerciseOverrides
             <Btn v="secondary" onClick={()=>setShowDB(true)} style={{flex:"2 1 120px"}}>+ Übung hinzufügen</Btn>
             <Btn v="ghost" onClick={applyRestRules} style={{flex:"1 1 60px",fontSize:11,padding:"8px 4px"}}
               title="Pausen aller Übungen dieses Tages nach den Einstellungen setzen">
-              ⏱ Pausen
+              Pausen
             </Btn>
             {(sessions||[]).length > 0 && (
               <Btn v="ghost" onClick={applyLastSession}
                 style={{flex:"1 1 80px",fontSize:11,padding:"8px 4px",color:T.teal,borderColor:T.teal+"66"}}
                 title="Gewicht, Wdh und Satzanzahl aus letztem Training übernehmen (planunabhängig)">
-                📋 Letztes Training
+                Letztes Training
               </Btn>
             )}
           </div>
@@ -2861,7 +3079,7 @@ const ProgressionTip = ({plan}) => {
   if (!plan || plan.id!=="pg2") return null;
   return (
     <div style={{padding:"12px 14px",background:"#3090FF18",borderRadius:12,border:`1px solid ${T.blue}44`,marginTop:12,fontSize:13,color:T.sub,lineHeight:1.7}}>
-      <div style={{color:T.blue,fontWeight:800,marginBottom:4}}>📈 PROGRESSIONSPRINZIP</div>
+      <div style={{color:T.blue,fontWeight:800,marginBottom:4}}>PROGRESSIONSPRINZIP</div>
       <b style={{color:T.text}}>Ziel:</b> Alle Arbeitssätze sauber → dann +2,5 kg (Maschinen) / +5 kg (Beinpresse).<br/>
       <b style={{color:T.text}}>Deload:</b> Alle 4 Wochen 10% weniger Gewicht, gleiche Wdh.<br/>
       <b style={{color:T.text}}>Rotation:</b> Tag A → B → C → Pause → wiederholen.
@@ -2920,7 +3138,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
           <div style={{flex:1,fontSize:18,fontWeight:900,color:T.text}}>{plan.name}</div>
           <Btn v="ghost" onClick={()=>{setEditing(plan);setView("edit");}} style={{padding:"8px 14px"}}>✎</Btn>
         </div>
-        {plan.archived&&<Badge color={T.muted} style={{marginBottom:10}}>📦 Archiviert</Badge>}
+        {plan.archived&&<Badge color={T.muted} style={{marginBottom:10}}>Archiviert</Badge>}
         {plan.desc&&<div style={{fontSize:13,color:T.sub,marginBottom:4}}>{plan.desc}</div>}
         {plan.id==="pg2"&&<ProgressionTip plan={plan}/>}
         <div style={{height:12}}/>
@@ -2951,11 +3169,11 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 
         {/* Action buttons */}
         <div style={{display:"flex",gap:8,marginTop:8,flexWrap:"wrap"}}>
-          <Btn v="ghost" onClick={()=>copy(plan.id)} style={{flex:1,padding:"10px 8px",fontSize:13}}>📋 Kopieren</Btn>
+          <Btn v="ghost" onClick={()=>copy(plan.id)} style={{flex:1,padding:"10px 8px",fontSize:13}}>Kopieren</Btn>
           <Btn v="ghost" onClick={()=>{archive(plan.id);setView("list");}} style={{flex:1,padding:"10px 8px",fontSize:13}}>
-            {plan.archived?"📤 Aktivieren":"📦 Archivieren"}
+            {plan.archived?"Aktivieren":"Archivieren"}
           </Btn>
-          <Btn v="danger" onClick={()=>del(plan.id)} style={{flex:1,padding:"10px 8px",fontSize:13}}>🗑 Löschen</Btn>
+          <Btn v="danger" onClick={()=>del(plan.id)} style={{flex:1,padding:"10px 8px",fontSize:13}}>Löschen</Btn>
         </div>
         {!plan.archived&&(
           <Btn onClick={()=>onSelectPlan(plan.id)} full style={{padding:14,marginTop:10}}>▶ Trainieren</Btn>
@@ -2999,7 +3217,7 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
       {archivedPlans.length>0&&(
         <>
           <button onClick={()=>setShowArchive(s=>!s)} style={{background:"none",border:"none",cursor:"pointer",color:T.sub,fontSize:13,fontWeight:700,padding:"8px 0",width:"100%",textAlign:"left"}}>
-            📦 Archiv ({archivedPlans.length}) {showArchive?"▲":"▼"}
+            Archiv ({archivedPlans.length}) {showArchive?"▲":"▼"}
           </button>
           {showArchive && archivedPlans.map(renderPlan)}
         </>
@@ -3013,23 +3231,73 @@ const PlansScreen = ({plans, setPlans, allExercises, exerciseOverrides, setExerc
 // Fix: React.useState must not be called inside .map()
 // ─────────────────────────────────────────────────────────────────────
 const WorkoutExerciseCard = ({
-  planEx, planExIdx, allExercises, exerciseOverrides,
+  // New grouped props
+  eid, warmupEntries=[], workEntries=[],
+  // Legacy single-entry props (kept for backward compat, derived below)
+  planEx: _planExLegacy, planExIdx: _planExIdxLegacy,
+  allExercises, exerciseOverrides,
   sets, toggle, upd, addSet, setExTimer, exTimer, settings, sessions,
+  onDeloadApplied,
 }) => {
+  // Derive primary (work) entry – first work entry, or first warmup if no work entries
+  const primaryEntry = workEntries[0] || warmupEntries[0] || {planEx:_planExLegacy, planExIdx:_planExIdxLegacy};
+  const planEx    = primaryEntry.planEx;
+  const planExIdx = primaryEntry.planExIdx;
+
+  // All entries combined for done-counting
+  const allEntries = [...warmupEntries, ...workEntries];
+  const allIkeys   = allEntries.map(e => instKey(e.planEx.eid, e.planExIdx));
+
   const ikey     = instKey(planEx.eid, planExIdx);
-  const exercise = (allExercises||[]).find(e=>e.id===planEx.eid);
-  const override = exerciseOverrides?.[planEx.eid] || {};
+  const exercise = (allExercises||[]).find(e=>e.id===(eid||planEx.eid));
+  const override = exerciseOverrides?.[eid||planEx.eid] || {};
   const resolved = {...(exercise||{}), ...override};
+
+  // Sets for the primary work entry (used for suggestion, deload etc.)
   const exSets   = sets[ikey]||[];
-  const doneCount= exSets.filter(s=>s.done).length;
-  const allDone  = exSets.length>0 && exSets.every(s=>s.done);
-  const unitType = resolved.unitType || "reps+kg"; // undefined = standard kg+Wdh
+  // All sets across all entries in this group
+  const allGroupSets = allIkeys.flatMap(k => sets[k]||[]);
+  const doneCount= allGroupSets.filter(s=>s.done).length;
+  const totalSets= allGroupSets.length;
+  const allDone  = totalSets>0 && allGroupSets.every(s=>s.done);
+
+  const unitType = resolved.unitType || "reps+kg";
   const isTimeBased  = unitType === "secs" || unitType === "mins";
-  const isRepsOnly   = unitType === "reps"; // Nur Wdh, kein Gewicht
+  const isRepsOnly   = unitType === "reps";
+  // incr kept for potential other uses
+  const incr = (() => {
+    const rules = settings?.progressionSettings?.incrementRules || {};
+    const eq = (exercise?.eq||"").toLowerCase();
+    if (eq.includes("maschine"))   return rules.machine   ?? 2.5;
+    if (eq.includes("kabel"))      return rules.cable     ?? 2.5;
+    if (eq.includes("kurkhantel")) return rules.dumbbell  ?? 1;
+    if (eq.includes("langhantel")) return rules.barbell   ?? 2.5;
+    return rules.default ?? 2.5;
+  })();
   const repLabel = repsFieldLabel(unitType);
   const hasExpandableInfo = !!(resolved.desc || resolved.link || resolved.img);
   const hasExtraInfo = hasExpandableInfo;
   const [showInfo, setShowInfo] = useState(false); // safe: called in component, not .map()
+  // Deload hint: local editable weight, null = use calculated value
+  const [deloadWeightEdit, setDeloadWeightEdit] = useState(null);
+  const deloadActive = isDeloadActive(settings);
+  const isWarmup = planEx?.isWarmup || false;
+  // Calculate deload weight for this exercise
+  const deloadWeight = useMemo(() => {
+    if (!deloadActive || isWarmup || isTimeBased || isRepsOnly) return null;
+    // Base: first undone set's current weight → last real work sets → plan weight
+    const undone = exSets.find(s => !s.done && !s.isWarmup);
+    const base = (undone?.weight > 0 ? undone.weight : 0)
+      || (getLastWorkSets(planEx.eid, sessions||[])||[])[0]?.weight
+      || planEx.weight
+      || 0;
+    if (base <= 0) return null;
+    return applyDeloadToWeight(base, settings, exercise);
+  }, [deloadActive, isWarmup, isTimeBased, isRepsOnly, planEx.eid, planEx.weight,
+      exSets.map(s=>s.weight).join(), sessions?.length,
+      JSON.stringify(settings?.progressionSettings)]);
+  // Track if Übernehmen was clicked (for session.deloadApplied)
+  const [deloadApplied, setDeloadApplied] = useState(false);
   // Punkt 9: auto-collapse on allDone, manual re-open stays open
   const [collapsed, setCollapsed]       = useState(false);
   const [manuallyOpened, setManuallyOpened] = useState(false);
@@ -3102,7 +3370,7 @@ const WorkoutExerciseCard = ({
           <div style={{fontSize:15,fontWeight:700,color:allDone?T.accentDim:T.text,display:"flex",gap:6,alignItems:"center"}}>
             {resolved.name||"?"}
             {allDone && <span style={{fontSize:11,color:T.accentDim}}>✓</span>}
-            {isThisTimerActive && <span style={{fontSize:11,color:T.blue,fontWeight:800}}>⏱</span>}
+            {isThisTimerActive && <span style={{fontSize:11,color:T.blue,fontWeight:800}}>●</span>}
           </div>
           <div style={{fontSize:11,color:T.sub}}>
             {resolved.cat}{resolved.eq?` · ${resolved.eq}`:""}
@@ -3143,96 +3411,161 @@ const WorkoutExerciseCard = ({
         {resolved.trainingsnotiz&&(
           <div style={{fontSize:11,color:T.teal,marginBottom:6,padding:"4px 8px",
             background:T.teal+"15",borderRadius:6,border:`1px solid ${T.teal}33`}}>
-            📌 {resolved.trainingsnotiz}
+            Notiz: {resolved.trainingsnotiz}
           </div>
         )}
         {planEx.isWarmup&&(
           <div style={{fontSize:10,color:T.orange,fontWeight:700,marginBottom:4}}>
-            🔥 Eingewöhnungssatz
+            Warm-up-Satz
+          </div>
+        )}
+        {/* Deload ↓ bar – compact, only during active deload for weight exercises */}
+        {deloadActive && !isWarmup && !isTimeBased && !isRepsOnly && deloadWeight !== null && (
+          <div style={{
+            display:"flex", alignItems:"center", gap:8, marginBottom:8,
+            padding:"7px 10px", borderRadius:9,
+            background:T.orange+"18", border:`1px solid ${T.orange}44`,
+          }}>
+            <span style={{fontSize:12,color:T.orange,fontWeight:800,whiteSpace:"nowrap"}}>Deload ↓</span>
+            <input
+              type="number"
+              value={deloadWeightEdit !== null ? deloadWeightEdit : (deloadWeight || "")}
+              onChange={e => setDeloadWeightEdit(e.target.value)}
+              style={{
+                width:62, padding:"4px 6px", textAlign:"center",
+                borderRadius:7, border:`1.5px solid ${T.orange}88`,
+                background:T.orange+"14", color:T.orange,
+                fontSize:15, fontWeight:800,
+              }}
+            />
+            <span style={{fontSize:12,color:T.orange,fontWeight:700}}>kg</span>
+            <button
+              onClick={() => {
+                const finalW = parseFloat(deloadWeightEdit !== null ? deloadWeightEdit : deloadWeight);
+                if (!finalW || finalW <= 0) return;
+                const ikey_ = instKey(planEx.eid, planExIdx);
+                const cur = sets[ikey_] || [];
+                // Only update: non-warmup, not done, weight-based sets
+                cur.forEach((s, si) => {
+                  if (!s.isWarmup && !s.done && !isTimeBased) {
+                    upd(ikey_, si, "weight", finalW);
+                  }
+                });
+                setDeloadWeightEdit(null);
+                if (onDeloadApplied) onDeloadApplied();
+              }}
+              style={{
+                marginLeft:"auto", flexShrink:0,
+                background:T.orange, color:"#07070F", border:"none",
+                borderRadius:8, padding:"5px 12px", fontSize:12, fontWeight:800, cursor:"pointer",
+              }}
+            >Übernehmen</button>
+          </div>
+        )}
+
+        {/* Warm-up sets section – rendered inline before work sets */}
+        {warmupEntries.length > 0 && warmupEntries.map(({planEx:wex, planExIdx:wIdx}) => {
+          const wikey = instKey(wex.eid, wIdx);
+          const wSets = sets[wikey]||[];
+          const unitTypeW = resolved.unitType || "reps+kg";
+          const isTimeW = unitTypeW==="secs"||unitTypeW==="mins";
+          return (
+            <div key={wikey} style={{marginBottom:8}}>
+              <div style={{fontSize:10,color:T.orange,fontWeight:600,marginBottom:4}}>Warm-up</div>
+              {wSets.map((s, si) => (
+                <div key={si} style={{
+                  display:"grid",
+                  gridTemplateColumns: isTimeW ? "1fr 36px" : "1fr 20px 1fr 36px",
+                  gap:5, alignItems:"center", marginBottom:5,
+                }}>
+                  {isTimeW ? (
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <input type="number" inputMode="numeric" value={s.reps}
+                        onChange={e=>upd(wikey,si,"reps",e.target.value)}
+                        style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                          padding:"6px 4px",color:T.text,fontSize:14,fontWeight:700,
+                          textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                      <span style={{fontSize:11,color:T.sub,fontWeight:700}}>{unitTypeW==="secs"?"Sek":"Min"}</span>
+                    </div>
+                  ) : (<>
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <input type="number" inputMode="decimal" value={s.weight}
+                        onChange={e=>upd(wikey,si,"weight",e.target.value)}
+                        style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                          padding:"6px 4px",color:T.text,fontSize:14,fontWeight:700,
+                          textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                      <span style={{fontSize:11,color:T.sub,fontWeight:700}}>kg</span>
+                    </div>
+                    <span style={{textAlign:"center",color:T.muted,fontSize:12}}>×</span>
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <input type="number" inputMode="numeric" value={s.reps}
+                        onChange={e=>upd(wikey,si,"reps",e.target.value)}
+                        style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:7,
+                          padding:"6px 4px",color:T.text,fontSize:14,fontWeight:700,
+                          textAlign:"center",width:"100%",boxSizing:"border-box"}}/>
+                      <span style={{fontSize:11,color:T.sub,fontWeight:700}}>Wdh</span>
+                    </div>
+                  </>)}
+                  <button onClick={()=>toggle(wikey,si,0)}
+                    style={{width:36,height:32,borderRadius:9,border:"none",cursor:"pointer",
+                      background:s.done?T.orange+"44":T.bgAlt,
+                      color:s.done?T.orange:T.sub, fontSize:14,fontWeight:700}}>
+                    {s.done?"✓":"○"}
+                  </button>
+                </div>
+              ))}
+              {workEntries.length>0&&<div style={{height:1,background:T.border,margin:"8px 0"}}/>}
+            </div>
+          );
+        })}
+
+        {/* Set progress bar */}
+        {workEntries.length > 0 && exSets.length > 0 && (
+          <div style={{marginBottom:6}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+              <span style={{fontSize:10,color:T.sub}}>
+                {exSets.filter(s=>s.done).length} / {planEx.sets||exSets.length} Sätze
+              </span>
+              {allDone && <span style={{fontSize:10,color:T.accent,fontWeight:700}}>✓ Fertig</span>}
+            </div>
+            <div style={{height:3,background:T.border,borderRadius:99,overflow:"hidden"}}>
+              <div style={{
+                height:3, borderRadius:99, background:allDone?T.accent:T.teal,
+                width:`${(exSets.filter(s=>s.done).length/(planEx.sets||exSets.length))*100}%`,
+                transition:"width 0.4s",
+              }}/>
+            </div>
           </div>
         )}
         {planEx.note&&(
-          <div style={{fontSize:10,color:T.muted,marginBottom:6}}>💡 {planEx.note}</div>
+          <div style={{fontSize:10,color:T.muted,marginBottom:6}}>{planEx.note}</div>
         )}
 
-        {/* ── Progression suggestion box ─────────────────── */}
-        {suggestion&&(()=>{
-          const repRange  = getRepRangeForPlanExercise(planEx, settings);
-          const accent    = suggestion.isDeload ? T.orange : T.teal;
-          const dispW     = sugWeight !== null ? sugWeight : suggestion.suggestedWeight;
-          const dispR     = sugReps   !== null ? sugReps   : repRange.min;
-          const label     = suggestion.isDeload ? "⬇ DELOAD" : suggestion.action==="increase" ? "↑ PROGRESSION" : "→ GEWICHT HALTEN";
+        {/* ── Progression hint – compact single line ── */}
+        {suggestion && !deloadActive && (()=>{
+          const accent = suggestion.action==="increase" ? T.teal : T.muted;
+          if (suggestion.action !== "increase") return null;
           return (
-          <div style={{
-            marginBottom:8, padding:"10px 12px", borderRadius:10,
-            background: accent+"18",
-            border:`1px solid ${accent}55`,
-          }}>
-            {/* Header row */}
-            <div style={{fontSize:11,fontWeight:800,letterSpacing:0.3,marginBottom:6,color:accent}}>
-              {label}
+            <div style={{
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+              marginBottom:6, padding:"6px 10px", borderRadius:8,
+              background:T.teal+"14", border:`1px solid ${T.teal}33`,
+            }}>
+              <span style={{fontSize:11,color:T.teal,fontWeight:800}}>↑ {suggestion.suggestedWeight} kg möglich</span>
+              <button onClick={applySuggestion} style={{
+                background:T.teal,color:"#07070F",border:"none",borderRadius:6,
+                padding:"4px 10px",fontSize:11,fontWeight:800,cursor:"pointer",
+              }}>Übernehmen</button>
             </div>
-            {/* Editable weight + reps row */}
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-              {suggestion.suggestedWeight>0 && (
-                <>
-                  <input
-                    type="number"
-                    value={dispW}
-                    onChange={e=>setSugWeight(e.target.value)}
-                    style={{
-                      width:72, padding:"6px 8px", borderRadius:8, textAlign:"center",
-                      border:`1.5px solid ${accent}88`,
-                      background:accent+"14", color:accent,
-                      fontSize:16, fontWeight:800,
-                    }}
-                  />
-                  <span style={{fontSize:12,color:accent,fontWeight:700}}>kg</span>
-                  <span style={{fontSize:13,color:T.muted}}>×</span>
-                </>
-              )}
-              <input
-                type="number"
-                value={dispR}
-                onChange={e=>setSugReps(e.target.value)}
-                style={{
-                  width:56, padding:"6px 8px", borderRadius:8, textAlign:"center",
-                  border:`1.5px solid ${accent}88`,
-                  background:accent+"14", color:accent,
-                  fontSize:16, fontWeight:800,
-                }}
-              />
-              <span style={{fontSize:12,color:accent,fontWeight:700}}>Wdh</span>
-            </div>
-            {/* Reason + apply row */}
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
-              <div>
-                <div style={{fontSize:10,color:T.sub,lineHeight:1.4}}>{suggestion.reason}</div>
-                {suggestion.isDeload&&suggestion.suggestedSets!=null&&(
-                  <div style={{fontSize:10,color:T.orange,marginTop:2,fontWeight:700}}>
-                    → {suggestion.suggestedSets} Sätze empfohlen
-                  </div>
-                )}
-              </div>
-              <button
-                onClick={applySuggestion}
-                style={{
-                  background: accent, color:"#07070F", border:"none", borderRadius:8,
-                  padding:"7px 13px", fontSize:12, fontWeight:800,
-                  cursor:"pointer", flexShrink:0, whiteSpace:"nowrap",
-                }}
-              >Auf alle Sätze</button>
-            </div>
-          </div>
           );
         })()}
 
         {/* Extra info badges */}
         {hasExtraInfo&&(
           <div style={{display:"flex",gap:5,marginBottom:6,flexWrap:"wrap"}}>
-            {resolved.img&&<span style={{fontSize:10,color:T.purple,background:T.purple+"18",border:`1px solid ${T.purple}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>🖼 Bild</span>}
-            {resolved.desc&&<span style={{fontSize:10,color:T.blue,background:T.blue+"18",border:`1px solid ${T.blue}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>📝 Info</span>}
-            {resolved.link&&<span style={{fontSize:10,color:T.teal,background:T.teal+"18",border:`1px solid ${T.teal}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>🎥 Video</span>}
+            {resolved.img&&<span style={{fontSize:10,color:T.purple,background:T.purple+"18",border:`1px solid ${T.purple}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>Bild</span>}
+            {resolved.desc&&<span style={{fontSize:10,color:T.blue,background:T.blue+"18",border:`1px solid ${T.blue}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>Info</span>}
+            {resolved.link&&<span style={{fontSize:10,color:T.teal,background:T.teal+"18",border:`1px solid ${T.teal}44`,borderRadius:5,padding:"1px 6px",fontWeight:700}}>Video</span>}
           </div>
         )}
 
@@ -3243,7 +3576,7 @@ const WorkoutExerciseCard = ({
             {resolved.desc&&<div style={{fontSize:12,color:T.sub,lineHeight:1.6,marginBottom:resolved.link?8:0}}>{resolved.desc}</div>}
             {resolved.link&&<a href={resolved.link} target="_blank" rel="noreferrer"
               style={{display:"flex",alignItems:"center",gap:6,padding:"7px 10px",background:T.bgCard,borderRadius:8,color:T.blue,fontSize:12,fontWeight:700,textDecoration:"none",marginTop:resolved.desc?6:0}}>
-              🎥 Anleitungsvideo
+              Anleitungsvideo
             </a>}
           </div>
         )}
@@ -3282,7 +3615,7 @@ const WorkoutExerciseCard = ({
                   : T.muted,
                 border:`1px solid ${s.done ? T.accent+"44" : T.border}`,
               }}>
-                {s.done ? "✓" : isThisTimerActive && exTimer?.setIdx===i ? "⏱" : i+1}
+                {s.done ? "✓" : isThisTimerActive && exTimer?.setIdx===i ? "▶" : i+1}
               </div>
 
               {isTimeBased ? (
@@ -3322,10 +3655,11 @@ const WorkoutExerciseCard = ({
               ) : (
                 /* Standard: Gewicht × Wiederholungen */
                 <>
-                  {/* Weight field with "kg" label */}
-                  <div style={{display:"flex", alignItems:"center", gap:3}}>
+                  {/* Weight field – direct input, no +/- buttons */}
+                  <div style={{display:"flex", alignItems:"center", gap:4}}>
                     <input
                       type="number"
+                      inputMode="decimal"
                       value={s.weight}
                       onChange={e => upd(ikey, i, "weight", e.target.value)}
                       style={{
@@ -3335,7 +3669,7 @@ const WorkoutExerciseCard = ({
                         textAlign:"center", width:"100%", boxSizing:"border-box",
                       }}
                     />
-                    <span style={{fontSize:11, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>kg</span>
+                    <span style={{fontSize:12, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>kg</span>
                   </div>
                   <span style={{textAlign:"center", color:T.muted, fontSize:12}}>×</span>
                   {/* Reps field with "Wdh" label */}
@@ -3372,6 +3706,7 @@ const WorkoutExerciseCard = ({
               >
                 {s.done ? "✓" : isTimeBased ? "▶" : "○"}
               </button>
+
             </div>
           );
         })}
@@ -3461,6 +3796,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const [dayId,setDayId]   = useState(() => hasDraft ? draft.dayId  : null);
   const [sets,setSets]     = useState(() => hasDraft ? (draft.sets||{}) : {});
   const [note,setNote]     = useState(() => hasDraft ? (draft.note||"") : "");
+  const [deloadApplied, setDeloadApplied] = useState(false); // true when Übernehmen was clicked
   // rest timer is lifted to App via globalRest/setGlobalRest so it persists across tabs
   const rest    = globalRest;
   const setRest = setGlobalRest;
@@ -3574,20 +3910,41 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     const day = activePlans.find(p=>p.id===planId)?.days.find(d=>d.id===dayId);
     if (!day) return;
     const allSets = [];
-    // Fix 1: iterate by instance key to keep duplicate exercises separate
     day.exercises.forEach((ex, exIdx) => {
       const key = instKey(ex.eid, exIdx);
       (sets[key]||[]).filter(s=>s.done).forEach(s => allSets.push({eid:ex.eid,...s}));
     });
     if (allSets.length === 0) { setWarnEmpty(true); return; }
     setWarnEmpty(false); clearWorkoutDraft();
-    onSave({id:uid(), planId, dayId, date:new Date().toISOString(), duration:Math.floor(elapsed/60), sets:allSets, note});
+
+    // Determine deload flags
+    const deloadCurrentlyActive = isDeloadActive(settings);
+    let sessionIsDeload   = deloadCurrentlyActive;
+    let sessionDeloadApplied = deloadApplied; // set to true when Übernehmen was clicked
+
+    // If deload is active but Übernehmen was NOT used, ask the user
+    if (deloadCurrentlyActive && !deloadApplied) {
+      const confirmed = window.confirm(
+        "Deload angewendet?\n\nJa = Training wird als Deload-Einheit gespeichert (beeinflusst keine Progression).\nNein = Normales Training speichern."
+      );
+      sessionIsDeload      = confirmed;
+      sessionDeloadApplied = confirmed;
+    }
+
+    onSave({
+      id:uid(), planId, dayId,
+      date:new Date().toISOString(),
+      duration:Math.floor(elapsed/60),
+      sets:allSets, note,
+      ...(sessionIsDeload    ? { isDeload: true }      : {}),
+      ...(sessionDeloadApplied ? { deloadApplied: true } : {}),
+    });
     setPhase("done");
   };
 
   if (phase==="done") return (
     <div style={{padding:"60px 24px",textAlign:"center"}}>
-      <div style={{fontSize:80,marginBottom:20}}>🏆</div>
+      <div style={{fontSize:36,fontWeight:900,color:T.accent,marginBottom:16}}>Training abgeschlossen</div>
       <div style={{fontSize:30,fontWeight:900,color:T.accent,marginBottom:8}}>Stark gemacht!</div>
       <div style={{color:T.sub,fontSize:16,marginBottom:6}}>{fmt(elapsed)}</div>
       <div style={{color:T.muted,fontSize:13,marginBottom:40}}>
@@ -3617,8 +3974,8 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
         <Card style={{marginBottom:14}} glow>
           <div style={{fontSize:20,fontWeight:900,color:T.accent,marginBottom:6}}>{cd.name}</div>
           <div style={{display:"flex",gap:14,fontSize:13,color:T.sub,marginBottom:16}}>
-            <span>🏋 {cd.exercises.length} Übungen</span>
-            <span>📋 {totalSets} Sätze</span>
+            <span>{cd.exercises.length} Übungen</span>
+            <span>{totalSets} Sätze</span>
           </div>
 
           {/* Exercise list preview */}
@@ -3636,10 +3993,10 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
                 <div>
                   <div style={{fontSize:13,fontWeight:600,color:T.text}}>{resolved.name||"?"}</div>
                   {resolved.trainingsnotiz && (
-                    <div style={{fontSize:10,color:T.teal,marginTop:1}}>📌 {resolved.trainingsnotiz}</div>
+                    <div style={{fontSize:10,color:T.teal,marginTop:1}}>Notiz: {resolved.trainingsnotiz}</div>
                   )}
                   {ex.note && (
-                    <div style={{fontSize:10,color:T.muted,marginTop:1}}>💡 {ex.note}</div>
+                    <div style={{fontSize:10,color:T.muted,marginTop:1}}>{ex.note}</div>
                   )}
                 </div>
                 <div style={{textAlign:"right",flexShrink:0,marginLeft:12}}>
@@ -3682,7 +4039,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
         const dn = Object.values(draft.sets||{}).flat().filter(s=>s.done).length;
         return (
           <div style={{background:`${T.orange}18`,border:`1px solid ${T.orange}55`,borderRadius:14,padding:"14px 16px",marginBottom:16}}>
-            <div style={{fontSize:12,color:T.orange,fontWeight:800,marginBottom:6}}>⚡ UNTERBROCHENES TRAINING</div>
+            <div style={{fontSize:12,color:T.orange,fontWeight:800,marginBottom:6}}>UNTERBROCHENES TRAINING</div>
             <div style={{fontSize:15,fontWeight:700,color:T.text,marginBottom:2}}>{dd?.name||"Training"}</div>
             <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{dp?.name} · {dn} Sätze · {fmt(draft.elapsed||0)}</div>
             <div style={{display:"flex",gap:8}}>
@@ -3773,37 +4130,59 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
           </div>
         </div>
         <PBar value={done} max={total} h={4}/>
-        <div style={{fontSize:9,color:T.muted,textAlign:"right",marginTop:3,letterSpacing:0.5}}>💾 automatisch gespeichert</div>
+        <div style={{fontSize:9,color:T.muted,textAlign:"right",marginTop:3,letterSpacing:0.5}}> automatisch gespeichert</div>
       </div>
 
-      {day.exercises.map((planEx, planExIdx) => (
-        // Fix 1: WorkoutExerciseCard per instance – hooks valid, keys unique
-        <WorkoutExerciseCard
-          key={instKey(planEx.eid, planExIdx)}
-          planEx={planEx}
-          planExIdx={planExIdx}
-          allExercises={allExercises}
-          exerciseOverrides={exerciseOverrides}
-          sets={sets}
-          toggle={toggle}
-          upd={upd}
-          addSet={addSet}
-          setExTimer={setExTimer}
-          exTimer={exTimer}
-          settings={settings}
-          sessions={sessions}
-        />
-      ))}
+      {(()=>{
+        // Group consecutive same-eid entries: warmup entries + work entries → one card
+        const groups = [];
+        day.exercises.forEach((planEx, planExIdx) => {
+          const isWU = planEx.isWarmup ||
+            (planEx.note||"").toLowerCase().includes("eingewöhnung") ||
+            (planEx.note||"").toLowerCase().includes("warm-up") ||
+            (planEx.note||"").toLowerCase().includes("warmup");
+          const last = groups[groups.length-1];
+          if (last && last.eid === planEx.eid) {
+            if (isWU) last.warmupEntries.push({planEx, planExIdx});
+            else      last.workEntries.push({planEx, planExIdx});
+          } else {
+            groups.push({
+              eid: planEx.eid,
+              warmupEntries: isWU ? [{planEx, planExIdx}] : [],
+              workEntries:   isWU ? [] : [{planEx, planExIdx}],
+            });
+          }
+        });
+        return groups.map((group, gi) => (
+          <WorkoutExerciseCard
+            key={`group-${gi}-${group.eid}`}
+            eid={group.eid}
+            warmupEntries={group.warmupEntries}
+            workEntries={group.workEntries}
+            allExercises={allExercises}
+            exerciseOverrides={exerciseOverrides}
+            sets={sets}
+            toggle={toggle}
+            upd={upd}
+            addSet={addSet}
+            setExTimer={setExTimer}
+            exTimer={exTimer}
+            settings={settings}
+            sessions={sessions}
+            onDeloadApplied={()=>setDeloadApplied(true)}
+          />
+        ));
+      })()}
 
       <div style={{marginTop:16}}><Lbl>NOTIZ</Lbl><Inp value={note} onChange={setNote} placeholder="Wie war das Training?"/></div>
 
       {warnEmpty && (
         <div style={{marginTop:10,padding:"10px 14px",background:T.red+"22",borderRadius:10,border:`1px solid ${T.red}44`,fontSize:13,color:T.red}}>
-          ⚠️ Mindestens einen Satz abhaken bevor du das Training abschließt.
+          Mindestens einen Satz abhaken bevor du das Training abschließt.
         </div>
       )}
 
-      <Btn onClick={finish} full style={{padding:16,marginTop:14,fontSize:16}}>Training abschließen ✓</Btn>
+      <Btn onClick={finish} full style={{padding:16,marginTop:14,fontSize:16}}>Training abschließen</Btn>
 
       {/* Abbrechen – klein und dezent, mit Sicherheitsabfrage */}
       <button
@@ -3838,6 +4217,10 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const [view,setView]         = useState("overview");
   const [selEx,setSelEx]       = useState(null);
   const [detailSess,setDetailSess] = useState(null);
+  // Collapsible UI states (must be top-level, not inside IIFEs)
+  const [showVolChart,  setShowVolChart]  = useState(false);
+  const [showAllRecs,   setShowAllRecs]   = useState(false);
+  const [showExChart,   setShowExChart]   = useState(false);
 
   // ── Pre-computed data ─────────────────────────────────
   const usedEids  = useMemo(()=>[...new Set(sessions.flatMap(s=>s.sets.filter(isDone).map(x=>x.eid)))],[sessions]);
@@ -3849,7 +4232,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   const summary   = useMemo(()=>buildWeeklySummary(sessions,cardio,allExercises),[sessions,cardio,allExercises]);
   const recs      = useMemo(()=>buildRecommendations(sessions,cardio,allExercises,calcStreak(sessions,cardio)),[sessions,cardio,allExercises]);
   // Progression tab data
-  const deloadRec = useMemo(()=>detectDeloadRecommendation(sessions,settings),[sessions,settings]);
+  const deloadRec = useMemo(()=>detectDeloadRecommendation(sessions,settings,plans,allExercises),[sessions,settings,plans,allExercises]);
   const progData  = useMemo(()=>{
     if(!sessions||sessions.length<2) return [];
     const ps = getProgressionSettings(settings);
@@ -3861,7 +4244,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
       if(!ex||(ex.unitType&&ex.unitType!=="reps")) return null;
       const planEx={eid, weight:0, sets:3, reps:10};
       // Fix 2: use actual last-known weight so deload suggestion is non-zero
-      const history=getExercisePerformanceHistory(eid, sessions);
+      const history=getExercisePerformanceHistory(canonicalEid(eid), sessions);
       const lastKnownWeight = history.length>0 ? (history[history.length-1].sets[0]?.weight||0) : 0;
       const planExWithWeight = {...planEx, weight: lastKnownWeight};
       const sug=calculateProgressionSuggestion(planExWithWeight,ex,sessions,settings);
@@ -3891,7 +4274,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
       volPct:     pctChange(vl),
       rm1Pct:     pctChange(rm),
       slope:      calcTrend(wt),
-      bestSet:    getBestSet(sessions,selEx),
+      bestSet:    getBestSet(sessions,canonicalEid(selEx)),
       best1RM:    Math.max(0,...rm),
       last30Sets: now30.length,
       latestWt:   wt[wt.length-1],
@@ -3914,7 +4297,8 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
             <div style={{fontSize:19,fontWeight:900,color:T.accent,marginBottom:4}}>
               {plans.find(p=>p.id===detailSess.planId)?.days.find(d=>d.id===detailSess.dayId)?.name||"Training"}
             </div>
-            {detailSess.source&&<Badge color={T.orange} style={{marginBottom:8}}>{detailSess.source} Import</Badge>}
+            {detailSess.isDeload&&<Badge color={T.orange} style={{marginBottom:8}}>⬇ Deload</Badge>}
+            {detailSess.source&&<Badge color={T.muted} style={{marginBottom:8}}>{detailSess.source} Import</Badge>}
             <div style={{fontSize:12,color:T.sub,marginBottom:12}}>{fmtD(detailSess.date)}</div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
               {[{l:"DAUER",v:`${detailSess.duration}min`},{l:"SÄTZE",v:detailSess.sets.filter(isDone).length},{l:"VOLUMEN",v:`${(Math.round(vol(detailSess.sets)/100)/10).toFixed(1)}t`}].map(s=>(
@@ -3953,7 +4337,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
   }
 
   // ── Tab bar ─────────────────────────────────────────
-  const tabs=[{v:"overview",l:"📊 Woche"},{v:"muscles",l:"💪 Muskeln"},{v:"exercises",l:"🏋 Übungen"},{v:"progress",l:"📈 Progression"},{v:"history",l:"📋 Verlauf"}];
+  const tabs=[{v:"overview",l:"Woche"},{v:"muscles",l:"Muskeln"},{v:"exercises",l:"Übungen"},{v:"progress",l:"Progression"},{v:"history",l:"Verlauf"}];
 
   return (
     <div style={{padding:"0 16px 24px"}}>
@@ -3992,11 +4376,16 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
           </Card>
         </div>
 
-        {/* Volume sparkline */}
+        {/* Volume sparkline – compact */}
         {sessions.length>2 && (
           <Card style={{marginBottom:12}}>
-            <Lbl>VOLUMEN LETZTE 8 EINHEITEN</Lbl>
-            <LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={68}/>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <Lbl>VOLUMEN-VERLAUF</Lbl>
+              <button onClick={()=>setShowVolChart(v=>!v)} style={{background:"none",border:"none",cursor:"pointer",fontSize:11,color:T.muted,padding:0}}>
+                {showVolChart?"▲":"▼"}
+              </button>
+            </div>
+            {showVolChart&&<LineChart data={sessions.slice(0,8).map(s=>vol(s.sets)).reverse()} color={T.blue} height={60}/>}
           </Card>
         )}
 
@@ -4019,23 +4408,31 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
           </div>
         </Card>
 
-        {/* Recommendations */}
+        {/* Recommendations – max 1 visible, rest collapsible */}
         {recs.length>0&&(
           <Card style={{marginBottom:12}}>
-            <Lbl color={T.blue}>EMPFEHLUNGEN</Lbl>
-            {recs.map((r,i)=>(
-              <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"6px 0",borderBottom:i<recs.length-1?`1px solid ${T.border}`:"none"}}>
-                <span style={{fontSize:16,flexShrink:0}}>{r.icon}</span>
-                <div style={{fontSize:13,color:T.sub,lineHeight:1.5}}>{r.text}</div>
+            <Lbl color={T.blue}>HINWEIS</Lbl>
+            {(showAllRecs ? recs : recs.slice(0,1)).map((r,i)=>(
+              <div key={i} style={{fontSize:13,color:T.sub,lineHeight:1.5,padding:"4px 0",
+                borderBottom:i<(showAllRecs?recs:recs.slice(0,1)).length-1?`1px solid ${T.border}`:"none"}}>
+                {r.text}
               </div>
             ))}
+            {recs.length>1&&(
+              <button onClick={()=>setShowAllRecs(v=>!v)} style={{
+                background:"none",border:"none",cursor:"pointer",
+                fontSize:11,color:T.muted,marginTop:6,padding:0,
+              }}>
+                {showAllRecs ? "Weniger anzeigen ▲" : `${recs.length-1} weitere Hinweise ▼`}
+              </button>
+            )}
           </Card>
         )}
 
         {/* PRs overview */}
         {Object.keys(prs).length>0&&(
           <Card style={{marginBottom:12}}>
-            <Lbl color={T.orange}>BESTLEISTUNGEN 🏆</Lbl>
+            <Lbl color={T.orange}>BESTLEISTUNGEN</Lbl>
             {Object.entries(prs).slice(0,5).map(([eid,kg])=>{
               const ex=(allExercises||[]).find(e=>e.id===eid);
               return(
@@ -4069,7 +4466,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         {/* Muscle group bars */}
         <Card style={{marginBottom:12}}>
           <Lbl>SÄTZE PRO MUSKELGRUPPE (diese Woche)</Lbl>
-          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility).map(([cat,mg])=>{
+          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility&&!mg.legacy).map(([cat,mg])=>{
             const sets=weekSets[cat]||0;
             const status=getMuscleStatus(sets,mg.targetSets);
             const days=lastTrained[cat];
@@ -4097,7 +4494,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         {/* Recovery status */}
         <Card style={{marginBottom:12}}>
           <Lbl>REGENERATIONS-STATUS</Lbl>
-          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility).map(([cat])=>{
+          {Object.entries(MUSCLE_GROUPS).filter(([,mg])=>!mg.mobility&&!mg.legacy).map(([cat])=>{
             const days=lastTrained[cat];
             if(days===undefined)return null;
             const st=getRecoveryStatus(days);
@@ -4132,52 +4529,42 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
                 <div style={{fontSize:16,fontWeight:900,color:T.text}}>{exObj.name}</div>
                 <div style={{fontSize:11,color:T.sub}}>{exObj.cat} · {exObj.eq}</div>
               </div>
-              {prs[selEx]&&<Badge color={T.orange}>🏆 {prs[selEx]} kg</Badge>}
+              {prs[selEx]&&<Badge color={T.orange}>{prs[selEx]} kg</Badge>}
             </div>
 
             {!isTimeEx && exTrend && (<>
-              {/* Trend indicators */}
-              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
-                {[
-                  {l:"GEWICHT",v:exTrend.latestWt?`${exTrend.latestWt} kg`:"—",pct:exTrend.weightPct,c:T.accent},
-                  {l:"EST. 1RM", v:exTrend.best1RM>0?`${exTrend.best1RM} kg`:"—",pct:exTrend.rm1Pct,c:T.orange},
-                  {l:"VOLUMEN",  v:exTrend.volPct!==null?`${exTrend.volPct>0?"+":""}${exTrend.volPct}%`:"—",pct:exTrend.volPct,c:T.blue},
-                ].map(s=>(
-                  <div key={s.l} style={{textAlign:"center",padding:"10px 6px",background:T.bgAlt,borderRadius:10}}>
-                    <div style={{fontSize:14,fontWeight:900,color:s.c}}>{s.v}</div>
-                    {s.pct!==null&&(
-                      <div style={{fontSize:10,marginTop:2,color:s.pct>0?T.green:s.pct<0?T.red:T.muted,fontWeight:700}}>
-                        {s.pct>0?"↑":"↓"} {Math.abs(s.pct)}%
-                      </div>
-                    )}
-                    <div style={{fontSize:9,color:T.muted,marginTop:1}}>{s.l}</div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Coaching insight */}
-              {exTrend.weightPct!==null&&(
-                <div style={{padding:"8px 10px",background:T.accentGlow,borderRadius:8,fontSize:12,color:T.accentDim,marginBottom:10}}>
-                  {exTrend.weightPct>0
-                    ? `📈 +${exTrend.weightPct}% stärker seit dem ersten Eintrag`
-                    : exTrend.weightPct<0
-                    ? `📉 ${exTrend.weightPct}% – Gewicht gesunken, Technik prüfen`
-                    : `➡️ Gewicht stabil – bereit für den nächsten Schritt?`}
+                {/* Top stats – always visible */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:8}}>
+                  {[
+                    {l:"GEWICHT", v:exTrend.latestWt?`${exTrend.latestWt} kg`:"—", pct:exTrend.weightPct, c:T.accent},
+                    {l:"1RM ca.",  v:exTrend.best1RM>0?`${exTrend.best1RM} kg`:"—",   pct:null, c:T.orange},
+                    {l:"TREND",    v:exTrend.slope>0.05?"↑":exTrend.slope<-0.05?"↓":"→", pct:exTrend.weightPct, c:exTrend.slope>0.05?T.green:exTrend.slope<-0.05?T.red:T.muted},
+                  ].map(s=>(
+                    <div key={s.l} style={{textAlign:"center",padding:"9px 4px",background:T.bgAlt,borderRadius:9}}>
+                      <div style={{fontSize:14,fontWeight:900,color:s.c}}>{s.v}</div>
+                      {s.pct!==null&&s.pct!==0&&(
+                        <div style={{fontSize:9,marginTop:1,color:s.pct>0?T.green:T.red,fontWeight:700}}>
+                          {s.pct>0?"+":""}{s.pct}%
+                        </div>
+                      )}
+                      <div style={{fontSize:9,color:T.muted,marginTop:1}}>{s.l}</div>
+                    </div>
+                  ))}
                 </div>
-              )}
 
-              {/* Weight chart */}
-              {exHistory.length>1&&(<>
-                <Lbl>GEWICHTSVERLAUF</Lbl>
-                <LineChart data={exHistory.map(h=>h.weight)} color={T.accent} height={80}/>
-                <div style={{display:"flex",gap:16,marginTop:8,fontSize:12,color:T.sub}}>
-                  <span>Start: <b style={{color:T.text}}>{exTrend.firstWt} kg</b></span>
-                  <span>Aktuell: <b style={{color:T.accent}}>{exTrend.latestWt} kg</b></span>
-                  {exTrend.slope>0.05&&<span style={{color:T.green,fontWeight:700}}>↑ Trend</span>}
-                  {exTrend.slope<-0.05&&<span style={{color:T.red,fontWeight:700}}>↓ Trend</span>}
-                </div>
+                {/* Chart – collapsible */}
+                {exHistory.length>1&&(
+                  <button onClick={()=>setShowExChart(v=>!v)} style={{
+                    background:"none",border:"none",cursor:"pointer",
+                    fontSize:11,color:T.muted,padding:"2px 0",marginBottom:showExChart?8:0,
+                  }}>
+                    {showExChart ? "Verlauf ausblenden ▲" : "Gewichtsverlauf anzeigen ▼"}
+                  </button>
+                )}
+                {showExChart && exHistory.length>1&&(
+                  <LineChart data={exHistory.map(h=>h.weight)} color={T.accent} height={72}/>
+                )}
               </>)}
-            </>)}
 
             {/* Time exercise analysis (Punkt 5) */}
             {isTimeEx && timeHist.length>0&&(<>
@@ -4219,20 +4606,29 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         {deloadRec&&(
           <Card style={{marginBottom:12,background:T.orange+"12",border:`1px solid ${T.orange}44`}}>
             <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
-              <span style={{fontSize:22}}>⬇</span>
-              <div>
-                <div style={{fontSize:14,fontWeight:800,color:T.orange,marginBottom:4}}>Entlastung empfohlen</div>
-                <div style={{fontSize:12,color:T.sub,lineHeight:1.5}}>{deloadRec.reason}</div>
-                <div style={{fontSize:11,color:T.muted,marginTop:4}}>
-                  {deloadRec.urgency==="active" ? "Aktiver Deload läuft" : "Nächste Einheit leichter trainieren"}
+              <span style={{fontSize:22}}>"⬇"</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:800,color:T.orange,marginBottom:4}}>
+                  {deloadRec.urgency==="active" ? "Deload aktiv" : "Entlastung empfohlen"}
                 </div>
+                <div style={{fontSize:12,color:T.sub,lineHeight:1.5}}>{deloadRec.reason}</div>
+                {deloadRec.urgency==="stagnation" && deloadRec.stagnatingCount > 0 && (
+                  <div style={{fontSize:11,color:T.orange,marginTop:4,fontWeight:700}}>
+                    {deloadRec.stagnatingCount} Übungen zeigen keine Steigerung
+                  </div>
+                )}
+                {deloadRec.urgency !== "active" && (
+                  <div style={{fontSize:11,color:T.muted,marginTop:4}}>
+                    Nächste Einheit mit reduziertem Gewicht oder weniger Sätzen trainieren
+                  </div>
+                )}
               </div>
             </div>
           </Card>
         )}
         {!deloadRec&&(
           <Card style={{marginBottom:12,background:T.teal+"12",border:`1px solid ${T.teal}44`}}>
-            <div style={{fontSize:13,color:T.teal,fontWeight:700}}>✅ Keine Entlastung nötig</div>
+            <div style={{fontSize:13,color:T.teal,fontWeight:700}}>Keine Entlastung nötig</div>
             <div style={{fontSize:11,color:T.sub,marginTop:2}}>Trainingsbelastung im grünen Bereich</div>
           </Card>
         )}
@@ -4270,7 +4666,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
               </div>
               {item.stagnation?.stagnating&&(
                 <div style={{fontSize:10,color:T.muted,marginTop:4,borderTop:`1px solid ${T.border}`,paddingTop:4}}>
-                  ⚠ Keine Steigerung seit {item.stagnation.sessionsChecked} Einheiten
+                  Keine Steigerung seit {item.stagnation.sessionsChecked} Einheiten
                 </div>
               )}
             </Card>
@@ -4286,7 +4682,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
         )}
         {sessions.map(sess=>{
           const v=vol(sess.sets);
-          const dn=plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training";
+          const dn=(sess.isDeload?"⬇ ":"")+(plans.find(p=>p.id===sess.planId)?.days.find(d=>d.id===sess.dayId)?.name||"Training");
           return(
             <Card key={sess.id} style={{marginBottom:8,padding:0,overflow:"hidden"}}>
               <div style={{display:"flex",alignItems:"stretch"}}>
@@ -4309,7 +4705,7 @@ const ProgressScreen = ({sessions, plans, cardio, allExercises, exerciseOverride
                 <button
                   onClick={e=>{e.stopPropagation();if(window.confirm(`"${dn}" wirklich löschen?`))onDeleteSession(sess.id);}}
                   style={{background:T.red+"18",border:"none",borderLeft:`1px solid ${T.red}33`,cursor:"pointer",padding:"0 16px",color:T.red,fontSize:18,flexShrink:0,borderRadius:"0 18px 18px 0"}}
-                >🗑</button>
+                >Löschen</button>
               </div>
             </Card>
           );
@@ -4525,7 +4921,7 @@ const BadgeUnlockOverlay = ({badges, onClose}) => {
 
         {idx<badges.length-1
           ? <Btn onClick={()=>setIdx(i=>i+1)} full v="gold" style={{marginBottom:8}}>Weiter →</Btn>
-          : <Btn onClick={onClose} full v="gold">🎉 Abschließen</Btn>
+          : <Btn onClick={onClose} full v="gold">Abschließen</Btn>
         }
       </div>
     </div>
@@ -4573,7 +4969,7 @@ const AchievementsScreen = ({sessions, metrics, streak, cardio, allExercises=[]}
                   <div style={{fontSize:13,fontWeight:700,color:a.unlocked?T.gold:T.sub}}>{a.name}</div>
                   <div style={{fontSize:11,color:T.muted,marginTop:1}}>{a.desc}</div>
                 </div>
-                {a.unlocked?<span style={{color:T.gold,fontSize:14}}>✓</span>:<span style={{color:T.muted,fontSize:12}}>🔒</span>}
+                {a.unlocked?<span style={{color:T.gold,fontSize:14}}>✓</span>:<span style={{color:T.muted,fontSize:12}}>–</span>}
               </div>
             ))}
           </div>
@@ -4587,117 +4983,107 @@ const AchievementsScreen = ({sessions, metrics, streak, cardio, allExercises=[]}
 // ═══════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════
-const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, onStartWorkout, onGoTo}) => {
-  const latest   = metrics[metrics.length-1];
+const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, achievements, allExercises, onStartWorkout, onGoTo}) => {
   const {sessions:weekS, cardio:weekC} = useMemo(()=>getWeekActivities(sessions,cardio),[sessions,cardio]);
-  const weekGoal = settings.weeklyGoal||3;
-  const lastSession = sessions[0];
-  const lastCardio  = cardio[0];
+  const weekGoal      = settings.weeklyGoal||3;
+  const lastSession   = sessions[0];
+  const lastCardio    = cardio[0];
   const totalActivity = weekS.length + weekC.length;
-  const newAch = achievements.filter(a=>a.unlocked).slice(-2);
+  const newAchCount   = achievements.filter(a=>a.unlocked).length;
+  const newAchLatest  = achievements.filter(a=>a.unlocked).slice(-1)[0];
 
-  // ISO Mo=0..So=6 für Wochenkalender
-  const DAYS = ["Mo","Di","Mi","Do","Fr","Sa","So"];
+  const DAYS     = ["Mo","Di","Mi","Do","Fr","Sa","So"];
   const todayISO = (new Date().getDay()||7)-1;
   const isoDay   = d => { const wd=new Date(d).getDay(); return (wd||7)-1; };
 
   return (
     <div style={{padding:"0 16px 24px"}}>
-      <div style={{padding:"22px 0 16px"}}>
-        <div style={{fontSize:12,color:T.sub,marginBottom:3}}>
+      {/* Header */}
+      <div style={{padding:"20px 0 14px"}}>
+        <div style={{fontSize:12,color:T.muted,marginBottom:2}}>
           {new Date().toLocaleDateString("de-DE",{weekday:"long",day:"numeric",month:"long"})}
         </div>
-        <div style={{fontSize:26,fontWeight:900,color:T.text}}>Hey {settings.name||"Athlet"} <span style={{color:T.accent}}>⚡</span></div>
+        <div style={{fontSize:24,fontWeight:900,color:T.text}}>{settings.name||"Athlet"}</div>
       </div>
 
-      <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:10,marginBottom:12}}>
-        <Card style={{padding:"14px 18px",textAlign:"center",minWidth:86}} onClick={()=>onGoTo("achievements")}>
-          <div style={{fontSize:28}}>🔥</div>
-          <div style={{fontSize:26,fontWeight:900,color:T.orange}}>{streak}</div>
-          <div style={{fontSize:9,color:T.muted,marginTop:2}}>STREAK</div>
-        </Card>
-        <Card glow={totalActivity>=weekGoal}>
-          <div style={{display:"flex",justifyContent:"space-between",marginBottom:7}}>
-            <div>
-              <Lbl>DIESE WOCHE</Lbl>
-              <div style={{fontSize:22,fontWeight:900,color:T.text}}>
-                {totalActivity}<span style={{color:T.sub,fontSize:14,fontWeight:400}}> / {weekGoal}</span>
+      {/* Nächstes Training – primäre Aktion */}
+      {(()=>{
+        const rec = getNextABRecommendation(plans, sessions);
+        if (!rec) return (
+          <Btn onClick={onStartWorkout} full style={{padding:"15px 8px",fontSize:15,borderRadius:14,marginBottom:12}}>Training starten</Btn>
+        );
+        return (
+          <Card style={{marginBottom:12, background:`linear-gradient(135deg,${T.accent}10,${T.bgCard})`, border:`1px solid ${T.accent}44`}}
+            onClick={()=>onGoTo("workout")}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:10,color:T.accent,fontWeight:800,letterSpacing:0.5,marginBottom:3}}>NÄCHSTES TRAINING</div>
+                <div style={{fontSize:18,fontWeight:900,color:T.text,marginBottom:1}}>{rec.dayName}</div>
+                <div style={{fontSize:11,color:T.muted}}>{rec.planName}</div>
               </div>
+              <div style={{background:T.accent,color:"#07070F",borderRadius:10,padding:"9px 16px",fontSize:14,fontWeight:800,flexShrink:0}}>Starten</div>
             </div>
-            <div style={{textAlign:"right",fontSize:11,color:T.muted}}>
-              <div>{weekS.length} Kraft</div>
-              <div>{weekC.length} Cardio</div>
-            </div>
-          </div>
-          <div style={{display:"flex",gap:3,marginBottom:7}}>
-            {DAYS.map((d,i)=>{
-              const hasS=weekS.some(s=>isoDay(s.date)===i);
-              const hasC=weekC.some(c=>isoDay(c.date)===i);
-              return (
-                <div key={d} style={{
-                  flex:1,height:26,borderRadius:6,
-                  background:hasS?T.accent:hasC?T.green:todayISO===i?T.accentGlow:T.bgInput,
-                  border:`1.5px solid ${hasS?T.accent:hasC?T.green:todayISO===i?T.accentDim:T.border}`,
-                  display:"flex",alignItems:"center",justifyContent:"center",
-                  fontSize:8,fontWeight:800,
-                  color:hasS?"#07070F":hasC?"#07070F":todayISO===i?T.accent:T.muted,
-                }}>{d}</div>
-              );
-            })}
-          </div>
-          <PBar value={totalActivity} max={weekGoal} h={4}/>
-          {totalActivity>=weekGoal&&<div style={{marginTop:6,fontSize:11,color:T.accent,fontWeight:700}}>🏆 Wochenziel erreicht!</div>}
-        </Card>
-      </div>
+          </Card>
+        );
+      })()}
 
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
-        <Card style={{padding:12,textAlign:"center"}}><div style={{fontSize:20,fontWeight:900,color:T.accent}}>{sessions.length}</div><div style={{fontSize:9,color:T.muted,marginTop:2}}>KRAFT</div></Card>
-        <Card style={{padding:12,textAlign:"center"}}><div style={{fontSize:20,fontWeight:900,color:T.green}}>{cardio.length}</div><div style={{fontSize:9,color:T.muted,marginTop:2}}>CARDIO</div></Card>
-        <Card style={{padding:12,textAlign:"center"}} onClick={()=>onGoTo("achievements")}><div style={{fontSize:20,fontWeight:900,color:T.gold}}>{achievements.filter(a=>a.unlocked).length}</div><div style={{fontSize:9,color:T.muted,marginTop:2}}>BADGES</div></Card>
-      </div>
-
-      {newAch.length>0 && (
-        <Card style={{marginBottom:12,background:`linear-gradient(135deg,${T.gold}15,${T.bgCard})`}} accent={T.gold}>
-          <Lbl color={T.gold}>ZULETZT FREIGESCHALTET 🏆</Lbl>
-          <div style={{display:"flex",gap:12}}>
-            {newAch.map(a=>(
-              <div key={a.id} style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{fontSize:22}}>{a.icon}</span>
-                <span style={{fontSize:12,fontWeight:700,color:T.gold}}>{a.name}</span>
-              </div>
-            ))}
+      {/* Woche – Kalender + Zähler */}
+      <Card glow={totalActivity>=weekGoal} style={{marginBottom:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}>
+          <Lbl>DIESE WOCHE</Lbl>
+          <div style={{fontSize:18,fontWeight:900,color:T.text}}>
+            {totalActivity}<span style={{color:T.muted,fontSize:12,fontWeight:400}}> / {weekGoal}</span>
           </div>
-        </Card>
-      )}
+        </div>
+        <div style={{display:"flex",gap:3,marginBottom:6}}>
+          {DAYS.map((d,i)=>{
+            const hasS=weekS.some(s=>isoDay(s.date)===i);
+            const hasC=weekC.some(c=>isoDay(c.date)===i);
+            return (
+              <div key={d} style={{
+                flex:1,height:24,borderRadius:5,
+                background:hasS?T.accent:hasC?T.green:todayISO===i?T.accentGlow:T.bgInput,
+                border:`1px solid ${hasS?T.accent:hasC?T.green:todayISO===i?T.accentDim:T.border}`,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                fontSize:7,fontWeight:800,
+                color:hasS?"#07070F":hasC?"#07070F":todayISO===i?T.accent:T.muted,
+              }}>{d}</div>
+            );
+          })}
+        </div>
+        <PBar value={totalActivity} max={weekGoal} h={3}/>
+        {totalActivity>=weekGoal&&<div style={{marginTop:5,fontSize:11,color:T.accent,fontWeight:700}}>Wochenziel erreicht</div>}
+      </Card>
 
+      {/* Letztes Training */}
       {lastSession && (
-        <Card style={{marginBottom:10}}>
-          <Lbl>LETZTES KRAFT-TRAINING</Lbl>
+        <Card style={{marginBottom:8}} onClick={()=>onGoTo("progress")}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <div>
-              <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:3}}>
+              <Lbl>LETZTES TRAINING</Lbl>
+              <div style={{fontSize:14,fontWeight:700,color:T.text,marginTop:2}}>
                 {plans.find(p=>p.id===lastSession.planId)?.days.find(d=>d.id===lastSession.dayId)?.name||"Training"}
               </div>
-              <div style={{fontSize:12,color:T.sub}}>
-                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets)/100)/10).toFixed(1)}t
+              <div style={{fontSize:11,color:T.muted,marginTop:1}}>
+                {lastSession.sets.filter(isDone).length} Sätze · {lastSession.duration} min · {(Math.round(vol(lastSession.sets)/100)/10).toFixed(1)} t
               </div>
             </div>
-            <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastSession.date)}</div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastSession.date)}</div>
+              {lastSession.isDeload&&<Badge color={T.orange} style={{marginTop:4}}>Deload</Badge>}
+            </div>
           </div>
         </Card>
       )}
 
+      {/* Schnellstart Cardio */}
       {lastCardio && (
         <Card style={{marginBottom:12}}>
-          <Lbl>LETZTE AKTIVITÄT</Lbl>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div style={{display:"flex",gap:10,alignItems:"center"}}>
-              <span style={{fontSize:20}}>{CARDIO_ICONS[lastCardio.type]||"🏃"}</span>
-              <div>
-                <div style={{fontSize:14,fontWeight:700,color:T.text}}>{lastCardio.type}</div>
-                <div style={{fontSize:12,color:T.sub}}>
-                  {lastCardio.duration} min{lastCardio.distance?` · ${lastCardio.distance} km`:""}
-                </div>
+            <div>
+              <Lbl>LETZTE CARDIO</Lbl>
+              <div style={{fontSize:13,fontWeight:600,color:T.text,marginTop:2}}>
+                {lastCardio.type} · {lastCardio.duration} min{lastCardio.distance?` · ${lastCardio.distance} km`:""}
               </div>
             </div>
             <div style={{fontSize:11,color:T.muted}}>{fmtDShort(lastCardio.date)}</div>
@@ -4705,19 +5091,112 @@ const DashboardScreen = ({sessions, plans, metrics, settings, cardio, streak, ac
         </Card>
       )}
 
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-        <Btn onClick={onStartWorkout} style={{padding:"14px 8px",fontSize:14,borderRadius:14}}>🏋 Kraft</Btn>
-        <Btn v="teal" onClick={()=>onGoTo("cardio")} style={{padding:"14px 8px",fontSize:14,borderRadius:14}}>🏃 Cardio</Btn>
+      {/* Quick-Actions */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+        <Btn onClick={onStartWorkout} style={{padding:"11px 8px",fontSize:13,borderRadius:12}}>Kraft</Btn>
+        <Btn v="teal" onClick={()=>onGoTo("cardio")} style={{padding:"11px 8px",fontSize:13,borderRadius:12}}>Cardio</Btn>
       </div>
 
-      <div style={{marginTop:14,padding:"12px 14px",background:T.accentGlow,borderRadius:12,border:`1px solid ${T.accent}22`,fontSize:13,color:T.sub,lineHeight:1.6}}>
-        <span style={{color:T.accent,fontWeight:700}}>💡 </span>
-        {streak>=3
-          ? `${streak} Tage am Stück – Körper passt sich an. Dranbleiben!`
-          : sessions.length===0
-            ? "Starte mit dem Ganzkörper-Plan aus deinem GAINSFIRE-Training."
-            : `${sessions.length} Kraft + ${cardio.length} Cardio – gute Mischung macht dich stärker.`}
-      </div>
+      {/* Diese Woche: Minuten + Volumen */}
+      {(()=>{
+        const weekMinutes = weekS.reduce((s,x)=>s+(x.duration||0),0);
+        const weekVol     = weekS.reduce((s,x)=>s+vol(x.sets||[]),0);
+        return (
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            <Card style={{padding:"12px 14px",textAlign:"center"}}>
+              <div style={{fontSize:26,fontWeight:900,color:T.blue,lineHeight:1}}>{weekMinutes}</div>
+              <div style={{fontSize:9,color:T.muted,marginTop:4,letterSpacing:1}}>MIN DIESE WOCHE</div>
+            </Card>
+            <Card style={{padding:"12px 14px",textAlign:"center"}}>
+              <div style={{fontSize:26,fontWeight:900,color:T.teal,lineHeight:1}}>
+                {weekVol>=1000?(weekVol/1000).toFixed(1)+"t":Math.round(weekVol)+"kg"}
+              </div>
+              <div style={{fontSize:9,color:T.muted,marginTop:4,letterSpacing:1}}>VOLUMEN DIESE WOCHE</div>
+            </Card>
+          </div>
+        );
+      })()}
+
+      {/* Trainings-Insights */}
+      {(()=>{
+        if (weekS.length === 0) return null;
+
+        // ── 1. Stärkste Übung: best weight improvement vs. previous week ──
+        const prevWeekCutoff = new Date(); prevWeekCutoff.setDate(prevWeekCutoff.getDate()-14);
+        const thisWeekCutoff = new Date(); thisWeekCutoff.setDate(thisWeekCutoff.getDate()-7);
+
+        const prevSessions = sessions.filter(s =>
+          !s.isDeload &&
+          new Date(s.date) >= prevWeekCutoff &&
+          new Date(s.date) < thisWeekCutoff
+        );
+
+        // Best weight per exercise in each period
+        const bestOf = sessArr => {
+          const best = {};
+          sessArr.forEach(s => s.sets.forEach(x => {
+            if (!isDone(x) || isWarmupSet(x) || (x.weight||0)<=0) return;
+            const cid = canonicalEid(x.eid);
+            if (!best[cid] || x.weight > best[cid]) best[cid] = x.weight;
+          }));
+          return best;
+        };
+
+        const thisWeekBest = bestOf(weekS);
+        const prevWeekBest = bestOf(prevSessions);
+
+        // Find biggest improvement
+        let topImprove = null;
+        Object.entries(thisWeekBest).forEach(([cid, wt]) => {
+          const prev = prevWeekBest[cid];
+          if (!prev || wt <= prev) return;
+          const diff = wt - prev;
+          if (!topImprove || diff > topImprove.diff) {
+            const exName = (allExercises||[]).find(e=>e.id===cid)?.name || cid;
+            topImprove = { name: exName, diff, wt };
+          }
+        });
+
+        // ── 2. Volumen vs. Vorwoche ──────────────────────────────────────
+        const thisVol = weekS.reduce((s,x)=>s+vol(x.sets||[]),0);
+        const prevVol = prevSessions.reduce((s,x)=>s+vol(x.sets||[]),0);
+        const volPct  = prevVol > 0 ? Math.round((thisVol - prevVol) / prevVol * 100) : null;
+
+        return (
+          <Card style={{marginBottom:0}}>
+            <Lbl>TRAININGS-INSIGHTS</Lbl>
+            {/* Stärkste Übung */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+              paddingBottom:volPct!==null?"10px 0":0,
+              borderBottom:volPct!==null?`1px solid ${T.border}`:"none",
+              marginBottom:volPct!==null?10:0}}>
+              <div>
+                <div style={{fontSize:11,color:T.muted,marginBottom:2}}>Stärkste Übung</div>
+                {topImprove ? (
+                  <div style={{fontSize:13,fontWeight:700,color:T.text}}>{topImprove.name}</div>
+                ) : (
+                  <div style={{fontSize:12,color:T.muted}}>Noch keine neue Bestleistung</div>
+                )}
+              </div>
+              {topImprove && (
+                <div style={{fontSize:15,fontWeight:900,color:T.green}}>+{topImprove.diff} kg</div>
+              )}
+            </div>
+            {/* Volumen vs. Vorwoche */}
+            {volPct !== null && (
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{fontSize:11,color:T.muted}}>Volumen vs. Vorwoche</div>
+                <div style={{
+                  fontSize:15,fontWeight:900,
+                  color: volPct > 0 ? T.green : volPct < -5 ? T.orange : T.muted
+                }}>
+                  {volPct > 0 ? "+" : ""}{volPct}%
+                </div>
+              </div>
+            )}
+          </Card>
+        );
+      })()}
     </div>
   );
 };
@@ -4742,7 +5221,7 @@ const SettingsScreen = ({
   // ── Export ───────────────────────────────────────────
   const exportData = useCallback(() => {
     const payload = {
-      _fittrack_version: 7,
+      _fittrack_version: 9,
       exportedAt: new Date().toISOString(),
       settings,
       sessions,
@@ -4839,14 +5318,14 @@ const SettingsScreen = ({
       {/* Profile card */}
       <Card style={{marginBottom:12}}>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
-          <div style={{width:52,height:52,borderRadius:16,background:T.accentGlow,border:`2px solid ${T.accent}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>💪</div>
+          <div style={{width:52,height:52,borderRadius:16,background:T.accentGlow,border:`2px solid ${T.accent}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:900,color:T.accent}}>FT</div>
           <div>
             <div style={{fontSize:18,fontWeight:900,color:T.text}}>{settings.name||"Athlet"}</div>
             <div style={{fontSize:12,color:T.sub}}>{settings.fitnessGoal||"Fitness"}</div>
           </div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginTop:14,paddingTop:14,borderTop:`1px solid ${T.border}`}}>
-          {[{v:sessions.length,l:"Kraft",c:T.accent},{v:cardio.length,l:"Cardio",c:T.green},{v:`${streak}🔥`,l:"Streak",c:T.orange},{v:`${Math.round(totalVol/1000)}t`,l:"Volumen",c:T.blue}].map(s=>(
+          {[{v:sessions.length,l:"Kraft",c:T.accent},{v:cardio.length,l:"Cardio",c:T.green},{v:streak,l:"Streak",c:T.orange},{v:`${Math.round(totalVol/1000)}t`,l:"Volumen",c:T.blue}].map(s=>(
             <div key={s.l} style={{textAlign:"center"}}>
               <div style={{fontSize:18,fontWeight:900,color:s.c}}>{s.v}</div>
               <div style={{fontSize:9,color:T.muted}}>{s.l}</div>
@@ -4893,12 +5372,12 @@ const SettingsScreen = ({
 
         {/* Export */}
         <Btn v="ghost" onClick={exportData} full style={{marginBottom:8}}>
-          📤 Backup exportieren (JSON)
+          Backup exportieren (JSON)
         </Btn>
 
         {/* Import */}
         <Btn v="ghost" onClick={()=>importRef.current?.click()} full style={{marginBottom:8}}>
-          📥 Backup importieren
+          Backup importieren
         </Btn>
         <input
           ref={importRef}
@@ -5022,12 +5501,27 @@ const SettingsScreen = ({
               </div>
 
               {ps.deloadEnabled&&<>
+                {/* Scheduled deload toggle */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:13,color:T.sub}}>Fester Rhythmus</div>
+                    <div style={{fontSize:10,color:T.muted,marginTop:1}}>alle X Wochen, unabhängig von Stagnation</div>
+                  </div>
+                  <button onClick={()=>upd_({scheduledDeloadEnabled:!(ps.scheduledDeloadEnabled??false)})} style={{
+                    background:(ps.scheduledDeloadEnabled??false)?T.orange:T.bgInput,
+                    color:(ps.scheduledDeloadEnabled??false)?"#07070F":T.muted,
+                    border:`1px solid ${(ps.scheduledDeloadEnabled??false)?T.orange:T.border}`,
+                    borderRadius:20,padding:"5px 14px",fontSize:12,fontWeight:700,cursor:"pointer",flexShrink:0,
+                  }}>{(ps.scheduledDeloadEnabled??false)?"AN":"AUS"}</button>
+                </div>
+
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
                   <div>
-                    <div style={{fontSize:10,color:T.muted,marginBottom:3}}>ALLE (WOCHEN)</div>
+                    <div style={{fontSize:10,color:(ps.scheduledDeloadEnabled??false)?T.muted:T.border,marginBottom:3}}>ALLE (WOCHEN)</div>
                     <input type="number" value={ps.deloadEveryWeeks??6} min="2" max="16"
+                      disabled={!(ps.scheduledDeloadEnabled??false)}
                       onChange={e=>{const n=parseInt(e.target.value);if(n>=2&&n<=16)upd_({deloadEveryWeeks:n});}}
-                      style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
+                      style={{background:T.bgInput,border:`1px solid ${(ps.scheduledDeloadEnabled??false)?T.border:T.border+"44"}`,borderRadius:8,padding:"6px 8px",color:(ps.scheduledDeloadEnabled??false)?T.text:T.muted,fontSize:13,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
                   </div>
                   <div>
                     <div style={{fontSize:10,color:T.muted,marginBottom:3}}>GEWICHT -(%)</div>
@@ -5035,6 +5529,20 @@ const SettingsScreen = ({
                       onChange={e=>{const n=parseInt(e.target.value);if(n>=5&&n<=40)upd_({deloadPercent:n});}}
                       style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,padding:"6px 8px",color:T.text,fontSize:13,fontWeight:700,width:"100%",textAlign:"center",boxSizing:"border-box"}}/>
                   </div>
+                </div>
+
+                {/* Stagnation-Deload info */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:13,color:T.sub}}>Stagnations-Deload</div>
+                    <div style={{fontSize:10,color:T.muted,marginTop:1}}>bei ≥2 stagnierenden Hauptübungen</div>
+                  </div>
+                  <button onClick={()=>upd_({autoDeloadOnStagnation:!ps.autoDeloadOnStagnation})} style={{
+                    background:ps.autoDeloadOnStagnation?T.orange:T.bgInput,
+                    color:ps.autoDeloadOnStagnation?"#07070F":T.muted,
+                    border:`1px solid ${ps.autoDeloadOnStagnation?T.orange:T.border}`,
+                    borderRadius:20,padding:"5px 14px",fontSize:12,fontWeight:700,cursor:"pointer",flexShrink:0,
+                  }}>{ps.autoDeloadOnStagnation?"AN":"AUS"}</button>
                 </div>
 
                 {/* Deload Strategie */}
@@ -5110,7 +5618,7 @@ const SettingsScreen = ({
       <Card style={{marginBottom:12}}>
         <Lbl color={T.blue}>STANDARD-PAUSEN (Sekunden)</Lbl>
         <div style={{fontSize:11,color:T.muted,marginBottom:10,lineHeight:1.5}}>
-          Werden beim Hinzufügen von Übungen und bei „⏱ Pausen" im Plan-Editor verwendet.
+          Werden beim Hinzufügen von Übungen und bei „Pausen" im Plan-Editor verwendet.
         </div>
         {[
           {key:"warmup",    label:"Aufwärmen"},
@@ -5142,7 +5650,7 @@ const SettingsScreen = ({
       <Card style={{marginBottom:12}}>
         <Lbl>ZURÜCKSETZEN</Lbl>
         {!confirmReset
-          ? <Btn v="danger" onClick={()=>setConfirmReset(true)} full>⚠️ Alle Daten löschen</Btn>
+          ? <Btn v="danger" onClick={()=>setConfirmReset(true)} full>Alle Daten löschen</Btn>
           : <div>
               <div style={{fontSize:13,color:T.red,marginBottom:10,lineHeight:1.5}}>
                 Wirklich alle Daten unwiderruflich löschen?<br/>
@@ -5255,17 +5763,17 @@ function App() {
 
   const TABS = [
     {id:"dashboard", icon:"⌂",  label:"Home"},
-    {id:"plans",     icon:"📋", label:"Pläne"},
-    {id:"workout",   icon:"🏋", label:"Kraft"},
-    {id:"cardio",    icon:"🏃", label:"Cardio"},
-    {id:"progress",  icon:"📈", label:"Verlauf"},
+    {id:"plans",     icon:"≡",  label:"Pläne"},
+    {id:"workout",   icon:"↑",  label:"Kraft"},
+    {id:"cardio",    icon:"↺",  label:"Cardio"},
+    {id:"progress",  icon:"~",  label:"Verlauf"},
     {id:"more",      icon:"⋯",  label:"Mehr"},
   ];
   const MORE = [
-    {id:"body",         icon:"⚖",  label:"Körper"},
-    {id:"achievements", icon:"🏆", label:"Badges"},
-    {id:"exercises",    icon:"📚", label:"Übungen"},
-    {id:"settings",     icon:"⚙",  label:"Einst."},
+    {id:"body",         icon:"◎", label:"Körper"},
+    {id:"achievements", icon:"★", label:"Badges"},
+    {id:"exercises",    icon:"≡", label:"Übungen"},
+    {id:"settings",     icon:"≡", label:"Einst."},
   ];
 
   const goTab = id => {
@@ -5334,23 +5842,45 @@ function App() {
         </div>
         <div style={{position:"fixed",inset:0,zIndex:98}} onClick={()=>setShowMore(false)}/>
       </>}
-      <div style={{position:"fixed",bottom:0,width:"100%",maxWidth:390,background:T.bgCard,borderTop:`1px solid ${T.border}`,display:"flex",padding:"7px 0 14px",zIndex:100}}>
-        {TABS.map(t=>(
-          <button key={t.id} onClick={()=>{if(t.id==="more"){setShowMore(s=>!s);}else{goTab(t.id);}}} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"4px 0"}}>
-            <span style={{fontSize:18}}>{t.icon}</span>
-            <span style={{fontSize:9,fontWeight:700,letterSpacing:0.3,color:(tab===t.id||(t.id==="more"&&isMoreTab))?T.accent:T.muted}}>{t.label}</span>
-            {(tab===t.id||(t.id==="more"&&isMoreTab))&&<div style={{width:3,height:3,borderRadius:"50%",background:T.accent}}/>}
-            {globalRest && t.id==="workout" && tab!=="workout" && (
-              <div style={{
-                position:"absolute",top:4,right:"50%",transform:"translateX(14px)",
-                width:7,height:7,borderRadius:"50%",
-                background:T.orange,
-                boxShadow:`0 0 6px ${T.orange}`,
-                animation:"pulse 1s infinite",
-              }}/>
-            )}
-          </button>
-        ))}
+      <div style={{position:"fixed",bottom:0,width:"100%",maxWidth:390,background:T.bgCard,borderTop:`1px solid ${T.border}44`,display:"flex",alignItems:"stretch",padding:"6px 0 env(safe-area-inset-bottom,10px)",zIndex:100}}>
+        {TABS.map(t=>{
+          const isActive = tab===t.id||(t.id==="more"&&isMoreTab);
+          return (
+            <button key={t.id} onClick={()=>{if(t.id==="more"){setShowMore(s=>!s);}else{goTab(t.id);}}}
+              style={{
+                flex:1, background:"none", border:"none", cursor:"pointer",
+                display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+                gap:3, padding:"6px 2px 4px",
+                position:"relative",
+              }}>
+              <span style={{
+                fontSize: isActive ? 20 : 18,
+                lineHeight:1,
+                color: isActive ? T.accent : "#AAAACC",
+                transition:"font-size 0.15s",
+              }}>{t.icon}</span>
+              <span style={{
+                fontSize:9,
+                fontWeight: isActive ? 800 : 500,
+                letterSpacing: 0.2,
+                color: isActive ? T.accent : "#AAAACC",
+                lineHeight:1,
+              }}>{t.label}</span>
+              {isActive && (
+                <div style={{width:4,height:4,borderRadius:"50%",background:T.accent,marginTop:1}}/>
+              )}
+              {!isActive && <div style={{width:4,height:4,marginTop:1}}/>}
+              {globalRest && t.id==="workout" && !isActive && (
+                <div style={{
+                  position:"absolute",top:4,right:"calc(50% - 14px)",
+                  width:7,height:7,borderRadius:"50%",
+                  background:T.orange, boxShadow:`0 0 6px ${T.orange}`,
+                  animation:"pulse 1s infinite",
+                }}/>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
