@@ -1646,11 +1646,14 @@ const RestTimer = ({seconds, onDone, onSkip, tickStart=10}) => {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const adjust = delta => {
-    setLeft(l => {
-      const next = Math.max(0, l + delta);
-      ticked.current = new Set([...ticked.current].filter(v => v > next));
-      return next;
-    });
+    // Timer is timestamp-based, so shift the absolute end time, not just the display
+    endAt.current = endAt.current + delta * 1000;
+    const next = Math.max(0, Math.round((endAt.current - Date.now()) / 1000));
+    // Don't let it go negative – clamp end time to now if needed
+    if (next <= 0) endAt.current = Date.now();
+    ticked.current = new Set([...ticked.current].filter(v => v > next));
+    doneFired.current = false; // allow re-fire if extended past 0
+    setLeft(Math.max(0, next));
   };
 
   const pct  = (left / seconds) * 100;
@@ -3510,7 +3513,7 @@ const WorkoutExerciseCard = ({
                       <span style={{fontSize:11,color:T.sub,fontWeight:700}}>Wdh</span>
                     </div>
                   </>)}
-                  <button onClick={()=>toggle(wikey,si,0)}
+                  <button onClick={()=>toggle(wikey,si,(settings?.restRules?.warmup ?? wex.rest ?? 30))}
                     style={{width:36,height:32,borderRadius:9,border:"none",cursor:"pointer",
                       background:s.done?T.orange+"44":T.bgAlt,
                       color:s.done?T.orange:T.sub, fontSize:14,fontWeight:700}}>
