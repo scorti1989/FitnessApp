@@ -2071,6 +2071,53 @@ const OnboardingScreen = ({onDone, onImport}) => {
   const [importMsg,   setImportMsg]   = useState("");
   const importRef = useRef(null);
 
+  // ── Cloud-Sync state (Onboarding) ─────────────────────
+  const [showCloud,  setShowCloud]  = useState(false);
+  const [obSyncUrl,  setObSyncUrl]  = useState(() => ftSync.getCfg()?.url   || "https://app-sync.scorti1989.workers.dev");
+  const [obSyncTok,  setObSyncTok]  = useState(() => ftSync.getCfg()?.token || "");
+  const [cloudState, setCloudState] = useState(null);  // null | "loading" | "ok" | "error"
+  const [cloudMsg,   setCloudMsg]   = useState("");
+
+  const handleCloudLoad = async () => {
+    ftSync.setCfg({ url: obSyncUrl.trim(), token: obSyncTok.trim() });
+    setCloudState("loading");
+    setCloudMsg("");
+    try {
+      const server = await ftSync.pull();
+      if (server && server.empty) {
+        setCloudState("error");
+        setCloudMsg("Noch keine Daten in der Cloud gespeichert.");
+        return;
+      }
+      if (!server || !Array.isArray(server.sessions)) {
+        setCloudState("error");
+        setCloudMsg("Keine gültigen FitTrack-Daten in der Cloud gefunden.");
+        return;
+      }
+      // Same path as backup import: sanitize + mark onboarded
+      const imported = {
+        settings:          mergeWithDefaults({...(server.settings||{}), onboarded: true}),
+        sessions:          server.sessions          || [],
+        cardio:            server.cardio            || [],
+        plans:             server.plans             || [],
+        metrics:           server.metrics           || [],
+        customExercises:   server.customExercises   || [],
+        exerciseOverrides: server.exerciseOverrides || {},
+      };
+      // Update sync meta so the next reconcile doesn't re-download
+      const m = ftSync.getMeta();
+      m.lastSync     = new Date().toISOString();
+      m.lastServerAt = server._savedAt || m.lastSync;
+      try { localStorage.setItem("fit_sync_meta", JSON.stringify(m)); } catch(_){}
+      onImport(imported);
+      setCloudState("ok");
+      setCloudMsg(`${imported.sessions.length} Trainings, ${imported.plans.length} Pläne aus der Cloud geladen.`);
+    } catch (e) {
+      setCloudState("error");
+      setCloudMsg(e?.message || "Cloud-Abruf fehlgeschlagen");
+    }
+  };
+
   const handleImportFile = e => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2180,6 +2227,65 @@ const OnboardingScreen = ({onDone, onImport}) => {
                   background:T.red+"18",color:T.red,border:`1px solid ${T.red}44`,
                 }}>
                   ✗ {importMsg}
+                </div>
+              )}
+            </div>
+
+            {/* ── Cloud-Sync laden ── */}
+            <div style={{
+              border:`1px solid ${T.border}`, borderRadius:14,
+              padding:"16px 16px 14px", marginTop:12,
+              background:T.bgAlt,
+            }}>
+              <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>
+                Aus der Cloud laden
+              </div>
+              <div style={{fontSize:12,color:T.sub,marginBottom:12,lineHeight:1.6}}>
+                Du nutzt Cloud-Sync? Server und Passwort eintragen – deine Daten werden direkt geladen.
+              </div>
+
+              {!showCloud ? (
+                <Btn v="secondary" onClick={()=>setShowCloud(true)} full
+                  style={{fontSize:13,padding:"10px 0"}}>
+                  Cloud-Zugang eingeben
+                </Btn>
+              ) : (<>
+                <div style={{fontSize:10,color:T.muted,marginBottom:3}}>SERVER-ADRESSE</div>
+                <input
+                  type="url" value={obSyncUrl} onChange={e=>setObSyncUrl(e.target.value)}
+                  placeholder="https://app-sync....workers.dev" autoComplete="off"
+                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+                    padding:"8px 10px",color:T.text,fontSize:12,width:"100%",boxSizing:"border-box",
+                    outline:"none",marginBottom:8}}/>
+                <div style={{fontSize:10,color:T.muted,marginBottom:3}}>SYNC-PASSWORT</div>
+                <input
+                  type="password" value={obSyncTok} onChange={e=>setObSyncTok(e.target.value)}
+                  placeholder="Passwort aus dem Worker" autoComplete="new-password"
+                  style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+                    padding:"8px 10px",color:T.text,fontSize:12,width:"100%",boxSizing:"border-box",
+                    outline:"none",marginBottom:10}}/>
+                <Btn onClick={handleCloudLoad} disabled={cloudState==="loading"} full
+                  style={{fontSize:13,padding:"10px 0"}}>
+                  {cloudState==="loading" ? "Lade aus Cloud…" : "Jetzt aus Cloud laden"}
+                </Btn>
+              </>)}
+
+              {cloudState === "ok" && (
+                <div style={{
+                  marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
+                  background:T.green+"18",color:T.green,border:`1px solid ${T.green}44`,
+                  lineHeight:1.5,
+                }}>
+                  ✓ Cloud-Daten geladen!<br/>
+                  <span style={{color:T.sub}}>{cloudMsg}</span>
+                </div>
+              )}
+              {cloudState === "error" && (
+                <div style={{
+                  marginTop:10,padding:"10px 12px",borderRadius:10,fontSize:12,
+                  background:T.red+"18",color:T.red,border:`1px solid ${T.red}44`,
+                }}>
+                  ✗ {cloudMsg}
                 </div>
               )}
             </div>
