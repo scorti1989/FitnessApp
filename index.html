@@ -1391,6 +1391,238 @@ function usePersistedState(key, seed) {
 }
 
 // ═══════════════════════════════════════════════════════
+// CLOUD SYNC (Cloudflare Worker)
+// ═══════════════════════════════════════════════════════
+const SYNC_CFG_KEY   = "fit_sync";          // config: {url, token}
+const SYNC_META_KEY   = "fit_sync_meta";    // {lastSync, lastServerAt}
+const SYNC_DIRTY_KEY  = "fit_sync_dirty";   // "1" when local changes pending
+const SYNC_APP_NAME   = "fitness";
+// Keys the sync itself owns – must NEVER trigger dirty-marking (endless loop)
+const SYNC_OWN_KEYS   = [SYNC_CFG_KEY, SYNC_META_KEY, SYNC_DIRTY_KEY];
+// App data keys that belong in a sync payload
+const SYNC_DATA_KEYS  = ["settings","sessions","cardio","plans","metrics",
+                          "customExercises","exerciseOverrides","seenBadgeIds"];
+
+const ftSync = (() => {
+  let running = false;
+  let pushTimer = null;
+  let listeners = [];   // status change callbacks
+
+  const notify = (msg, isError) => {
+    listeners.forEach(fn => { try { fn(msg, isError); } catch(_){} });
+  };
+
+  const getCfg = () => {
+    try { return JSON.parse(localStorage.getItem(SYNC_CFG_KEY) || "null"); }
+    catch { return null; }
+  };
+  const setCfg = cfg => {
+    try { localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(cfg)); } catch(_){}
+  };
+  const getMeta = () => {
+    try { return JSON.parse(localStorage.getItem(SYNC_META_KEY) || "{}"); }
+    catch { return {}; }
+  };
+  const setMeta = m => {
+    try { localStorage.setItem(SYNC_META_KEY, JSON.stringify(m)); } catch(_){}
+  };
+  const isDirty  = () => { try { return localStorage.getItem(SYNC_DIRTY_KEY) === "1"; } catch { return false; } };
+  const setDirty = v  => { try { v ? localStorage.setItem(SYNC_DIRTY_KEY,"1")
+                                    : localStorage.removeItem(SYNC_DIRTY_KEY); } catch(_){} };
+
+  const isConfigured = () => {
+    const c = getCfg();
+    return !!(c && c.url && c.token);
+  };
+
+  // Collect all app data (same shape as the JSON backup export)
+  const collect = () => {
+    const out = { _fittrack_version: 9, exportedAt: new Date().toISOString() };
+    SYNC_DATA_KEYS.forEach(k => {
+      try {
+        const raw = localStorage.getItem(LS_PREFIX + k);
+        if (raw !== null) out[k] = JSON.parse(raw);
+      } catch(_){}
+    });
+    return out;
+  };
+
+  // Apply a server payload into localStorage, then reload UI
+  const apply = data => {
+    if (!data || typeof data !== "object") return false;
+    let wrote = 0;
+    SYNC_DATA_KEYS.forEach(k => {
+      if (data[k] === undefined) return;
+      try {
+        localStorage.setItem(LS_PREFIX + k, JSON.stringify(data[k]));
+        wrote++;
+      } catch(e) { console.warn("Sync apply failed for", k, e?.name); }
+    });
+    setDirty(false);
+    return wrote > 0;
+  };
+
+  const pull = async (snap) => {
+    const cfg = getCfg();
+    if (!cfg) throw new Error("Sync nicht konfiguriert");
+    const base = cfg.url.replace(/\/+$/,"");
+    const url  = `${base}/load?app=${SYNC_APP_NAME}` + (snap ? `&snap=${encodeURIComponent(snap)}` : "");
+    const res  = await fetch(url, { headers: { "X-Sync-Token": cfg.token } });
+    if (res.status === 401) throw new Error("Falsches Sync-Passwort");
+    if (!res.ok)            throw new Error(`Server-Fehler ${res.status}`);
+    return await res.json();
+  };
+
+  const push = async () => {
+    const cfg = getCfg();
+    if (!cfg) throw new Error("Sync nicht konfiguriert");
+    const base = cfg.url.replace(/\/+$/,"");
+    const res  = await fetch(`${base}/save?app=${SYNC_APP_NAME}`, {
+      method: "POST",
+      headers: { "X-Sync-Token": cfg.token, "Content-Type": "application/json" },
+      body: JSON.stringify(collect()),
+    });
+    if (res.status === 401) throw new Error("Falsches Sync-Passwort");
+    if (!res.ok)            throw new Error(`Server-Fehler ${res.status}`);
+    const j = await res.json();
+    const meta = getMeta();
+    meta.lastSync     = new Date().toISOString();
+    meta.lastServerAt = j.savedAt || meta.lastSync;
+    setMeta(meta);
+    setDirty(false);
+    return j;
+  };
+
+  const listSnapshots = async () => {
+    const cfg = getCfg();
+    if (!cfg) return [];
+    const base = cfg.url.replace(/\/+$/,"");
+    const res  = await fetch(`${base}/snapshots?app=${SYNC_APP_NAME}`, {
+      headers: { "X-Sync-Token": cfg.token },
+    });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return Array.isArray(j) ? j : (j.snapshots || []);
+  };
+
+  // Main reconcile routine
+  const run = async ({ silent = false, onApplied } = {}) => {
+    if (running || !isConfigured()) return { skipped: true };
+    running = true;
+    try {
+      if (!silent) notify("Abgleich läuft…", false);
+      const server = await pull();
+      const meta   = getMeta();
+      const dirty  = isDirty();
+
+      // 1. Server empty → upload if we have anything locally
+      if (server && server.empty) {
+        const local = collect();
+        const hasLocal = SYNC_DATA_KEYS.some(k => local[k] !== undefined);
+        if (hasLocal) {
+          await push();
+          notify("Erster Upload abgeschlossen", false);
+        } else {
+          notify("Nichts zu synchronisieren", false);
+        }
+        return { uploaded: true };
+      }
+
+      const serverAt   = server?._savedAt || null;
+      const serverIsNew = serverAt && (!meta.lastServerAt || new Date(serverAt) > new Date(meta.lastServerAt));
+
+      // 2. Conflict: both sides changed → ask the user
+      if (serverIsNew && dirty) {
+        const useServer = window.confirm(
+          "Konflikt beim Abgleich\n\n" +
+          "Auf dem Server liegen neuere Daten, gleichzeitig hast du lokale Änderungen.\n\n" +
+          "OK  = Server-Stand übernehmen (lokale Änderungen gehen verloren)\n" +
+          "Abbrechen = Eigene Daten hochladen (Server wird überschrieben)"
+        );
+        if (useServer) {
+          apply(server);
+          const m = getMeta(); m.lastSync = new Date().toISOString(); m.lastServerAt = serverAt; setMeta(m);
+          notify("Server-Stand übernommen", false);
+          if (onApplied) onApplied(server);
+          return { downloaded: true };
+        } else {
+          await push();
+          notify("Eigene Daten hochgeladen", false);
+          return { uploaded: true };
+        }
+      }
+
+      // 3. Server newer → download
+      if (serverIsNew) {
+        apply(server);
+        const m = getMeta(); m.lastSync = new Date().toISOString(); m.lastServerAt = serverAt; setMeta(m);
+        notify("Daten vom Server geladen", false);
+        if (onApplied) onApplied(server);
+        return { downloaded: true };
+      }
+
+      // 4. Local changes → upload
+      if (dirty) {
+        await push();
+        notify("Änderungen hochgeladen", false);
+        return { uploaded: true };
+      }
+
+      // 5. Nothing to do
+      const m = getMeta(); m.lastSync = new Date().toISOString(); setMeta(m);
+      if (!silent) notify("Alles aktuell", false);
+      return { upToDate: true };
+
+    } catch (e) {
+      notify(e?.message || "Sync fehlgeschlagen", true);
+      return { error: e?.message };
+    } finally {
+      running = false;
+    }
+  };
+
+  // Debounced background upload after local changes
+  const schedulePush = () => {
+    if (!isConfigured()) return;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => {
+      push().catch(e => notify(e?.message || "Upload fehlgeschlagen", true));
+    }, 4000);
+  };
+
+  // Patch localStorage.setItem to detect app-data changes
+  const installWatcher = () => {
+    try {
+      if (localStorage.__ftSyncPatched) return;
+      const orig = localStorage.setItem.bind(localStorage);
+      localStorage.setItem = function (key, value) {
+        orig(key, value);
+        try {
+          // ignore our own keys → prevents endless loop
+          if (SYNC_OWN_KEYS.includes(key)) return;
+          if (typeof key === "string" && key.startsWith(LS_PREFIX)) {
+            const bare = key.slice(LS_PREFIX.length);
+            if (SYNC_DATA_KEYS.includes(bare)) {
+              setDirty(true);
+              schedulePush();
+            }
+          }
+        } catch(_){}
+      };
+      localStorage.__ftSyncPatched = true;
+    } catch(e) { console.warn("Sync watcher install failed", e); }
+  };
+
+  return {
+    getCfg, setCfg, getMeta, isConfigured, isDirty,
+    collect, apply, push, pull, run, listSnapshots,
+    installWatcher, schedulePush,
+    onStatus: fn => { listeners.push(fn); return () => { listeners = listeners.filter(f=>f!==fn); }; },
+  };
+})();
+
+
+// ═══════════════════════════════════════════════════════
 // UI ATOMS
 // ═══════════════════════════════════════════════════════
 const Card = ({children, style={}, onClick, glow, accent:ac}) => (
@@ -5222,6 +5454,43 @@ const SettingsScreen = ({
   const [importStatus,setImportStatus] = useState(null); // null | "ok" | "error" | string
   const importRef = useRef(null);
 
+  // ── Cloud-Sync state ──────────────────────────────────
+  const [syncUrl,   setSyncUrl]   = useState(() => ftSync.getCfg()?.url   || "https://app-sync.scorti1989.workers.dev");
+  const [syncToken, setSyncToken] = useState(() => ftSync.getCfg()?.token || "");
+  const [syncMsg,   setSyncMsg]   = useState(null);   // {text, error}
+  const [syncBusy,  setSyncBusy]  = useState(false);
+  const [syncMeta,  setSyncMeta]  = useState(() => ftSync.getMeta());
+
+  useEffect(() => {
+    const off = ftSync.onStatus((text, error) => {
+      setSyncMsg({ text, error: !!error });
+      setSyncMeta(ftSync.getMeta());
+    });
+    return off;
+  }, []);
+
+  const saveSyncCfg = () => {
+    ftSync.setCfg({ url: syncUrl.trim(), token: syncToken.trim() });
+    setSyncMsg({ text: "Konfiguration gespeichert", error: false });
+  };
+
+  const runSyncNow = async () => {
+    ftSync.setCfg({ url: syncUrl.trim(), token: syncToken.trim() });
+    setSyncBusy(true);
+    setSyncMsg({ text: "Abgleich läuft…", error: false });
+    try {
+      const r = await ftSync.run({
+        onApplied: () => { setTimeout(() => window.location.reload(), 600); },
+      });
+      setSyncMeta(ftSync.getMeta());
+      if (r?.error) setSyncMsg({ text: r.error, error: true });
+    } catch (e) {
+      setSyncMsg({ text: e?.message || "Sync fehlgeschlagen", error: true });
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
   const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
   const streak   = useMemo(()=>calcStreak(sessions,cardio),[sessions,cardio]);
 
@@ -5375,6 +5644,62 @@ const SettingsScreen = ({
             <span style={{color:T.teal,fontWeight:700}}>{lsUsageKB} KB</span>
             <span style={{color:T.muted}}> localStorage</span>
           </div>
+        </div>
+
+        {/* ── Cloud-Sync ─────────────────────────────── */}
+        <div style={{height:1,background:T.border,margin:"14px 0"}}/>
+        <Lbl color={T.blue}>CLOUD-SYNC</Lbl>
+        <div style={{fontSize:11,color:T.muted,marginBottom:10,lineHeight:1.5}}>
+          Gleicht deine Daten mit deinem eigenen Server ab. Ohne Eintrag bleibt die App rein lokal.
+        </div>
+
+        <div style={{marginBottom:8}}>
+          <div style={{fontSize:10,color:T.muted,marginBottom:3}}>SERVER-ADRESSE</div>
+          <input
+            type="url"
+            value={syncUrl}
+            onChange={e=>setSyncUrl(e.target.value)}
+            placeholder="https://app-sync....workers.dev"
+            autoComplete="off"
+            style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+              padding:"8px 10px",color:T.text,fontSize:12,width:"100%",boxSizing:"border-box",outline:"none"}}/>
+        </div>
+
+        <div style={{marginBottom:8}}>
+          <div style={{fontSize:10,color:T.muted,marginBottom:3}}>SYNC-PASSWORT</div>
+          <input
+            type="password"
+            value={syncToken}
+            onChange={e=>setSyncToken(e.target.value)}
+            placeholder="Passwort aus dem Worker"
+            autoComplete="new-password"
+            style={{background:T.bgInput,border:`1px solid ${T.border}`,borderRadius:8,
+              padding:"8px 10px",color:T.text,fontSize:12,width:"100%",boxSizing:"border-box",outline:"none"}}/>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginBottom:8}}>
+          <Btn v="ghost" onClick={saveSyncCfg} style={{flex:1,fontSize:12,padding:"9px 0"}}>
+            Speichern
+          </Btn>
+          <Btn onClick={runSyncNow} disabled={syncBusy} style={{flex:1,fontSize:12,padding:"9px 0"}}>
+            {syncBusy ? "Läuft…" : "Jetzt abgleichen"}
+          </Btn>
+        </div>
+
+        {/* Status line */}
+        <div style={{
+          padding:"8px 10px", borderRadius:8, fontSize:11, lineHeight:1.5,
+          background: syncMsg?.error ? T.red+"14" : T.bgAlt,
+          border:`1px solid ${syncMsg?.error ? T.red+"44" : T.border}`,
+          color: syncMsg?.error ? T.red : T.sub,
+        }}>
+          {syncMsg?.text ||
+            (syncMeta?.lastSync
+              ? `Zuletzt abgeglichen: ${new Date(syncMeta.lastSync).toLocaleString("de-DE",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}`
+              : "Noch kein Abgleich durchgeführt")}
+          {ftSync.isDirty() && (
+            <div style={{color:T.orange,marginTop:3}}>Lokale Änderungen noch nicht hochgeladen</div>
+          )}
         </div>
 
         {/* Export */}
@@ -5712,6 +6037,42 @@ function App() {
       setSettings(prev => ({...prev, activeDeloadUntil: null}));
     }
   }, [settings.activeDeloadUntil]); // re-check whenever the value changes
+
+  // ── Cloud-Sync lifecycle ──────────────────────────────
+  useEffect(() => {
+    try {
+      ftSync.installWatcher();
+      if (!ftSync.isConfigured()) return;
+
+      // Initial reconcile ~1s after start
+      const t = setTimeout(() => {
+        ftSync.run({ silent: true, onApplied: () => {
+          setTimeout(() => window.location.reload(), 400);
+        }}).catch(()=>{});
+      }, 1000);
+
+      // On leaving the app: quick upload. On return: reconcile.
+      const onVis = () => {
+        try {
+          if (document.visibilityState === "hidden") {
+            if (ftSync.isDirty()) ftSync.push().catch(()=>{});
+          } else {
+            ftSync.run({ silent: true, onApplied: () => {
+              setTimeout(() => window.location.reload(), 400);
+            }}).catch(()=>{});
+          }
+        } catch(_){}
+      };
+      document.addEventListener("visibilitychange", onVis);
+
+      return () => {
+        clearTimeout(t);
+        document.removeEventListener("visibilitychange", onVis);
+      };
+    } catch (e) {
+      console.warn("Sync init failed (app continues normally):", e);
+    }
+  }, []);
 
   const streak       = useMemo(()=>calcStreak(sessions,cardio),                     [sessions,cardio]);
   const achievements = useMemo(()=>calcAchievements(sessions,metrics,streak,cardio,allExercises),[sessions,metrics,streak,cardio,allExercises]);
