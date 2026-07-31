@@ -4245,6 +4245,10 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
   const addSet = (ikey,tmpl)    => setSets(p=>({...p,[ikey]:[...(p[ikey]||[]),{setN:(p[ikey]||[]).length+1,reps:tmpl.reps,weight:tmpl.weight,done:false}]}));
 
   const discardDraft = () => {
+    if (!window.confirm(
+      "Unterbrochenes Training verwerfen?\n\n" +
+      "Alle bisher eingetragenen Sätze dieses Trainings gehen dabei verloren."
+    )) return;
     clearWorkoutDraft(); t0Ref.current = null;
     setPlanId(preselectedPlanId||null);
     setDayId(null); setSets({}); setNote(""); setElapsed(0);
@@ -5597,6 +5601,155 @@ const SettingsScreen = ({
     }
   };
 
+  // ── Snapshot-Browser: alte Tagesstände einsehen & wiederherstellen ──────
+  const [snapList,    setSnapList]    = useState(null);   // null = nicht geladen, [] = geladen leer, [...] = Daten
+  const [snapBusy,    setSnapBusy]    = useState(false);
+  const [snapDetails, setSnapDetails] = useState({});     // { "2026-07-29": {sessions:12, latestDate:"..."} }
+  const [snapMsg,     setSnapMsg]     = useState(null);
+
+  const loadSnapshotList = async () => {
+    ftSync.setCfg({ url: syncUrl.trim(), token: syncToken.trim() });
+    setSnapBusy(true);
+    setSnapMsg(null);
+    try {
+      const days = await ftSync.listSnapshots();
+      const sorted = [...days].sort((a,b)=> b.localeCompare(a)); // neueste zuerst
+      setSnapList(sorted);
+      // Aktuellen Stand (heute, ohne &snap=) auch mit auflisten
+      const currentCount = (sessions||[]).length;
+      setSnapDetails(prev => ({ ...prev, __current: { sessions: currentCount } }));
+    } catch (e) {
+      setSnapMsg({ text: e?.message || "Snapshot-Liste konnte nicht geladen werden", error: true });
+    } finally {
+      setSnapBusy(false);
+    }
+  };
+
+  const inspectSnapshot = async day => {
+    if (snapDetails[day]) return; // schon geladen
+    try {
+      const data = await ftSync.pull(day);
+      if (data?.empty) {
+        setSnapDetails(prev => ({ ...prev, [day]: { sessions: 0, empty: true } }));
+        return;
+      }
+      const sess = data?.sessions || [];
+      const dates = sess.map(s=>s.date).sort();
+      setSnapDetails(prev => ({
+        ...prev,
+        [day]: {
+          sessions: sess.length,
+          firstDate: dates[0] || null,
+          lastDate:  dates[dates.length-1] || null,
+        },
+      }));
+    } catch (e) {
+      setSnapDetails(prev => ({ ...prev, [day]: { error: e?.message || "Fehler" } }));
+    }
+  };
+
+  // Merge-Helfer: Sessions/Cardio anhand von id (Fallback: date+planId+Satzanzahl) dedupliziert zusammenführen
+  const mergeById = (existing, incoming, idKey="id") => {
+    const map = new Map();
+    (existing||[]).forEach(item => {
+      const key = item[idKey] || `${item.date}__${item.planId||""}__${(item.sets||[]).length}`;
+      map.set(key, item);
+    });
+    (incoming||[]).forEach(item => {
+      const key = item[idKey] || `${item.date}__${item.planId||""}__${(item.sets||[]).length}`;
+      // Bei Konflikt: den mit mehr abgehakten Sätzen behalten (vollständigeres Training gewinnt)
+      const prev = map.get(key);
+      if (!prev) { map.set(key, item); return; }
+      const prevDone = (prev.sets||[]).filter(s=>s.done).length;
+      const newDone  = (item.sets||[]).filter(s=>s.done).length;
+      if (newDone > prevDone) map.set(key, item);
+    });
+    return [...map.values()].sort((a,b)=>new Date(b.date)-new Date(a.date));
+  };
+
+  const restoreSnapshot = async day => {
+    if (!window.confirm(
+      `Snapshot vom ${day} in den aktuellen Stand einfügen?\n\n` +
+      "Trainings aus diesem Snapshot werden zu deinen bestehenden Trainings HINZUGEFÜGT.\n" +
+      "Bereits vorhandene Trainings (gleiches Datum) bleiben unverändert oder werden " +
+      "durch die vollständigere Version ersetzt. Nichts wird gelöscht."
+    )) return;
+    setSnapBusy(true);
+    try {
+      const data = await ftSync.pull(day);
+      if (!data || data.empty) {
+        setSnapMsg({ text: "Dieser Snapshot ist leer.", error: true });
+        return;
+      }
+      const mergedSessions = mergeById(sessions, data.sessions||[]);
+      const mergedCardio   = mergeById(cardio,   data.cardio||[]);
+      const added = mergedSessions.length - (sessions||[]).length;
+      const imported = {
+        settings:          settings,
+        sessions:          mergedSessions,
+        cardio:            mergedCardio,
+        plans:              plans,
+        metrics:           metrics,
+        customExercises:   customExercises,
+        exerciseOverrides: exerciseOverrides,
+      };
+      onImport(imported);
+      setSnapMsg({
+        text: added > 0
+          ? `${added} Training${added===1?"":"s"} aus dem ${day}-Snapshot hinzugefügt. Insgesamt jetzt ${mergedSessions.length} Trainings.`
+          : `Keine neuen Trainings in diesem Snapshot – alles bereits vorhanden.`,
+        error: false,
+      });
+    } catch (e) {
+      setSnapMsg({ text: e?.message || "Zusammenführen fehlgeschlagen", error: true });
+    } finally {
+      setSnapBusy(false);
+    }
+  };
+
+  // Alle 60 Tages-Snapshots durchgehen und alles zusammenführen (Vollständig-Wiederherstellung)
+  const mergeAllSnapshots = async () => {
+    if (!snapList || !snapList.length) return;
+    if (!window.confirm(
+      `Alle ${snapList.length} gespeicherten Tagesstände durchsuchen und fehlende Trainings ergänzen?\n\n` +
+      "Das kann einige Sekunden dauern. Nichts wird gelöscht, nur ergänzt."
+    )) return;
+    setSnapBusy(true);
+    setSnapMsg({ text: "Durchsuche alle Snapshots…", error: false });
+    try {
+      let runningSessions = sessions || [];
+      let runningCardio   = cardio   || [];
+      let scanned = 0;
+      for (const day of snapList) {
+        try {
+          const data = await ftSync.pull(day);
+          if (data && !data.empty) {
+            runningSessions = mergeById(runningSessions, data.sessions||[]);
+            runningCardio   = mergeById(runningCardio,   data.cardio||[]);
+          }
+        } catch(_) { /* einzelner Snapshot-Fehler stoppt den Gesamtlauf nicht */ }
+        scanned++;
+        setSnapMsg({ text: `Durchsuche Snapshots… (${scanned}/${snapList.length})`, error: false });
+      }
+      const added = runningSessions.length - (sessions||[]).length;
+      onImport({
+        settings, plans, metrics, customExercises, exerciseOverrides,
+        sessions: runningSessions,
+        cardio:   runningCardio,
+      });
+      setSnapMsg({
+        text: added > 0
+          ? `Fertig: ${added} fehlende Training${added===1?"":"s"} aus ${snapList.length} Snapshots ergänzt. Insgesamt jetzt ${runningSessions.length} Trainings.`
+          : `Fertig: alle ${snapList.length} Snapshots durchsucht, keine fehlenden Trainings gefunden.`,
+        error: false,
+      });
+    } catch (e) {
+      setSnapMsg({ text: e?.message || "Zusammenführen fehlgeschlagen", error: true });
+    } finally {
+      setSnapBusy(false);
+    }
+  };
+
   const totalVol = useMemo(()=>sessions.reduce((s,x)=>s+vol(x.sets),0),[sessions]);
   const streak   = useMemo(()=>calcStreak(sessions,cardio),[sessions,cardio]);
 
@@ -5798,6 +5951,7 @@ const SettingsScreen = ({
           background: syncMsg?.error ? T.red+"14" : T.bgAlt,
           border:`1px solid ${syncMsg?.error ? T.red+"44" : T.border}`,
           color: syncMsg?.error ? T.red : T.sub,
+          marginBottom:10,
         }}>
           {syncMsg?.text ||
             (syncMeta?.lastSync
@@ -5807,6 +5961,78 @@ const SettingsScreen = ({
             <div style={{color:T.orange,marginTop:3}}>Lokale Änderungen noch nicht hochgeladen</div>
           )}
         </div>
+
+        {/* ── Snapshot-Browser: alte Cloud-Stände ── */}
+        <div style={{fontSize:10,color:T.muted,marginBottom:6,lineHeight:1.5}}>
+          Falls Trainings fehlen (z.B. durch ein verworfenes Training): hier alte Cloud-Stände
+          durchsuchen. Gefundene Trainings werden ergänzt, nichts wird gelöscht.
+        </div>
+        <Btn v="ghost" onClick={loadSnapshotList} disabled={snapBusy} full style={{marginBottom:8,fontSize:12,padding:"9px 0"}}>
+          {snapBusy ? "Lädt…" : "Alte Cloud-Stände durchsuchen"}
+        </Btn>
+
+        {snapMsg && (
+          <div style={{
+            padding:"8px 10px", borderRadius:8, fontSize:11, lineHeight:1.5, marginBottom:8,
+            background: snapMsg.error ? T.red+"14" : T.green+"14",
+            border:`1px solid ${snapMsg.error ? T.red+"44" : T.green+"44"}`,
+            color: snapMsg.error ? T.red : T.green,
+          }}>{snapMsg.text}</div>
+        )}
+
+        {snapList !== null && (
+          <div style={{marginBottom:10}}>
+            {snapList.length === 0 ? (
+              <div style={{fontSize:12,color:T.muted,padding:"8px 0"}}>Keine gespeicherten Tagesstände gefunden.</div>
+            ) : (
+              <>
+                <div style={{fontSize:10,color:T.muted,marginBottom:6}}>
+                  {snapList.length} gespeicherte Tagesstände (letzte 60 Tage) · antippen zum Prüfen
+                </div>
+                <Btn onClick={mergeAllSnapshots} disabled={snapBusy} full style={{marginBottom:10,fontSize:12,padding:"9px 0"}}>
+                  {snapBusy ? "Läuft…" : "Alle Snapshots durchsuchen & fehlende Trainings ergänzen"}
+                </Btn>
+                {snapList.map(day => {
+                  const det = snapDetails[day];
+                  return (
+                    <div key={day} onClick={()=>inspectSnapshot(day)} style={{
+                      display:"flex", justifyContent:"space-between", alignItems:"center",
+                      padding:"9px 10px", borderRadius:8, marginBottom:5,
+                      background:T.bgAlt, border:`1px solid ${T.border}`, cursor:"pointer",
+                    }}>
+                      <div>
+                        <div style={{fontSize:13,fontWeight:700,color:T.text}}>{day}</div>
+                        {det ? (
+                          det.error ? (
+                            <div style={{fontSize:10,color:T.red}}>{det.error}</div>
+                          ) : det.empty ? (
+                            <div style={{fontSize:10,color:T.muted}}>leer</div>
+                          ) : (
+                            <div style={{fontSize:10,color:T.sub}}>
+                              {det.sessions} Trainings{det.lastDate ? ` · bis ${fmtDShort(det.lastDate)}` : ""}
+                            </div>
+                          )
+                        ) : (
+                          <div style={{fontSize:10,color:T.muted}}>Tippen zum Prüfen…</div>
+                        )}
+                      </div>
+                      {det && !det.error && !det.empty && (
+                        <button
+                          onClick={e=>{e.stopPropagation(); restoreSnapshot(day);}}
+                          disabled={snapBusy}
+                          style={{
+                            background:T.accent, color:"#07070F", border:"none", borderRadius:7,
+                            padding:"7px 12px", fontSize:11, fontWeight:800, cursor:"pointer", flexShrink:0,
+                          }}
+                        >Ergänzen</button>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        )}
 
         {/* Export */}
         <Btn v="ghost" onClick={exportData} full style={{marginBottom:8}}>
