@@ -1450,14 +1450,19 @@ const ftSync = (() => {
   // Apply a server payload into localStorage, then reload UI
   const apply = data => {
     if (!data || typeof data !== "object") return false;
+    applying = true;
     let wrote = 0;
-    SYNC_DATA_KEYS.forEach(k => {
-      if (data[k] === undefined) return;
-      try {
-        localStorage.setItem(LS_PREFIX + k, JSON.stringify(data[k]));
-        wrote++;
-      } catch(e) { console.warn("Sync apply failed for", k, e?.name); }
-    });
+    try {
+      SYNC_DATA_KEYS.forEach(k => {
+        if (data[k] === undefined) return;
+        try {
+          localStorage.setItem(LS_PREFIX + k, JSON.stringify(data[k]));
+          wrote++;
+        } catch(e) { console.warn("Sync apply failed for", k, e?.name); }
+      });
+    } finally {
+      applying = false;
+    }
     setDirty(false);
     return wrote > 0;
   };
@@ -1591,6 +1596,8 @@ const ftSync = (() => {
   };
 
   // Patch localStorage.setItem to detect app-data changes
+  let applying = false; // true while apply() is writing – suppresses dirty-marking
+
   const installWatcher = () => {
     try {
       if (localStorage.__ftSyncPatched) return;
@@ -1598,6 +1605,7 @@ const ftSync = (() => {
       localStorage.setItem = function (key, value) {
         orig(key, value);
         try {
+          if (applying) return; // we are the ones writing – not a local change
           // ignore our own keys → prevents endless loop
           if (SYNC_OWN_KEYS.includes(key)) return;
           if (typeof key === "string" && key.startsWith(LS_PREFIX)) {
@@ -5590,7 +5598,7 @@ const SettingsScreen = ({
     setSyncMsg({ text: "Abgleich läuft…", error: false });
     try {
       const r = await ftSync.run({
-        onApplied: () => { setTimeout(() => window.location.reload(), 600); },
+        onApplied: () => { window.location.reload(); },
       });
       setSyncMeta(ftSync.getMeta());
       if (r?.error) setSyncMsg({ text: r.error, error: true });
@@ -5720,6 +5728,18 @@ const SettingsScreen = ({
       let runningSessions = sessions || [];
       let runningCardio   = cardio   || [];
       let scanned = 0;
+
+      // Zuerst den AKTUELLEN Server-Stand einbeziehen (ohne &snap=) –
+      // der kann Trainings enthalten, die noch nicht in einem Tages-Snapshot
+      // gesichert wurden (z.B. Trainings von heute/kürzlich).
+      try {
+        const current = await ftSync.pull();
+        if (current && !current.empty) {
+          runningSessions = mergeById(runningSessions, current.sessions||[]);
+          runningCardio   = mergeById(runningCardio,   current.cardio||[]);
+        }
+      } catch(_) { /* aktueller Stand nicht erreichbar – Snapshots trotzdem durchsuchen */ }
+
       for (const day of snapList) {
         try {
           const data = await ftSync.pull(day);
@@ -6379,7 +6399,7 @@ function App() {
       // Initial reconcile ~1s after start
       const t = setTimeout(() => {
         ftSync.run({ silent: true, onApplied: () => {
-          setTimeout(() => window.location.reload(), 400);
+          window.location.reload();
         }}).catch(()=>{});
       }, 1000);
 
@@ -6390,7 +6410,7 @@ function App() {
             if (ftSync.isDirty()) ftSync.push().catch(()=>{});
           } else {
             ftSync.run({ silent: true, onApplied: () => {
-              setTimeout(() => window.location.reload(), 400);
+              window.location.reload();
             }}).catch(()=>{});
           }
         } catch(_){}
@@ -6428,6 +6448,13 @@ function App() {
       setNewBadges(newly);
       setSeenBadgeIds(ids => [...ids, ...newly.map(b => b.id)]);
     }
+    // Sync immediately after finishing a workout – don't wait for the debounce.
+    // A finished training is the single most important moment to not lose data.
+    try {
+      if (ftSync.isConfigured()) {
+        ftSync.push().catch(() => { /* debounced retry will still fire */ });
+      }
+    } catch(_){}
     setTab("progress");
   }, [sessions, metrics, cardio, seenBadgeIds]);
   const saveMetric     = useCallback(m =>  { setMetrics(p=>[...p,m]); },                      []);
