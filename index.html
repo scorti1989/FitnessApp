@@ -1098,7 +1098,7 @@ function calcAchievements(sessions, metrics, streak, cardio, allExercises=[]) {
 // ═══════════════════════════════════════════════════════
 // Each exercise can declare unitType: "reps" | "secs" | "mins"
 // Default = "reps".  Warm-up/Dehnung use "secs" or special.
-const UNIT_LABELS = { reps:"Wdh", secs:"Sek", mins:"Min" };
+const UNIT_LABELS = { reps:"Wdh", secs:"Sek", mins:"Min", timedReps:"Wdh" };
 
 function getUnitType(eid, allExercises) {
   const ex = allExercises?.find(e=>e.id===eid);
@@ -1190,6 +1190,24 @@ function mergeWithDefaults(saved) {
 
 // ── Zusätzliche Übungen: Warm-up, Mobilisierung, Dehnung ──────────────
 // Diese werden zu EDB gemergt (custom exercises folgen später im State)
+const CHALLENGE_EXERCISES = [
+  {id:"challenge_pushups_100", name:"100 Liegestütze", cat:"Brust", eq:"Körpergewicht", muscle:"chest", unitType:"timedReps", desc:"100 saubere Liegestütze. Pausen sind erlaubt; die Stoppuhr läuft weiter."},
+  {id:"challenge_squats_100", name:"100 Kniebeugen", cat:"Beine", eq:"Körpergewicht", muscle:"quads", unitType:"timedReps", desc:"100 saubere Kniebeugen. Pausen sind erlaubt; die Stoppuhr läuft weiter."},
+  {id:"challenge_situps_100", name:"100 Sit-ups", cat:"Core", eq:"Körpergewicht", muscle:"core", unitType:"timedReps", desc:"100 kontrollierte Sit-ups. Pausen sind erlaubt; die Stoppuhr läuft weiter."},
+];
+
+const CHALLENGE_PLAN = {
+  id:"plan_100er_challenge_timed",
+  name:"100er-Challenge – Einzelzeiten",
+  desc:"Je 100 Liegestütze, Kniebeugen und Sit-ups mit eigener Stoppuhr sowie Vergleich von letzter Zeit und Bestzeit",
+  archived:false,
+  days:[{id:"day_100er_challenge_timed",name:"300 Wiederholungen auf Zeit",exercises:[
+    {eid:"challenge_pushups_100",sets:1,reps:100,weight:0,rest:0,note:"Timer starten, 100 Wiederholungen absolvieren, dann stoppen."},
+    {eid:"challenge_squats_100",sets:1,reps:100,weight:0,rest:0,note:"Timer starten, 100 Wiederholungen absolvieren, dann stoppen."},
+    {eid:"challenge_situps_100",sets:1,reps:100,weight:0,rest:0,note:"Timer starten, 100 Wiederholungen absolvieren, dann stoppen."},
+  ]}]
+};
+
 const EXTRA_EDB = [
   {id:"w1", name:"Schulterkreisen",    cat:"Aufwärmen", eq:"Körpergewicht", muscle:"shoulders", unitType:"reps",
    desc:"15× vorwärts, 15× rückwärts. Arme hängen locker, große Kreisbewegung."},
@@ -1224,7 +1242,7 @@ const EXTRA_EDB = [
 ];
 
 // Merge: EDB + EXTRA_EDB → ALL_EDB (readonly reference)
-const ALL_EDB_BASE = [...EDB, ...EXTRA_EDB];
+const ALL_EDB_BASE = [...EDB, ...EXTRA_EDB, ...CHALLENGE_EXERCISES];
 
 // Erweiterte Kategorien
 const ALL_CATS = ["Alle","Brust","Rücken","Beine","Schultern","Arme","Core","Aufwärmen","Dehnung"];
@@ -2060,6 +2078,29 @@ const ExerciseTimer = ({targetSecs, onFinish, tickStart=10}) => {
             {overtime ? "Satz beenden ✓" : "Satz jetzt beenden"}
           </Btn>
         </div>
+      </div>
+    </div>
+  );
+};
+
+
+// Stoppuhr für eine feste Wiederholungszahl.
+const TimedRepsTimer = ({exerciseName, targetReps, onFinish, onCancel}) => {
+  const startedAt = useRef(Date.now());
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setElapsed(Math.max(0, Math.floor((Date.now()-startedAt.current)/1000))), 250);
+    return () => clearInterval(iv);
+  }, []);
+  return (
+    <div style={{position:"fixed",top:80,left:16,right:16,background:T.bgCard,borderRadius:18,border:`2px solid ${T.orange}77`,boxShadow:"0 8px 40px rgba(0,0,0,0.75)",zIndex:310,padding:16}}>
+      <div style={{fontSize:11,color:T.orange,fontWeight:900,letterSpacing:1,marginBottom:4}}>100ER-CHALLENGE</div>
+      <div style={{fontSize:17,color:T.text,fontWeight:800,marginBottom:2}}>{exerciseName}</div>
+      <div style={{fontSize:12,color:T.sub,marginBottom:12}}>Ziel: {targetReps} Wiederholungen · Pausen zählen mit</div>
+      <div style={{fontSize:46,fontWeight:900,color:T.orange,textAlign:"center",fontVariantNumeric:"tabular-nums",margin:"4px 0 14px"}}>{fmt(elapsed)}</div>
+      <div style={{display:"flex",gap:8}}>
+        <Btn v="ghost" onClick={onCancel} style={{flex:1,padding:"11px 0"}}>Abbrechen</Btn>
+        <Btn onClick={()=>{AudioEngine.done();onFinish(elapsed);}} style={{flex:2,padding:"11px 0",fontWeight:900}}>100 geschafft · Stoppen</Btn>
       </div>
     </div>
   );
@@ -3616,7 +3657,19 @@ const WorkoutExerciseCard = ({
 
   const unitType = resolved.unitType || "reps+kg";
   const isTimeBased  = unitType === "secs" || unitType === "mins";
-  const isRepsOnly   = unitType === "reps";
+  const isTimedReps  = unitType === "timedReps";
+  const isRepsOnly   = unitType === "reps" || isTimedReps;
+  const timedRepsStats = useMemo(() => {
+    if (!isTimedReps) return null;
+    const values = [...(sessions||[])]
+      .sort((a,b)=>new Date(b.date)-new Date(a.date))
+      .flatMap(session => (session.sets||[])
+        .filter(set => set.eid===(eid||planEx.eid) && set.done!==false && Number(set.elapsedSecs)>0)
+        .map(set => ({seconds:Number(set.elapsedSecs),date:session.date}))
+      );
+    if (!values.length) return {last:null,best:null,count:0};
+    return {last:values[0],best:values.reduce((a,b)=>b.seconds<a.seconds?b:a),count:values.length};
+  }, [isTimedReps, sessions, eid, planEx.eid]);
   // incr kept for potential other uses
   const incr = (() => {
     const rules = settings?.progressionSettings?.incrementRules || {};
@@ -3893,6 +3946,18 @@ const WorkoutExerciseCard = ({
         {planEx.note&&(
           <div style={{fontSize:10,color:T.muted,marginBottom:6}}>{planEx.note}</div>
         )}
+        {isTimedReps && timedRepsStats && (
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6,marginBottom:8}}>
+            <div style={{padding:"7px 9px",background:T.bgAlt,borderRadius:8,border:`1px solid ${T.border}`}}>
+              <div style={{fontSize:9,color:T.muted,letterSpacing:0.7}}>LETZTE ZEIT</div>
+              <div style={{fontSize:15,fontWeight:900,color:T.text}}>{timedRepsStats.last?fmt(timedRepsStats.last.seconds):"—"}</div>
+            </div>
+            <div style={{padding:"7px 9px",background:T.orange+"12",borderRadius:8,border:`1px solid ${T.orange}44`}}>
+              <div style={{fontSize:9,color:T.orange,letterSpacing:0.7}}>BESTZEIT</div>
+              <div style={{fontSize:15,fontWeight:900,color:T.orange}}>{timedRepsStats.best?fmt(timedRepsStats.best.seconds):"—"}</div>
+            </div>
+          </div>
+        )}
 
         {/* ── Progression hint – compact single line ── */}
         {suggestion && !deloadActive && (()=>{
@@ -3943,7 +4008,9 @@ const WorkoutExerciseCard = ({
             setExTimer({ikey, setIdx:i, targetSecs, restSecs:planEx.rest||0});
           };
           const handleDone = () => {
-            if (isTimeBased && !s.done) startTimer();
+            if (isTimedReps && !s.done) {
+              setExTimer({ikey,setIdx:i,mode:"timedReps",targetReps:s.reps||100,exerciseName:resolved.name,restSecs:0});
+            } else if (isTimeBased && !s.done) startTimer();
             else toggle(ikey, i, planEx.rest);
           };
           return (
@@ -4004,6 +4071,7 @@ const WorkoutExerciseCard = ({
                     }}
                   />
                   <span style={{fontSize:11, color:T.sub, fontWeight:700, whiteSpace:"nowrap"}}>Wdh</span>
+                  {isTimedReps && s.elapsedSecs > 0 && <span style={{fontSize:11,color:T.orange,fontWeight:800,whiteSpace:"nowrap"}}>{fmt(s.elapsedSecs)}</span>}
                 </div>
               ) : (
                 /* Standard: Gewicht × Wiederholungen */
@@ -4049,15 +4117,15 @@ const WorkoutExerciseCard = ({
                 style={{
                   width:38, height:38, borderRadius:9, border:"none", cursor:"pointer",
                   background: s.done ? T.accent+"44"
-                    : isTimeBased ? T.blue+"44"
+                    : (isTimeBased || isTimedReps) ? T.blue+"44"
                     : T.bgAlt,
                   color: s.done ? T.accent
-                    : isTimeBased ? T.blue
+                    : (isTimeBased || isTimedReps) ? T.blue
                     : T.sub,
                   fontSize:16, fontWeight:700,
                 }}
               >
-                {s.done ? "✓" : isTimeBased ? "▶" : "○"}
+                {s.done ? "✓" : (isTimeBased || isTimedReps) ? "▶" : "○"}
               </button>
 
             </div>
@@ -4226,6 +4294,7 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
           reps:     prev ? prev.reps   : (planRow?.reps   ?? ex.reps),
           weight:   prev ? prev.weight : (planRow?.weight ?? ex.weight),
           done:     false,
+          elapsedSecs: prev?.elapsedSecs || 0,
           planNote:  ex.note || null,
           planExIdx: exIdx,
           isWarmup:  planRow?.isWarmup ?? (i === 0 && !!ex.isWarmup),
@@ -4459,16 +4528,26 @@ const WorkoutScreen = ({plans, allExercises, exerciseOverrides, settings, sessio
     <div style={{padding:"0 16px 24px"}}>
       {/* RestTimer is now rendered globally in App so it persists across tab switches */}
         {/* Exercise timer overlay (Punkt 6) */}
-        {exTimer&&<ExerciseTimer
+        {exTimer && exTimer.mode === "timedReps" && <TimedRepsTimer
+          exerciseName={exTimer.exerciseName}
+          targetReps={exTimer.targetReps}
+          onCancel={()=>setExTimer(null)}
+          onFinish={(measuredSecs)=>{
+            setSets(prev=>{
+              if(!prev[exTimer.ikey]?.[exTimer.setIdx]) return prev;
+              return {...prev,[exTimer.ikey]:prev[exTimer.ikey].map((set,i)=>i===exTimer.setIdx?{...set,elapsedSecs:measuredSecs,done:true}:set)};
+            });
+            setExTimer(null);
+          }}
+        />}
+        {exTimer && exTimer.mode !== "timedReps" && <ExerciseTimer
           targetSecs={exTimer.targetSecs}
           tickStart={settings?.timerSettings?.exerciseTickStart ?? 10}
           onFinish={()=>{
-            // Mark set done, optionally start rest
             const {ikey, setIdx, restSecs} = exTimer;
             setSets(prev=>{
               if(!prev[ikey]?.[setIdx]) return prev;
-              const upd={...prev,[ikey]:prev[ikey].map((s,i)=>i===setIdx?{...s,done:true}:s)};
-              return upd;
+              return {...prev,[ikey]:prev[ikey].map((set,i)=>i===setIdx?{...set,done:true}:set)};
             });
             setExTimer(null);
             if(restSecs>0) setRest({secs:restSecs});
@@ -6381,6 +6460,14 @@ function App() {
   // Full exercise database = base + extra + user-created
   // allExercises are the raw entries; resolved = {...ex, ...overrides[ex.id]}
   const allExercises = useMemo(() => [...ALL_EDB_BASE, ...customExercises], [customExercises]);
+  useEffect(() => {
+    setPlans(prev => {
+      const list = Array.isArray(prev) ? prev : [];
+      const valid = list.find(p => p.id===CHALLENGE_PLAN.id && p.days?.[0]?.exercises?.every(e => ["challenge_pushups_100","challenge_squats_100","challenge_situps_100"].includes(e.eid)));
+      if (valid) return list;
+      return [...list.filter(p => p.id!==CHALLENGE_PLAN.id && p.id!=="plan_100er_challenge"), CHALLENGE_PLAN];
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const resolveEx = useCallback(ex => ({...ex, ...(exerciseOverrides?.[ex.id]||{})}), [exerciseOverrides]);
 
   // Auto-expire deload when activeDeloadUntil is in the past
